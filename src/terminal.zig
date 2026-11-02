@@ -14,9 +14,14 @@ pub const Error = error{
     WaitFailed,
     InputFailed,
     OutputFailed,
+    OutputBlocked,
+    Interrupted,
     SuspendFailed,
     CloseFailed,
 };
+
+const nonblocking = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+const screen_cleanup = "\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
 
 const handled_signals = [_]posix.SIG{ .INT, .TERM, .HUP, .TSTP, .CONT, .WINCH };
 
@@ -27,6 +32,9 @@ pub const Terminal = struct {
     saved_mode: posix.termios,
     saved_mask: posix.sigset_t,
     signal_fd: posix.fd_t,
+    saved_output_flags: usize,
+    output_flags_active: bool = false,
+    pending: Signals = .{},
     mode_active: bool = false,
     screen_active: bool = false,
 
@@ -35,6 +43,8 @@ pub const Terminal = struct {
         if (!try foreground()) return error.NotForeground;
         // Validate stdout as the controlling terminal too, before any mutation.
         _ = posix.tcgetpgrp(1) catch return error.NotATerminal;
+        const output_flags = linux.fcntl(1, linux.F.GETFL, 0);
+        if (posix.errno(output_flags) != .SUCCESS) return error.OutputFailed;
         var mask = posix.sigemptyset();
         for (handled_signals) |sig| posix.sigaddset(&mask, sig);
         var saved_mask: posix.sigset_t = undefined;
@@ -42,7 +52,7 @@ pub const Terminal = struct {
         errdefer posix.sigprocmask(posix.SIG.SETMASK, &saved_mask, null);
         const result = linux.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
         if (posix.errno(result) != .SUCCESS) return error.SignalSetupFailed;
-        return .{ .saved_mode = saved_mode, .saved_mask = saved_mask, .signal_fd = @intCast(result) };
+        return .{ .saved_mode = saved_mode, .saved_mask = saved_mask, .signal_fd = @intCast(result), .saved_output_flags = output_flags };
     }
 
     pub fn close(self: *Terminal) Error!void {
@@ -71,11 +81,19 @@ pub const Terminal = struct {
         mode.cc[@backingInt(linux.V.TIME)] = 0;
         posix.tcsetattr(0, .NOW, mode) catch return error.TerminalUnavailable;
         self.mode_active = true;
+        try self.setOutputNonblocking();
+        // A suspension may have left screen cleanup queued behind stalled
+        // output. Finish it before saving modes again, or we would save our
+        // hidden cursor/paste state as the shell's original state.
+        if (self.screen_active) {
+            try self.write(screen_cleanup);
+            self.screen_active = false;
+        }
         // Mark the screen acquired before output: a partial write must unwind.
         // Save/restore bracketed paste as well as cursor visibility in Konsole.
         // Pasted text is discarded by the input parser, never run as commands.
         self.screen_active = true;
-        try write("\x1b[?25s\x1b[?1049h\x1b[?25l\x1b[?2004s\x1b[?2004h");
+        try self.write("\x1b[?25s\x1b[?1049h\x1b[?25l\x1b[?2004s\x1b[?2004h");
     }
 
     fn leave(self: *Terminal) Error!void {
@@ -87,10 +105,21 @@ pub const Terminal = struct {
             self.mode_active = false;
         }
         if (self.screen_active) {
-            write("\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r") catch |err| {
+            self.setOutputNonblocking() catch |err| {
                 if (failure == null) failure = err;
             };
-            self.screen_active = false;
+            if (self.output_flags_active) {
+                if (writeCleanup(screen_cleanup)) |_| {
+                    self.screen_active = false;
+                } else |err| {
+                    if (failure == null) failure = err;
+                }
+            }
+        }
+        if (self.output_flags_active) {
+            if (posix.errno(linux.fcntl(1, linux.F.SETFL, self.saved_output_flags)) != .SUCCESS) {
+                if (failure == null) failure = error.OutputFailed;
+            } else self.output_flags_active = false;
         }
         if (failure) |err| return err;
     }
@@ -99,10 +128,22 @@ pub const Terminal = struct {
     /// entering/redrawing, so a queued termination wins over resume or input.
     pub fn next(self: *Terminal) Error!Event {
         while (true) {
-            const signals = try self.readSignals();
+            try self.readSignals();
+            const signals = self.pending;
+            self.pending = .{};
             if (signals.exit_code) |code| return .{ .quit = code };
             if (signals.should_suspend) {
-                try self.leave();
+                self.leave() catch |err| {
+                    if (err != error.OutputBlocked) return err;
+                    // Termios/descriptor flags are already restored. A stalled
+                    // screen must not prevent stopping; resume retries it.
+                    writeDiagnostic("nib: screen cleanup blocked by terminal output\n");
+                };
+                // Cleanup can wait briefly for output. Termination received
+                // during that wait still takes precedence over stopping.
+                try self.readSignals();
+                if (self.pending.exit_code) |code| return .{ .quit = code };
+                self.pending.should_suspend = false;
                 // SIGTSTP was consumed by signalfd. SIGSTOP actually stops us;
                 // unlike SIGTSTP it cannot be swallowed by our blocked mask.
                 posix.kill(linux.getpid(), .STOP) catch return error.SuspendFailed;
@@ -116,7 +157,10 @@ pub const Terminal = struct {
                 continue;
             }
             if (!self.mode_active) {
-                try self.enter();
+                self.enter() catch |err| {
+                    if (err == error.Interrupted) continue;
+                    return err;
+                };
                 return .{ .redraw = try size() };
             }
             if (signals.resize) return .{ .redraw = try size() };
@@ -150,24 +194,61 @@ pub const Terminal = struct {
         }
     }
 
+    fn setOutputNonblocking(self: *Terminal) Error!void {
+        if (self.output_flags_active) return;
+        if (posix.errno(linux.fcntl(1, linux.F.SETFL, self.saved_output_flags | nonblocking)) != .SUCCESS)
+            return error.OutputFailed;
+        self.output_flags_active = true;
+    }
+
+    /// Writes a frame while observing lifecycle signals under backpressure.
+    /// Interrupted means abandon the frame and call next to handle the signal.
+    pub fn write(self: *Terminal, bytes: []const u8) Error!void {
+        try self.readSignals();
+        if (self.pending.exit_code != null or self.pending.should_suspend) return error.Interrupted;
+        var remaining = bytes;
+        while (remaining.len != 0) {
+            remaining = try writeAvailable(1, remaining);
+            if (remaining.len == 0) return;
+            var fds = [_]linux.pollfd{
+                .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 },
+                .{ .fd = 1, .events = linux.POLL.OUT, .revents = 0 },
+            };
+            const result = linux.poll(&fds, fds.len, -1);
+            switch (posix.errno(result)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.WaitFailed,
+            }
+            if (fds[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+                return error.SignalReadFailed;
+            if (fds[0].revents & linux.POLL.IN != 0) {
+                try self.readSignals();
+                if (self.pending.exit_code != null or self.pending.should_suspend)
+                    return error.Interrupted;
+            }
+            if (fds[1].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+                return error.OutputFailed;
+        }
+    }
+
     const Signals = struct { exit_code: ?u8 = null, should_suspend: bool = false, resize: bool = false };
 
-    fn readSignals(self: *Terminal) Error!Signals {
-        var signals: Signals = .{};
+    fn readSignals(self: *Terminal) Error!void {
         while (true) {
             var info: linux.signalfd_siginfo = undefined;
             const count = linux.read(self.signal_fd, @ptrCast(&info), @sizeOf(@TypeOf(info)));
             switch (posix.errno(count)) {
-                .AGAIN => return signals,
+                .AGAIN => return,
                 .INTR => continue,
                 .SUCCESS => {},
                 else => return error.SignalReadFailed,
             }
             if (count != @sizeOf(@TypeOf(info))) return error.SignalReadFailed;
             switch (@as(posix.SIG, @fromBackingInt(@intCast(info.signo)))) {
-                .INT, .TERM, .HUP => signals.exit_code = @intCast(128 + info.signo),
-                .TSTP => signals.should_suspend = true,
-                .WINCH => signals.resize = true,
+                .INT, .TERM, .HUP => self.pending.exit_code = @intCast(128 + info.signo),
+                .TSTP => self.pending.should_suspend = true,
+                .WINCH => self.pending.resize = true,
                 .CONT => {},
                 else => unreachable,
             }
@@ -189,17 +270,59 @@ fn size() Error!Size {
     return .{ .rows = dimensions.row, .columns = dimensions.col };
 }
 
-pub fn write(bytes: []const u8) Error!void {
+/// All callers must first make the descriptor nonblocking. Returns the suffix
+/// not yet written, rather than waiting for a full terminal/pipe to drain.
+fn writeAvailable(fd: posix.fd_t, bytes: []const u8) Error![]const u8 {
     var remaining = bytes;
     while (remaining.len != 0) {
-        const count = linux.write(1, remaining.ptr, remaining.len);
+        const count = linux.write(fd, remaining.ptr, remaining.len);
         switch (posix.errno(count)) {
             .SUCCESS => {
                 if (count == 0) return error.OutputFailed;
                 remaining = remaining[count..];
             },
             .INTR => continue,
+            .AGAIN => return remaining,
             else => return error.OutputFailed,
         }
     }
+    return remaining;
+}
+
+fn milliseconds() Error!i64 {
+    var time: linux.timespec = undefined;
+    if (posix.errno(linux.clock_gettime(.MONOTONIC, &time)) != .SUCCESS) return error.WaitFailed;
+    return time.sec * 1000 + @divTrunc(time.nsec, 1_000_000);
+}
+
+// Termios is restored before this bounded best-effort screen cleanup. An
+// unresponsive emulator must not hold termination or suspension indefinitely.
+fn writeCleanup(bytes: []const u8) Error!void {
+    const deadline = try milliseconds() + 100;
+    var remaining = bytes;
+    while (remaining.len != 0) {
+        remaining = try writeAvailable(1, remaining);
+        if (remaining.len == 0) return;
+        const timeout: i32 = @intCast(@max(0, deadline - try milliseconds()));
+        if (timeout == 0) return error.OutputBlocked;
+        var fds = [_]linux.pollfd{.{ .fd = 1, .events = linux.POLL.OUT, .revents = 0 }};
+        const result = linux.poll(&fds, 1, timeout);
+        switch (posix.errno(result)) {
+            .SUCCESS => if (result == 0) return error.OutputBlocked,
+            .INTR => continue,
+            else => return error.WaitFailed,
+        }
+        if (fds[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+            return error.OutputFailed;
+    }
+}
+
+/// Reporting a cleanup failure must not block on the same stalled terminal.
+/// stderr can share stdout's open file description; always restore its flags.
+pub fn writeDiagnostic(bytes: []const u8) void {
+    const flags = linux.fcntl(2, linux.F.GETFL, 0);
+    if (posix.errno(flags) != .SUCCESS) return;
+    if (posix.errno(linux.fcntl(2, linux.F.SETFL, flags | nonblocking)) != .SUCCESS) return;
+    defer _ = linux.fcntl(2, linux.F.SETFL, flags);
+    _ = writeAvailable(2, bytes) catch return;
 }

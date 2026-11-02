@@ -48,6 +48,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "shellJobControl", shellJobControl },
         .{ "viewerWorkflow", viewerWorkflow },
         .{ "startupFailures", startupFailures },
+        .{ "stalledOutputRecovery", stalledOutputRecovery },
+        .{ "stalledOutputTermination", stalledOutputTermination },
+        .{ "stalledOutputSuspend", stalledOutputSuspend },
     };
     inline for (checks) |check| {
         check[1](executable) catch |err| {
@@ -93,6 +96,8 @@ const Options = struct {
     path: ?[:0]const u8 = null,
     missing_argument: bool = false,
     extra_argument: bool = false,
+    size: [2]u16 = .{ 24, 80 },
+    nonblocking_output: bool = false,
 };
 
 const Process = struct {
@@ -100,6 +105,7 @@ const Process = struct {
     slave: posix.fd_t,
     pid: posix.pid_t,
     saved: posix.termios,
+    saved_flags: usize,
     reaped: bool = false,
     eof: bool = false,
     output: [65536]u8 = undefined,
@@ -112,15 +118,20 @@ const Process = struct {
         _ = try checked(linux.ioctl(master, linux.T.IOCSPTLCK, @intFromPtr(&unlock)));
         const slave: posix.fd_t = @intCast(try checked(linux.ioctl(master, linux.T.IOCGPTPEER, @as(u32, @bitCast(linux.O{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true })))));
         errdefer _ = linux.close(slave);
-        var dimensions: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+        var dimensions: posix.winsize = .{ .row = options.size[0], .col = options.size[1], .xpixel = 0, .ypixel = 0 };
         _ = try checked(linux.ioctl(slave, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
+        if (options.nonblocking_output) {
+            const flags = try checked(linux.fcntl(slave, linux.F.GETFL, 0));
+            _ = try checked(linux.fcntl(slave, linux.F.SETFL, flags | @as(u32, @bitCast(linux.O{ .NONBLOCK = true }))));
+        }
+        const saved_flags = try checked(linux.fcntl(slave, linux.F.GETFL, 0));
         const saved = try posix.tcgetattr(slave);
         const pid: posix.pid_t = @intCast(try checked(linux.fork()));
         if (pid == 0) {
             child(master, slave, executable, options) catch {};
             linux.exit_group(127);
         }
-        return .{ .master = master, .slave = slave, .pid = pid, .saved = saved };
+        return .{ .master = master, .slave = slave, .pid = pid, .saved = saved, .saved_flags = saved_flags };
     }
 
     fn child(master: posix.fd_t, slave: posix.fd_t, executable: [:0]const u8, options: Options) !void {
@@ -249,6 +260,9 @@ const Process = struct {
 
     fn restored(self: *Process) !void {
         try std.testing.expectEqualDeep(self.saved, try posix.tcgetattr(self.slave));
+        // The harness dup2s one open file description onto stdin/stdout/stderr.
+        // This also detects leaked changes affecting the shell's descriptors.
+        try equal(self.saved_flags, try checked(linux.fcntl(self.slave, linux.F.GETFL, 0)));
     }
 
     fn ready(self: *Process) !void {
@@ -256,6 +270,31 @@ const Process = struct {
         const mode = try posix.tcgetattr(self.slave);
         try expect(!mode.lflag.ECHO and !mode.lflag.ICANON);
         try expect(mode.lflag.ISIG and !mode.iflag.IXON);
+    }
+
+    // Wait without reading: the 60 KiB frame cannot fit in the PTY output
+    // queue. This synchronizes with active rendering, not a startup sleep.
+    fn stalled(self: *Process) !void {
+        const deadline = try now() + 5000;
+        var path_buffer: [128]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/stat", .{self.pid}, 0);
+        while (try now() < deadline) {
+            var queued: c_int = 0;
+            _ = try checked(linux.ioctl(self.master.?, linux.T.FIONREAD, @intFromPtr(&queued)));
+            const mode = try posix.tcgetattr(self.slave);
+            if (queued >= 4095 and !mode.lflag.ICANON and !mode.lflag.ECHO) {
+                const fd: posix.fd_t = @intCast(try checked(linux.open(path, .{ .ACCMODE = .RDONLY }, 0)));
+                defer _ = linux.close(fd);
+                var buffer: [256]u8 = undefined;
+                const count = try checked(linux.read(fd, &buffer, buffer.len));
+                const name_end = std.mem.lastIndexOfScalar(u8, buffer[0..count], ')') orelse return error.BadProcessStatus;
+                // The renderer has filled the PTY and is asleep in its output
+                // wait. Do not race a signal against still-running rendering.
+                if (name_end + 2 < count and buffer[name_end + 2] == 'S') return;
+            }
+            _ = try checked(linux.poll(&.{}, 0, 10));
+        }
+        return error.OutputDidNotStall;
     }
 
     fn rejected(self: *Process, message: []const u8) !void {
@@ -501,4 +540,81 @@ fn startupFailures(executable: [:0]const u8) !void {
     var lines = try Process.start(executable, .{ .path = path });
     defer lines.close();
     try lines.rejected("temporary 262,144-line viewer limit");
+}
+
+fn stalledOutputTermination(executable: [:0]const u8) !void {
+    for ([_]posix.SIG{ .INT, .TERM, .HUP }) |sig| {
+        for ([_]bool{ false, true }) |nonblocking_output| {
+            var process = try Process.start(executable, .{ .size = .{ 200, 300 }, .nonblocking_output = nonblocking_output });
+            defer process.close();
+            try process.stalled();
+            const start = try now();
+            try process.signal(sig);
+            // Keep output unread until exit. A full queue can prevent screen
+            // cleanup, which is reported as failure rather than hanging exit.
+            const code = try process.wait(false);
+            try expect(code == 1 or code == 128 + @as(u8, @intCast(@backingInt(sig))));
+            try expect(try now() - start < 2000);
+            try process.restored();
+        }
+    }
+}
+
+fn stalledOutputSuspend(executable: [:0]const u8) !void {
+    for ([_]bool{ false, true }) |nonblocking_output| {
+        var process = try Process.start(executable, .{ .size = .{ 200, 300 }, .nonblocking_output = nonblocking_output });
+        defer process.close();
+        try process.stalled();
+        const start = try now();
+        try process.signal(.TSTP);
+        try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));
+        try expect(try now() - start < 2000);
+        try process.restored();
+        // Release backpressure while stopped. On fg/resume, incomplete screen
+        // cleanup must precede saving modes again and drawing a fresh frame.
+        while (try process.read(0) != 0) process.used = 0;
+        var dimensions: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+        _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
+        try process.signal(.CONT);
+        try process.until(leave);
+        try process.until(enter);
+        try process.ready();
+        try process.send("q");
+        try equal(@as(u8, 0), try process.wait(false));
+        try process.until(leave);
+        try process.restored();
+    }
+}
+
+fn stalledOutputRecovery(executable: [:0]const u8) !void {
+    var process = try Process.start(executable, .{ .size = .{ 200, 300 } });
+    defer process.close();
+    try process.stalled();
+    // Resume reading without signalling: partial writes must continue exactly
+    // where they stopped, with no dropped/duplicated source bytes or row padding.
+    const deadline = try now() + 5000;
+    while (std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m") == null) {
+        if (try now() >= deadline) return error.OutputTimeout;
+        _ = try process.read(50);
+    }
+    const bytes = process.output[0..process.used];
+    const start = (std.mem.indexOf(u8, bytes, frame) orelse return error.MissingOutput) + frame.len;
+    const status = std.mem.indexOf(u8, bytes, "\x1b[7mq quit") orelse return error.MissingOutput;
+    try equal(@as(usize, 199 * 301), status - start);
+    for (0..199) |number| {
+        var expected: [299]u8 = @splat(' ');
+        if (number < 60) {
+            _ = try std.fmt.bufPrint(expected[0..8], "line{d:0>3} ", .{number});
+            @memset(expected[8..120], 'x');
+            @memcpy(expected[120..124], "TAIL");
+            expected[128] = '!';
+        }
+        try std.testing.expectEqualSlices(u8, &expected, bytes[start + number * 301 ..][0..299]);
+        try std.testing.expectEqualStrings("\r\n", bytes[start + number * 301 + 299 ..][0..2]);
+    }
+    process.used = 0;
+    try process.send("q");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }
