@@ -50,3 +50,8 @@ fn report(io: std.Io, err: terminal.Error) void {
     const text = std.fmt.bufPrint(&buffer, "nib: {s}\n", .{message}) catch unreachable;
     std.Io.File.stderr().writeStreamingAll(io, text) catch {};
 }
+
+test {
+    _ = @import("snapshot.zig");
+    _ = @import("view.zig");
+}
