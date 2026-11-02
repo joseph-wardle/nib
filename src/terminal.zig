@@ -21,7 +21,12 @@ pub const Error = error{
 };
 
 const nonblocking = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
-const screen_cleanup = "\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
+// Entry prefixes mark the byte boundaries where each state was acquired.
+const cursor_save = "\x1b[?25s";
+const alternate_enter = cursor_save ++ "\x1b[?1049h";
+const paste_save = alternate_enter ++ "\x1b[?25l\x1b[?2004s";
+const screen_entry = paste_save ++ "\x1b[?2004h";
+const cleanup_capacity = 32;
 
 const handled_signals = [_]posix.SIG{ .INT, .TERM, .HUP, .TSTP, .CONT, .WINCH };
 
@@ -36,7 +41,7 @@ pub const Terminal = struct {
     output_flags_active: bool = false,
     pending: Signals = .{},
     mode_active: bool = false,
-    screen_active: bool = false,
+    entry_written: usize = 0,
 
     pub fn open() Error!Terminal {
         const saved_mode = posix.tcgetattr(0) catch return error.NotATerminal;
@@ -85,15 +90,26 @@ pub const Terminal = struct {
         // A suspension may have left screen cleanup queued behind stalled
         // output. Finish it before saving modes again, or we would save our
         // hidden cursor/paste state as the shell's original state.
-        if (self.screen_active) {
-            try self.write(screen_cleanup);
-            self.screen_active = false;
+        if (self.entry_written != 0) {
+            var buffer: [cleanup_capacity]u8 = undefined;
+            try self.write(self.cleanupBytes(&buffer));
+            self.entry_written = 0;
         }
-        // Mark the screen acquired before output: a partial write must unwind.
-        // Save/restore bracketed paste as well as cursor visibility in Konsole.
-        // Pasted text is discarded by the input parser, never run as commands.
-        self.screen_active = true;
-        try self.write("\x1b[?25s\x1b[?1049h\x1b[?25l\x1b[?2004s\x1b[?2004h");
+        // Progress is recorded even on interruption/error. A restore is valid
+        // only after its save completed; incomplete escape sequences need CAN.
+        try self.writeProgress(screen_entry, &self.entry_written);
+    }
+
+    fn cleanupBytes(self: *const Terminal, buffer: *[cleanup_capacity]u8) []const u8 {
+        // CAN also makes a retry safe if a bounded cleanup stopped inside a
+        // CSI sequence, possibly followed by shell output during suspension.
+        return std.fmt.bufPrint(buffer, "{s}{s}{s}{s}{s}", .{
+            if (self.entry_written != 0) "\x18" else "",
+            if (self.entry_written >= alternate_enter.len) "\x1b[0m" else "",
+            if (self.entry_written >= paste_save.len) "\x1b[?2004r" else "",
+            if (self.entry_written >= alternate_enter.len) "\x1b[?1049l" else "",
+            if (self.entry_written >= cursor_save.len) "\x1b[?25r" else "",
+        }) catch unreachable;
     }
 
     fn leave(self: *Terminal) Error!void {
@@ -104,13 +120,14 @@ pub const Terminal = struct {
             };
             self.mode_active = false;
         }
-        if (self.screen_active) {
+        if (self.entry_written != 0) {
             self.setOutputNonblocking() catch |err| {
                 if (failure == null) failure = err;
             };
             if (self.output_flags_active) {
-                if (writeCleanup(screen_cleanup)) |_| {
-                    self.screen_active = false;
+                var buffer: [cleanup_capacity]u8 = undefined;
+                if (writeCleanup(self.cleanupBytes(&buffer))) |_| {
+                    self.entry_written = 0;
                 } else |err| {
                     if (failure == null) failure = err;
                 }
@@ -204,11 +221,17 @@ pub const Terminal = struct {
     /// Writes a frame while observing lifecycle signals under backpressure.
     /// Interrupted means abandon the frame and call next to handle the signal.
     pub fn write(self: *Terminal, bytes: []const u8) Error!void {
+        var written: usize = 0;
+        try self.writeProgress(bytes, &written);
+    }
+
+    fn writeProgress(self: *Terminal, bytes: []const u8, written: *usize) Error!void {
         try self.readSignals();
         if (self.pending.exit_code != null or self.pending.should_suspend) return error.Interrupted;
-        var remaining = bytes;
+        var remaining = bytes[written.*..];
+        defer written.* = bytes.len - remaining.len;
         while (remaining.len != 0) {
-            remaining = try writeAvailable(1, remaining);
+            try writeAvailable(1, &remaining);
             if (remaining.len == 0) return;
             var fds = [_]linux.pollfd{
                 .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 },
@@ -270,23 +293,21 @@ fn size() Error!Size {
     return .{ .rows = dimensions.row, .columns = dimensions.col };
 }
 
-/// All callers must first make the descriptor nonblocking. Returns the suffix
-/// not yet written, rather than waiting for a full terminal/pipe to drain.
-fn writeAvailable(fd: posix.fd_t, bytes: []const u8) Error![]const u8 {
-    var remaining = bytes;
+/// All callers must first make the descriptor nonblocking. Consumes the written
+/// prefix even on error, without waiting for a full terminal/pipe to drain.
+fn writeAvailable(fd: posix.fd_t, remaining: *[]const u8) Error!void {
     while (remaining.len != 0) {
         const count = linux.write(fd, remaining.ptr, remaining.len);
         switch (posix.errno(count)) {
             .SUCCESS => {
                 if (count == 0) return error.OutputFailed;
-                remaining = remaining[count..];
+                remaining.* = remaining.*[count..];
             },
             .INTR => continue,
-            .AGAIN => return remaining,
+            .AGAIN => return,
             else => return error.OutputFailed,
         }
     }
-    return remaining;
 }
 
 fn milliseconds() Error!i64 {
@@ -301,7 +322,7 @@ fn writeCleanup(bytes: []const u8) Error!void {
     const deadline = try milliseconds() + 100;
     var remaining = bytes;
     while (remaining.len != 0) {
-        remaining = try writeAvailable(1, remaining);
+        try writeAvailable(1, &remaining);
         if (remaining.len == 0) return;
         const timeout: i32 = @intCast(@max(0, deadline - try milliseconds()));
         if (timeout == 0) return error.OutputBlocked;
@@ -324,5 +345,112 @@ pub fn writeDiagnostic(bytes: []const u8) void {
     if (posix.errno(flags) != .SUCCESS) return;
     if (posix.errno(linux.fcntl(2, linux.F.SETFL, flags | nonblocking)) != .SUCCESS) return;
     defer _ = linux.fcntl(2, linux.F.SETFL, flags);
-    _ = writeAvailable(2, bytes) catch return;
+    var remaining = bytes;
+    writeAvailable(2, &remaining) catch return;
+}
+
+test "interrupted entry restores only completed saves at every byte boundary" {
+    for (0..screen_entry.len + 1) |prefix| {
+        try interruptedSetup(prefix, 0, .TERM);
+        try interruptedSetup(prefix, 0, .TSTP);
+    }
+}
+
+test "cleanup retries cancel incomplete escape sequences before restoring modes" {
+    const cleanup = "\x18\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
+    for (1..cleanup.len + 1) |prefix| {
+        try interruptedSetup(screen_entry.len, prefix, .TERM);
+        try interruptedSetup(screen_entry.len, prefix, .TSTP);
+    }
+}
+
+// Isolate descriptor and signal mutations in a child. The pipe captures exactly
+// what an emulator would receive, including interrupted escape sequences.
+fn interruptedSetup(entry_prefix: usize, cleanup_prefix: usize, signal: posix.SIG) !void {
+    const testing = std.testing;
+    var pipe: [2]posix.fd_t = undefined;
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+    defer _ = linux.close(pipe[0]);
+    const result = linux.fork();
+    if (posix.errno(result) != .SUCCESS) {
+        _ = linux.close(pipe[1]);
+        return error.ForkFailed;
+    }
+    if (result == 0) {
+        interruptedSetupChild(pipe, entry_prefix, cleanup_prefix, signal) catch linux.exit_group(1);
+        linux.exit_group(0);
+    }
+    _ = linux.close(pipe[1]);
+    const pid: posix.pid_t = @intCast(result);
+    defer {
+        _ = linux.kill(pid, .KILL);
+        var status: i32 = 0;
+        while (posix.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    }
+    var output: [128]u8 = undefined;
+    var used: usize = 0;
+    while (true) {
+        const count = linux.read(pipe[0], output[used..].ptr, output.len - used);
+        if (posix.errno(count) == .INTR) continue;
+        try testing.expectEqual(posix.E.SUCCESS, posix.errno(count));
+        if (count == 0) break;
+        used += count;
+        try testing.expect(used < output.len);
+    }
+    // Independent expected ranges: no restore before its matching CSI save (or
+    // alternate-screen entry) has actually reached the output stream.
+    const cleanup: []const u8 = if (entry_prefix == 0)
+        ""
+    else if (entry_prefix < 6)
+        "\x18"
+    else if (entry_prefix < 14)
+        "\x18\x1b[?25r"
+    else if (entry_prefix < 28)
+        "\x18\x1b[0m\x1b[?1049l\x1b[?25r"
+    else
+        "\x18\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
+    var expected: [128]u8 = undefined;
+    @memcpy(expected[0..entry_prefix], screen_entry[0..entry_prefix]);
+    @memcpy(expected[entry_prefix..][0..cleanup_prefix], cleanup[0..cleanup_prefix]);
+    @memcpy(expected[entry_prefix + cleanup_prefix ..][0..cleanup.len], cleanup);
+    try testing.expectEqualSlices(u8, expected[0 .. entry_prefix + cleanup_prefix + cleanup.len], output[0..used]);
+    // Wait with WNOWAIT so the deferred reap still owns the pid even on failure.
+    var info: linux.siginfo_t = undefined;
+    try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOWAIT, null)));
+    try testing.expectEqual(@as(i32, 0), info.fields.common.second.sigchld.status);
+}
+
+fn interruptedSetupChild(pipe: [2]posix.fd_t, entry_prefix: usize, cleanup_prefix: usize, signal: posix.SIG) !void {
+    _ = linux.close(pipe[0]);
+    if (posix.errno(linux.dup2(pipe[1], 1)) != .SUCCESS) return error.DupFailed;
+    if (pipe[1] != 1) _ = linux.close(pipe[1]);
+    var mask = posix.sigemptyset();
+    posix.sigaddset(&mask, signal);
+    var saved_mask: posix.sigset_t = undefined;
+    posix.sigprocmask(posix.SIG.BLOCK, &mask, &saved_mask);
+    const fd = linux.signalfd(-1, &mask, linux.SFD.CLOEXEC | linux.SFD.NONBLOCK);
+    if (posix.errno(fd) != .SUCCESS) return error.SignalSetupFailed;
+    var session: Terminal = .{
+        .saved_mode = undefined, // No termios was acquired in this pipe test.
+        .saved_mask = saved_mask,
+        .signal_fd = @intCast(fd),
+        .saved_output_flags = linux.fcntl(1, linux.F.GETFL, 0),
+    };
+    try session.setOutputNonblocking();
+    try session.writeProgress(screen_entry[0..entry_prefix], &session.entry_written);
+    if (cleanup_prefix != 0) {
+        var buffer: [cleanup_capacity]u8 = undefined;
+        try session.write(session.cleanupBytes(&buffer)[0..cleanup_prefix]);
+    }
+    try posix.kill(linux.getpid(), signal);
+    if (cleanup_prefix == 0) {
+        try std.testing.expectError(error.Interrupted, session.writeProgress(screen_entry, &session.entry_written));
+        try std.testing.expectEqual(entry_prefix, session.entry_written);
+    } else {
+        var buffer: [cleanup_capacity]u8 = undefined;
+        try std.testing.expectError(error.Interrupted, session.write(session.cleanupBytes(&buffer)));
+    }
+    try session.close();
+    try std.testing.expectEqual(@as(usize, 0), session.entry_written);
+    try std.testing.expectEqual(session.saved_output_flags, linux.fcntl(1, linux.F.GETFL, 0));
 }
