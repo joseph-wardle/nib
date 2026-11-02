@@ -16,11 +16,14 @@ zig build run --
 The installed executable is `zig-out/bin/nib`. For development:
 
 ```sh
-zig fmt build.zig build.zig.zon src
+zig fmt build.zig build.zig.zon src tests
 zig build check
-```
+00000000000...........................................................................................................................................................................................................................................................................................................................................```
 
-`check` builds, checks formatting, and compiles and executes the test artifact.
-There are no behavioral tests yet.
+`check` builds, checks formatting, and runs the Zig unit-test artifact and Linux
+PTY lifecycle checks. The PTY harness is written in Zig, requires zsh on the
+host, and uses no C library or Python. It checks terminal restoration, signals,
+resize, failure paths, and shell job control; Konsole GUI presentation still
+needs manual verification.
 
 Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
