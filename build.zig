@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.standardTargetOptions(.{}),
+        .optimize = b.standardOptimizeOption(.{}),
+    });
+    const executable = b.addExecutable(.{
+        .name = "nib",
+        .root_module = module,
+    });
+    b.installArtifact(executable);
+
+    const run = b.addRunArtifact(executable);
+    run.addPassthruArgs();
+    b.step("run", "Run Nib").dependOn(&run.step);
+
+    const tests = b.addTest(.{ .root_module = module });
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test", "Compile and execute project tests").dependOn(&run_tests.step);
+
+    const format = b.addFmt(.{
+        .paths = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src") },
+        .check = true,
+    });
+    const check = b.step("check", "Build, check formatting, and run tests");
+    check.dependOn(b.getInstallStep());
+    check.dependOn(&format.step);
+    check.dependOn(&run_tests.step);
+}
