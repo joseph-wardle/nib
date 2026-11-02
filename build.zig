@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     });
     const terminal_tests = b.addRunArtifact(terminal_harness);
     terminal_tests.addArtifactArg(executable);
-    const test_step = b.step("test", "Run unit tests and Linux PTY lifecycle checks");
+    const test_step = b.step("test", "Run unit tests and Linux PTY viewer checks");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&terminal_tests.step);
 

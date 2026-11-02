@@ -66,13 +66,16 @@ pub const Terminal = struct {
         mode.lflag.ISIG = true;
         mode.iflag.IXON = false;
         mode.iflag.ICRNL = false;
+        mode.oflag.OPOST = false;
         mode.cc[@backingInt(linux.V.MIN)] = 1;
         mode.cc[@backingInt(linux.V.TIME)] = 0;
         posix.tcsetattr(0, .NOW, mode) catch return error.TerminalUnavailable;
         self.mode_active = true;
         // Mark the screen acquired before output: a partial write must unwind.
+        // Save/restore bracketed paste as well as cursor visibility in Konsole.
+        // Pasted text is discarded by the input parser, never run as commands.
         self.screen_active = true;
-        try write("\x1b[?25s\x1b[?1049h\x1b[?25l");
+        try write("\x1b[?25s\x1b[?1049h\x1b[?25l\x1b[?2004s\x1b[?2004h");
     }
 
     fn leave(self: *Terminal) Error!void {
@@ -84,7 +87,7 @@ pub const Terminal = struct {
             self.mode_active = false;
         }
         if (self.screen_active) {
-            write("\x1b[?1049l\x1b[?25r") catch |err| {
+            write("\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r") catch |err| {
                 if (failure == null) failure = err;
             };
             self.screen_active = false;
