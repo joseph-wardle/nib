@@ -8,7 +8,7 @@ const expect = std.testing.expect;
 const equal = std.testing.expectEqual;
 const frame = "\x1b[H\x1b[2J";
 const enter = "\x1b[?25s\x1b[?1049h\x1b[?25l\x1b[?2004s\x1b[?2004h";
-const leave = "\x18\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
+const leave = "\x1b\\\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
 const prompt = "NIBTEST> ";
 // Borrows main's path buffer for the lifetime of all checks.
 var fixture: [:0]const u8 = undefined;

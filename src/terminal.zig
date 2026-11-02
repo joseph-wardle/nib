@@ -95,16 +95,17 @@ pub const Terminal = struct {
             try self.write(self.cleanupBytes(&buffer));
             self.entry_written = 0;
         }
-        // Progress is recorded even on interruption/error. A restore is valid
-        // only after its save completed; incomplete escape sequences need CAN.
+        // Record progress even on interruption/error. Restore only modes
+        // whose saves completed; terminate incomplete escape sequences first.
         try self.writeProgress(screen_entry, &self.entry_written);
     }
 
     fn cleanupBytes(self: *const Terminal, buffer: *[cleanup_capacity]u8) []const u8 {
-        // CAN also makes a retry safe if a bounded cleanup stopped inside a
-        // CSI sequence, possibly followed by shell output during suspension.
+        // ST starts with ESC, cancelling an incomplete CSI, and terminates
+        // without printing or moving the cursor in Konsole. CAN prints a glyph.
+        // Resynchronize again when retrying cleanup after suspension.
         return std.fmt.bufPrint(buffer, "{s}{s}{s}{s}{s}", .{
-            if (self.entry_written != 0) "\x18" else "",
+            if (self.entry_written != 0) "\x1b\\" else "",
             if (self.entry_written >= alternate_enter.len) "\x1b[0m" else "",
             if (self.entry_written >= paste_save.len) "\x1b[?2004r" else "",
             if (self.entry_written >= alternate_enter.len) "\x1b[?1049l" else "",
@@ -357,7 +358,7 @@ test "interrupted entry restores only completed saves at every byte boundary" {
 }
 
 test "cleanup retries cancel incomplete escape sequences before restoring modes" {
-    const cleanup = "\x18\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
+    const cleanup = "\x1b\\\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
     for (1..cleanup.len + 1) |prefix| {
         try interruptedSetup(screen_entry.len, prefix, .TERM);
         try interruptedSetup(screen_entry.len, prefix, .TSTP);
@@ -402,13 +403,13 @@ fn interruptedSetup(entry_prefix: usize, cleanup_prefix: usize, signal: posix.SI
     const cleanup: []const u8 = if (entry_prefix == 0)
         ""
     else if (entry_prefix < 6)
-        "\x18"
+        "\x1b\\"
     else if (entry_prefix < 14)
-        "\x18\x1b[?25r"
+        "\x1b\\\x1b[?25r"
     else if (entry_prefix < 28)
-        "\x18\x1b[0m\x1b[?1049l\x1b[?25r"
+        "\x1b\\\x1b[0m\x1b[?1049l\x1b[?25r"
     else
-        "\x18\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
+        "\x1b\\\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
     var expected: [128]u8 = undefined;
     @memcpy(expected[0..entry_prefix], screen_entry[0..entry_prefix]);
     @memcpy(expected[entry_prefix..][0..cleanup_prefix], cleanup[0..cleanup_prefix]);
