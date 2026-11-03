@@ -1,107 +1,105 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const Motion = @import("motion.zig").Motion;
-pub const Movement = struct { motion: Motion, count: ?usize = null };
 
-pub const Command = union(enum) { move: Movement, quit };
+pub const escape_ms = 100;
+pub const Event = union(enum) {
+    key: u8,
+    escape,
+    ignored,
+    paste_begin,
+    paste_byte: u8,
+    paste_end,
+};
 
-/// Stateful across reads: sequence payloads must never become viewer commands.
-/// No escape-key action or timeout is needed. An unfinished sequence consumes
-/// input until its terminator; Ctrl-C and Ctrl-Z remain terminal signals.
-pub const Parser = struct {
+/// A failed paste delimiter can release at most five withheld payload bytes.
+/// Events borrow no storage and must be handled in order before the next feed.
+pub const Events = struct {
+    items: [7]Event = undefined,
+    len: usize = 0,
+
+    fn add(self: *Events, event: Event) void {
+        self.items[self.len] = event;
+        self.len += 1;
+    }
+};
+
+/// Terminal framing only. Recognized sequences never time out into key events.
+/// Paste is streamed, including hostile bytes; its consumer owns validation and
+/// atomic collection. Only an unrecognized, lone ESC has a deadline.
+pub const Decoder = struct {
     state: enum { ground, escape, intermediate, csi, string, string_escape, paste } = .ground,
+    deadline: ?i64 = null,
     paste_end: usize = 0,
     string_bell: bool = false,
     parameter: usize = 0,
     plain_parameter: bool = true,
 
-    count: ?usize = null,
-    count_overflow: bool = false,
-    pending_g: bool = false,
-
-    fn cancel(self: *Parser) void {
-        self.count = null;
-        self.count_overflow = false;
-        self.pending_g = false;
-    }
-
-    fn navigation(self: *Parser, byte: u8) ?Command {
-        if (!self.pending_g and byte >= '0' and byte <= '9' and (byte != '0' or self.count != null)) {
-            const value = std.math.mul(usize, self.count orelse 0, 10) catch {
-                self.count_overflow = true;
-                return null;
-            };
-            self.count = std.math.add(usize, value, byte - '0') catch {
-                self.count_overflow = true;
-                return null;
-            };
-            return null;
-        }
-        if (byte == 'g' and !self.pending_g and !self.count_overflow) {
-            self.pending_g = true;
-            return null;
-        }
-        const count = self.count;
-        const pending_g = self.pending_g;
-        const invalid = self.count_overflow;
-        self.cancel();
-        if (invalid) return null;
-        if (pending_g) return if (byte == 'g') .{ .move = .{ .motion = .first_line, .count = count } } else null;
-        const motion: Motion = switch (byte) {
-            'h' => .left,
-            'j' => .down,
-            'k' => .up,
-            'l' => .right,
-            '0' => .start,
-            '^' => .first,
-            '$' => .end,
-            'w' => .word,
-            'b' => .back,
-            'e' => .word_end,
-            'G' => .last_line,
-            'q' => return if (count == null) .quit else null,
-            else => return null,
+    pub fn expire(self: *Decoder, now: i64) Events {
+        var events: Events = .{};
+        if (self.deadline) |deadline| if (now >= deadline) {
+            self.deadline = null;
+            self.state = .ground;
+            events.add(.escape);
         };
-        return .{ .move = .{ .motion = motion, .count = count } };
+        return events;
     }
 
-    pub fn feed(self: *Parser, byte: u8) ?Command {
+    pub fn feed(self: *Decoder, byte: u8, now: i64) Events {
+        var events = self.expire(now);
         switch (self.state) {
-            .ground => {
-                if (byte == 0x1b) {
-                    self.cancel();
-                    self.state = .escape;
-                } else return self.navigation(byte);
-            },
-            .escape => switch (byte) {
-                '[' => {
-                    self.state = .csi;
-                    self.parameter = 0;
-                    self.plain_parameter = true;
-                },
-                ']', 'P', 'X', '^', '_' => {
-                    self.state = .string;
-                    self.string_bell = byte == ']';
-                },
-                'O' => self.state = .intermediate, // SS3 function/cursor keys.
-                0x20...0x2f => self.state = .intermediate,
-                0x1b => {},
-                else => self.state = .ground,
+            .ground => if (byte == 0x1b) {
+                self.state = .escape;
+                self.deadline = now + escape_ms;
+            } else events.add(.{ .key = byte }),
+            .escape => {
+                const lone = self.deadline != null;
+                self.deadline = null;
+                switch (byte) {
+                    '[' => {
+                        self.state = .csi;
+                        self.parameter = 0;
+                        self.plain_parameter = true;
+                        events.add(.ignored);
+                    },
+                    ']', 'P', 'X', '^', '_' => {
+                        self.state = .string;
+                        self.string_bell = byte == ']';
+                        events.add(.ignored);
+                    },
+                    'O', 0x20...0x2f => {
+                        self.state = .intermediate;
+                        events.add(.ignored);
+                    },
+                    0x1b => {
+                        if (lone) {
+                            events.add(.escape);
+                            self.deadline = now + escape_ms;
+                        }
+                    },
+                    else => {
+                        self.state = .ground;
+                        if (lone) {
+                            events.add(.escape);
+                            events.add(.{ .key = byte });
+                        }
+                    },
+                }
             },
             .intermediate => {
                 if (byte == 0x1b) self.state = .escape else if (byte >= 0x30 and byte <= 0x7e) self.state = .ground;
             },
             .csi => {
                 if (byte == 0x1b) {
+                    // An ESC inside a recognized sequence starts another
+                    // shielded sequence, never a timed standalone key.
                     self.state = .escape;
                 } else if (byte >= 0x40 and byte <= 0x7e) {
                     self.state = if (byte == '~' and self.plain_parameter and self.parameter == 200) .paste else .ground;
                     self.paste_end = 0;
+                    if (self.state == .paste) events.add(.paste_begin);
                 } else if (byte >= '0' and byte <= '9') {
                     self.parameter = @min(1000, self.parameter * 10 + byte - '0');
-                } else {
-                    self.plain_parameter = false;
-                }
+                } else self.plain_parameter = false;
             },
             .string => {
                 if (byte == 0x07 and self.string_bell) self.state = .ground else if (byte == 0x1b) self.state = .string_escape;
@@ -111,33 +109,75 @@ pub const Parser = struct {
             },
             .paste => {
                 const end = "\x1b[201~";
-                self.paste_end = if (byte == end[self.paste_end]) self.paste_end + 1 else if (byte == end[0]) 1 else 0;
-                if (self.paste_end == end.len) self.state = .ground;
+                if (byte == end[self.paste_end]) {
+                    self.paste_end += 1;
+                    if (self.paste_end == end.len) {
+                        self.state = .ground;
+                        self.paste_end = 0;
+                        events.add(.paste_end);
+                    }
+                } else {
+                    for (end[0..self.paste_end]) |held| events.add(.{ .paste_byte = held });
+                    self.paste_end = if (byte == end[0]) 1 else 0;
+                    if (self.paste_end == 0) events.add(.{ .paste_byte = byte });
+                }
             },
         }
-        return null;
+        return events;
     }
 };
 
-test "fragmented escape sequences and bracketed paste cannot execute commands" {
-    var parser: Parser = .{};
-    for ([_][]const u8{ "\x1b[A", "\x1bOq", "\x1bq", "\x1b[9999999999999q", "\x1b]qhjkl\x07", "\x1bPq\x07hjkl\x1b\\", "\x1bXqhjkl\x1b\\", "\x1b[200~qhjkl\x1b[20xq\x1b[201~", "\x1b(B" }) |sequence| {
-        for (sequence) |byte| try std.testing.expect(parser.feed(byte) == null);
-        try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .down } }, parser.feed('j').?);
-    }
-    try std.testing.expectEqualDeep(Command.quit, parser.feed('q').?);
+test "only lone Escape expires; unambiguous rapid commands survive" {
+    var decoder: Decoder = .{};
+    try std.testing.expectEqual(@as(usize, 0), decoder.feed(0x1b, 0).len);
+    try std.testing.expectEqual(@as(usize, 0), decoder.expire(99).len);
+    try std.testing.expectEqualDeep(Event.escape, decoder.expire(100).items[0]);
+    try std.testing.expect(decoder.deadline == null);
+    _ = decoder.feed(0x1b, 200);
+    const rapid = decoder.feed('i', 201);
+    try std.testing.expectEqual(@as(usize, 2), rapid.len);
+    try std.testing.expectEqualDeep(Event.escape, rapid.items[0]);
+    try std.testing.expectEqualDeep(Event{ .key = 'i' }, rapid.items[1]);
+    _ = decoder.feed(0x1b, 300);
+    const waited = decoder.feed('O', 400);
+    try std.testing.expectEqualDeep(Event.escape, waited.items[0]);
+    try std.testing.expectEqualDeep(Event{ .key = 'O' }, waited.items[1]);
 }
 
-test "navigation counts, zero, gg/G and invalid commands remain bounded" {
-    var parser: Parser = .{};
-    for ("12") |byte| try std.testing.expect(parser.feed(byte) == null);
-    try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .right, .count = 12 } }, parser.feed('l').?);
-    try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .start } }, parser.feed('0').?);
-    for ("20g") |byte| try std.testing.expect(parser.feed(byte) == null);
-    try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .first_line, .count = 20 } }, parser.feed('g').?);
-    try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .last_line } }, parser.feed('G').?);
-    for ("999999999999999999999999999999999999l") |byte| try std.testing.expect(parser.feed(byte) == null);
-    try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .word } }, parser.feed('w').?);
-    for ("2x3gq4\x1b[A") |byte| try std.testing.expect(parser.feed(byte) == null);
-    try std.testing.expectEqualDeep(Command{ .move = .{ .motion = .back } }, parser.feed('b').?);
+test "recognized sequences retain framing across arbitrary delays" {
+    for ([_][]const u8{ "\x1b[A", "\x1bOq", "\x1b[9999999999999q", "\x1b]qhjkl\x07", "\x1bPq\x07hjkl\x1b\\", "\x1bXqhjkl\x1b\\", "\x1b^qhjkl\x1b\\", "\x1b(B", "\x1b[123\x1b]qhjkl\x07", "\x1bO\x1bPqhjkl\x1b\\" }) |sequence| {
+        var decoder: Decoder = .{};
+        for (sequence, 0..) |byte, index| {
+            // Prefix arrives promptly; recognized payload may be arbitrarily late.
+            const events = decoder.feed(byte, if (index < 2) @intCast(index) else @intCast(index * 1000));
+            for (events.items[0..events.len]) |event| try std.testing.expect(event == .ignored);
+            if (index != 0) try std.testing.expect(decoder.deadline == null);
+        }
+        try std.testing.expectEqualDeep(Event{ .key = 'j' }, decoder.feed('j', 99999).items[0]);
+    }
+}
+
+test "paste framing preserves exact payload including false and overlapping delimiters" {
+    var decoder: Decoder = .{};
+    const payload = "q\x03\x1b[20x\x1b\x1b[201X\r\n";
+    var collected: [128]u8 = undefined;
+    var used: usize = 0;
+    var began = false;
+    var ended = false;
+    for ("\x1b[200~" ++ payload ++ "\x1b[201~") |byte| {
+        const events = decoder.feed(byte, 0);
+        for (events.items[0..events.len]) |event| switch (event) {
+            .ignored => {},
+            .paste_begin => began = true,
+            .paste_end => ended = true,
+            .paste_byte => |value| {
+                collected[used] = value;
+                used += 1;
+            },
+            else => return error.PayloadEscaped,
+        };
+    }
+    try std.testing.expect(began and ended);
+    try std.testing.expectEqualStrings(payload, collected[0..used]);
+    try std.testing.expectEqualDeep(Event{ .key = 'q' }, decoder.feed('q', 0).items[0]);
 }

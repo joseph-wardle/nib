@@ -48,6 +48,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "shellJobControl", shellJobControl },
         .{ "viewerWorkflow", viewerWorkflow },
         .{ "cursorMotions", cursorMotions },
+        .{ "modalCommands", modalCommands },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
@@ -271,6 +272,7 @@ const Process = struct {
         const mode = try posix.tcgetattr(self.slave);
         try expect(!mode.lflag.ECHO and !mode.lflag.ICANON);
         try expect(mode.lflag.ISIG and !mode.iflag.IXON);
+        try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.INTR)]);
     }
 
     // Wait without reading: the 60 KiB frame cannot fit in the PTY output
@@ -318,7 +320,7 @@ fn quitAndIdle(executable: [:0]const u8) !void {
     try process.ready();
     try equal(@as(usize, 0), process.used);
     try equal(@as(usize, 0), try process.read(150));
-    try process.send("q");
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -329,7 +331,7 @@ fn interruptAndTermination(executable: [:0]const u8) !void {
         var process = try Process.start(executable, .{});
         defer process.close();
         try process.ready();
-        if (sig == .INT) try process.send("\x03") else try process.signal(sig);
+        try process.signal(sig);
         try equal(@as(u8, 128 + @as(u8, @intCast(@backingInt(sig)))), try process.wait(false));
         try process.until(leave);
         try process.restored();
@@ -367,7 +369,7 @@ fn resizeAndSuspend(executable: [:0]const u8) !void {
         try process.signal(.CONT);
         try process.ready();
     }
-    try process.send("q");
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.restored();
 }
@@ -459,7 +461,7 @@ fn shellJobControl(executable: [:0]const u8) !void {
     try shell.excludes(enter);
     try shell.send("fg\n");
     try shell.until("Ctrl-Z suspend");
-    try shell.send("q");
+    try shell.send(":q\r");
     try shell.until(prompt);
     try shell.restored();
     @memcpy(command[length..][0..3], " &\n");
@@ -479,8 +481,8 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.send("2j3l");
     try process.until("3:4 | ");
     try process.until("\x1b[0m");
-    // Fragmented CSI, SS3, OSC, DCS, Alt-q and pasted commands are ignored.
-    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b]qhjkl", "\x07", "\x1bPq", "\x1b\\", "\x1bq", "\x1b[200~qhjkl\x1b[201~" }) |part| {
+    // Fragmented CSI, SS3, OSC, DCS and pasted commands are ignored.
+    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b]qhjkl", "\x07", "\x1bPq", "\x1b\\", "\x1b[200~qhjkl\x1b[201~" }) |part| {
         try process.send(part);
         try equal(@as(usize, 0), try process.read(20));
     }
@@ -511,7 +513,7 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.until("\x1b[1;1H\x1b[?25h");
     try process.ready();
     try equal(@as(usize, 0), try process.read(100));
-    try process.send("q");
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -554,11 +556,15 @@ fn cursorMotions(executable: [:0]const u8) !void {
         try process.until(case.position);
         try process.ready();
     }
-    // A refused count and an unsupported editing command cannot execute a
-    // truncated movement, redraw continuously, or modify this read-only viewer.
-    try process.send("99999999999999999999999999999999jdi");
-    try equal(@as(usize, 0), try process.read(100));
-    try process.send("q");
+    // A refused count cannot execute a truncated movement, redraw continuously,
+    // or modify this read-only viewer.
+    try process.send("99999999999999999999999999999999j");
+    try process.until("Unsupported command or count");
+    try process.ready();
+    try process.send("\x03");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(150));
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.restored();
 }
@@ -632,7 +638,7 @@ fn stalledOutputSuspend(executable: [:0]const u8) !void {
         try process.until(leave);
         try process.until(enter);
         try process.ready();
-        try process.send("q");
+        try process.send(":q\r");
         try equal(@as(u8, 0), try process.wait(false));
         try process.until(leave);
         try process.restored();
@@ -652,7 +658,7 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
     }
     const bytes = process.output[0..process.used];
     const start = (std.mem.indexOf(u8, bytes, frame) orelse return error.MissingOutput) + frame.len;
-    const status = std.mem.indexOf(u8, bytes, "\x1b[7mq quit") orelse return error.MissingOutput;
+    const status = std.mem.indexOf(u8, bytes, "\x1b[7m:q quit") orelse return error.MissingOutput;
     try equal(@as(usize, 199 * 301), status - start);
     for (0..199) |number| {
         var expected: [299]u8 = @splat(' ');
@@ -666,7 +672,78 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
         try std.testing.expectEqualStrings("\r\n", bytes[start + number * 301 + 299 ..][0..2]);
     }
     process.used = 0;
+    // Each large command-line frame also meets backpressure. Consume each
+    // frame before continuing so the bounded capture retains one at a time.
+    try process.send(":");
+    try process.ready();
     try process.send("q");
+    try process.ready();
+    try process.send("\r");
+    try process.until(leave);
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.restored();
+}
+
+fn modalCommands(executable: [:0]const u8) !void {
+    var process = try Process.start(executable, .{});
+    defer process.close();
+    try process.ready();
+    // Normal q cannot exit. Restricted Ex commands and refusal messages do not
+    // expose editing before saving is available.
+    try process.send("q");
+    try process.until("Unsupported command or count");
+    try process.ready();
+    try process.send("\x03");
+    try process.until(":q quit");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("Saving/reloading is not available yet");
+    try process.ready();
+    try process.send("\x03d");
+    try process.until("OPERATOR pending");
+    try process.ready();
+    const start = try now();
+    try process.send("\x1b");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.until(":q quit");
+    try expect(try now() - start >= 80 and try now() - start < 2000);
+    try process.ready();
+    // With no Escape pending the loop returns to indefinite idle waiting.
+    try equal(@as(usize, 0), try process.read(200));
+    try process.send("O");
+    try process.until("Editing is not available yet");
+    try process.ready();
+    try process.send("\x03d");
+    try process.until("OPERATOR pending");
+    try process.ready();
+    // An unambiguous following key cancels the operator immediately, rather
+    // than waiting or becoming an operator range.
+    try process.send("\x1bj");
+    try process.until("2:1 | ");
+    try process.ready();
+    // Recognized prefixes have no lone-Escape deadline. A payload arriving
+    // later than 100 ms stays shielded, including commands that could quit.
+    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b^", ":q!\r\x1b\\" }, .{ "\x1b[", "999q" } }) |parts| {
+        try process.send(parts[0]);
+        try equal(@as(usize, 0), try process.read(150));
+        try process.send(parts[1]);
+        try equal(@as(usize, 0), try process.read(20));
+    }
+    try process.send("\x0320g\x03j");
+    try process.until("3:1 | ");
+    try process.ready();
+    // Ctrl-C cancels a command line and paste cannot submit a quit command.
+    try process.send(":");
+    try process.ready();
+    try process.send("\x1b[200~q!\r\x03\x1b[201~");
+    try equal(@as(usize, 0), try process.read(150));
+    try process.send("\x03^");
+    try process.until("3:1 | ");
+    try process.ready();
+    try process.send("2d3w");
+    try process.until("Editing is not available yet");
+    try process.ready();
+    try process.send(":q!\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
