@@ -47,6 +47,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "disconnect", disconnect },
         .{ "shellJobControl", shellJobControl },
         .{ "viewerWorkflow", viewerWorkflow },
+        .{ "cursorMotions", cursorMotions },
+        .{ "modalCommands", modalCommands },
+        .{ "editingWorkflow", editingWorkflow },
+        .{ "pasteLifecycle", pasteLifecycle },
+        .{ "externalChanges", externalChanges },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
@@ -270,6 +275,9 @@ const Process = struct {
         const mode = try posix.tcgetattr(self.slave);
         try expect(!mode.lflag.ECHO and !mode.lflag.ICANON);
         try expect(mode.lflag.ISIG and !mode.iflag.IXON);
+        try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.INTR)]);
+        try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.SUSP)]);
+        try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.QUIT)]);
     }
 
     // Wait without reading: the 60 KiB frame cannot fit in the PTY output
@@ -317,7 +325,7 @@ fn quitAndIdle(executable: [:0]const u8) !void {
     try process.ready();
     try equal(@as(usize, 0), process.used);
     try equal(@as(usize, 0), try process.read(150));
-    try process.send("q");
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -328,7 +336,7 @@ fn interruptAndTermination(executable: [:0]const u8) !void {
         var process = try Process.start(executable, .{});
         defer process.close();
         try process.ready();
-        if (sig == .INT) try process.send("\x03") else try process.signal(sig);
+        try process.signal(sig);
         try equal(@as(u8, 128 + @as(u8, @intCast(@backingInt(sig)))), try process.wait(false));
         try process.until(leave);
         try process.restored();
@@ -339,10 +347,23 @@ fn resizeAndSuspend(executable: [:0]const u8) !void {
     var process = try Process.start(executable, .{});
     defer process.close();
     try process.ready();
-    for ([_][2]u16{ .{ 1, 1 }, .{ 0, 0 }, .{ 30, 100 } }) |size| {
+    for ([_][2]u16{ .{ 1, 1 }, .{ 0, 0 }, .{ 2, 2 }, .{ 30, 100 } }) |size| {
         var dimensions: posix.winsize = .{ .row = size[0], .col = size[1], .xpixel = 0, .ypixel = 0 };
         _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
         try process.until(frame);
+        if (size[0] <= 1 or size[1] <= 1) {
+            // Inspect the complete frame before ready consumes it.
+            const deadline = try now() + 5000;
+            while (std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m") == null) {
+                if (process.eof or try now() >= deadline) return error.OutputTimeout;
+                _ = try process.read(50);
+            }
+            try process.excludes("\x1b[?25h");
+            try process.ready();
+        } else if (size[0] == 2 and size[1] == 2) {
+            try process.until("\x1b[1;1H\x1b[?25h");
+            try process.ready();
+        }
     }
     try process.until("Ctrl-Z suspend");
     for (0..3) |_| {
@@ -353,7 +374,7 @@ fn resizeAndSuspend(executable: [:0]const u8) !void {
         try process.signal(.CONT);
         try process.ready();
     }
-    try process.send("q");
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.restored();
 }
@@ -445,7 +466,7 @@ fn shellJobControl(executable: [:0]const u8) !void {
     try shell.excludes(enter);
     try shell.send("fg\n");
     try shell.until("Ctrl-Z suspend");
-    try shell.send("q");
+    try shell.send(":q\r");
     try shell.until(prompt);
     try shell.restored();
     @memcpy(command[length..][0..3], " &\n");
@@ -462,11 +483,11 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.until("line000 ");
     try process.until("source'?[2J");
     try process.ready();
-    try process.send("jjlll");
+    try process.send("2j3l");
     try process.until("3:4 | ");
     try process.until("\x1b[0m");
-    // Fragmented CSI, SS3, OSC, DCS, Alt-q and pasted commands are ignored.
-    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b]qhjkl", "\x07", "\x1bPq", "\x1b\\", "\x1bq", "\x1b[200~qhjkl\x1b[201~" }) |part| {
+    // Fragmented CSI, SS3, OSC, DCS and pasted commands are ignored.
+    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b]qhjkl", "\x07", "\x1bPq", "\x1b\\", "\x1b[200~qhjkl\x1b[201~" }) |part| {
         try process.send(part);
         try equal(@as(usize, 0), try process.read(20));
     }
@@ -477,21 +498,27 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     var dimensions: posix.winsize = .{ .row = 4, .col = 12, .xpixel = 0, .ypixel = 0 };
     _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
     try process.signal(.CONT);
-    try process.until("e002 xxxxxx");
+    try process.until("line000 xxx");
+    try process.until("\x1b[3;4H\x1b[?25h");
     try process.ready();
     // Reach the final row and the final display column, then check the whole
     // clipped frame. The fixture ends with CRLF and contains an eight-stop tab.
     var movement: [128]u8 = undefined;
     @memset(&movement, 'j');
     try process.send(&movement);
-    try process.until("e059 xxxxxx\r\n");
+    try process.until("line059 xxx\r\n");
     try process.until("\x1b[0m");
     @memset(&movement, 'l');
     try process.send(&movement);
     try process.until("\x1b[H\x1b[2JxxTAIL    !\r\nxxTAIL    !\r\nxxTAIL    !\r\n");
+    try process.until("\x1b[3;11H\x1b[?25h");
+    try process.ready();
+    try process.send("gg0");
+    try process.until("line000 xxx\r\nline001 xxx\r\nline002 xxx\r\n");
+    try process.until("\x1b[1;1H\x1b[?25h");
     try process.ready();
     try equal(@as(usize, 0), try process.read(100));
-    try process.send("q");
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -508,6 +535,43 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
         for (bytes[number * 128 + 8 ..][0..112]) |byte| try equal(@as(u8, 'x'), byte);
         try std.testing.expectEqualStrings("TAIL\t!\r\n", bytes[number * 128 + 120 ..][0..8]);
     }
+}
+
+fn cursorMotions(executable: [:0]const u8) !void {
+    var process = try Process.start(executable, .{});
+    defer process.close();
+    try process.ready();
+    const cases = [_]struct { keys: []const u8, position: []const u8 }{
+        .{ .keys = "w", .position = "1:9 | " },
+        .{ .keys = "e", .position = "1:124 | " },
+        .{ .keys = "b", .position = "1:9 | " },
+        .{ .keys = "$", .position = "1:129 | " },
+        .{ .keys = "h", .position = "1:128 | " },
+        .{ .keys = "j", .position = "2:128 | " },
+        .{ .keys = "k", .position = "1:128 | " },
+        .{ .keys = "0", .position = "1:1 | " },
+        .{ .keys = "3G", .position = "3:1 | " },
+        .{ .keys = "G", .position = "60:1 | " },
+        .{ .keys = "gg", .position = "1:1 | " },
+        .{ .keys = "6w", .position = "3:1 | " },
+        .{ .keys = "2l^", .position = "3:1 | " },
+    };
+    for (cases) |case| {
+        try process.send(case.keys);
+        try process.until(case.position);
+        try process.ready();
+    }
+    // A refused count cannot execute a truncated movement, redraw continuously,
+    // or modify this read-only viewer.
+    try process.send("99999999999999999999999999999999j");
+    try process.until("Unsupported command or count");
+    try process.ready();
+    try process.send("\x03");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(150));
+    try process.send(":q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.restored();
 }
 
 fn startupFailures(executable: [:0]const u8) !void {
@@ -579,7 +643,7 @@ fn stalledOutputSuspend(executable: [:0]const u8) !void {
         try process.until(leave);
         try process.until(enter);
         try process.ready();
-        try process.send("q");
+        try process.send(":q\r");
         try equal(@as(u8, 0), try process.wait(false));
         try process.until(leave);
         try process.restored();
@@ -599,7 +663,7 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
     }
     const bytes = process.output[0..process.used];
     const start = (std.mem.indexOf(u8, bytes, frame) orelse return error.MissingOutput) + frame.len;
-    const status = std.mem.indexOf(u8, bytes, "\x1b[7mq quit") orelse return error.MissingOutput;
+    const status = std.mem.indexOf(u8, bytes, "\x1b[7m:q quit") orelse return error.MissingOutput;
     try equal(@as(usize, 199 * 301), status - start);
     for (0..199) |number| {
         var expected: [299]u8 = @splat(' ');
@@ -613,8 +677,355 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
         try std.testing.expectEqualStrings("\r\n", bytes[start + number * 301 + 299 ..][0..2]);
     }
     process.used = 0;
+    // Each large command-line frame also meets backpressure. Consume each
+    // frame before continuing so the bounded capture retains one at a time.
+    try process.send(":");
+    try process.ready();
     try process.send("q");
+    try process.ready();
+    try process.send("\r");
+    try process.until(leave);
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.restored();
+}
+
+fn modalCommands(executable: [:0]const u8) !void {
+    var process = try Process.start(executable, .{});
+    defer process.close();
+    try process.ready();
+    // Normal q cannot exit. Editing and saving use explicit modal commands.
+    try process.send("q");
+    try process.until("Unsupported command or count");
+    try process.ready();
+    try process.send("\x03");
+    try process.until(":q quit");
+    try process.ready();
+    try process.send(":e!\r");
+    try process.until("Reloaded; local edits and history discarded");
+    try process.ready();
+    try process.send("\x03d");
+    try process.until("OPERATOR pending");
+    try process.ready();
+    const start = try now();
+    try process.send("\x1b");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.until(":q quit");
+    try expect(try now() - start >= 80 and try now() - start < 2000);
+    try process.ready();
+    // With no Escape pending the loop returns to indefinite idle waiting.
+    try equal(@as(usize, 0), try process.read(200));
+    try process.send("O");
+    try process.until("INSERT");
+    try process.ready();
+    try process.send("\x03ud");
+    try process.until("OPERATOR pending");
+    try process.ready();
+    // An unambiguous following key cancels the operator immediately, rather
+    // than waiting or becoming an operator range.
+    try process.send("\x1bj");
+    try process.until("2:1 | ");
+    try process.ready();
+    // Recognized prefixes have no lone-Escape deadline. A payload arriving
+    // later than 100 ms stays shielded, including commands that could quit.
+    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b^", ":q!\r\x1b\\" }, .{ "\x1b[", "999q" } }) |parts| {
+        try process.send(parts[0]);
+        try equal(@as(usize, 0), try process.read(150));
+        try process.send(parts[1]);
+        try equal(@as(usize, 0), try process.read(20));
+    }
+    try process.send("\x0320g\x03j");
+    try process.until("3:1 | ");
+    try process.ready();
+    // Ctrl-C cancels a command line and paste cannot submit a quit command.
+    try process.send(":");
+    try process.ready();
+    try process.send("\x1b[200~q!\r\x03\x1b[201~");
+    try equal(@as(usize, 0), try process.read(150));
+    try process.send("\x03^");
+    try process.until("3:1 | ");
+    try process.ready();
+    try process.send("2d3w");
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try process.send(":q!\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
+}
+
+fn putFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd: posix.fd_t = @intCast(try checked(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600)));
+    defer _ = linux.close(fd);
+    try write(fd, bytes);
+}
+
+fn expectFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd: posix.fd_t = @intCast(try checked(linux.open(path, .{ .ACCMODE = .RDONLY }, 0)));
+    defer _ = linux.close(fd);
+    var buffer: [1024]u8 = undefined;
+    const count = try checked(linux.read(fd, &buffer, buffer.len));
+    try std.testing.expectEqualStrings(bytes, buffer[0..count]);
+}
+
+// Synchronize each input byte with its resulting frame. This keeps tests about
+// editing independent of PTY backpressure and bounded frame-capture capacity.
+fn editingKeys(process: *Process, bytes: []const u8) !void {
+    for (bytes) |byte| {
+        try process.send(&.{byte});
+        try process.ready();
+    }
+}
+
+fn editingWorkflow(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-edit-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    var copy_buffer: [128]u8 = undefined;
+    const copy_path = try std.fmt.bufPrintSentinel(&copy_buffer, "/tmp/nib-copy-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(copy_path);
+    try putFile(path, "abc\r\nlast");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    try editingKeys(&process, "G$a\rX\tY\x7fZ");
+    try process.send("\x03");
+    try process.until("3:9 | ");
+    try process.until("\x1b[3;9H\x1b[?25h");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try expectFile(path, "abc\r\nlast");
+    var command: [256]u8 = undefined;
+    try process.send(try std.fmt.bufPrint(&command, ":w {s}\r", .{copy_path}));
+    try process.until("Copy written");
+    try process.ready();
+    try expectFile(copy_path, "abc\r\nlast\r\nX\tZ");
+    try process.send(try std.fmt.bufPrint(&command, ":w {s}\r", .{copy_path}));
+    try process.until("Copy destination exists");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try expectFile(path, "abc\r\nlast\r\nX\tZ");
+    try process.send("u");
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try editingKeys(&process, "\x12");
+    try process.send(":q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    // Reopen saved bytes, then let an independent writer change the source.
+    var reopened = try Process.start(executable, .{ .path = path });
+    defer reopened.close();
+    try reopened.until("last");
+    try reopened.ready();
+    try editingKeys(&reopened, "cwLOCAL\x03");
+    try putFile(path, "external\n");
+    try reopened.send(":w\r");
+    try reopened.until("Source changed or missing");
+    try reopened.ready();
+    try expectFile(path, "external\n");
+    // The refused save retains undo: undo the local command, redo, then discard.
+    try editingKeys(&reopened, "u\x12");
+    try reopened.send(":q!\r");
+    try equal(@as(u8, 0), try reopened.wait(false));
+    try reopened.until(leave);
+    try reopened.restored();
+    try expectFile(path, "external\n");
+    // Unsupported source bytes stay exact and visibly read-only.
+    try putFile(path, "raw\xff\r");
+    var readonly = try Process.start(executable, .{ .path = path });
+    defer readonly.close();
+    try readonly.until("read-only");
+    try readonly.ready();
+    try readonly.send("i");
+    try readonly.until("Read-only: non-ASCII");
+    try readonly.ready();
+    try readonly.send(":w\r");
+    try readonly.until("Written");
+    try readonly.ready();
+    try readonly.send(":q\r");
+    try equal(@as(u8, 0), try readonly.wait(false));
+    try readonly.restored();
+    try expectFile(path, "raw\xff\r");
+}
+
+fn pasteLifecycle(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-paste-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    try putFile(path, "base\r\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    try editingKeys(&process, "iX");
+    // Signal characters must reach paste validation, even if the whole frame
+    // is already queued in the kernel before its begin delimiter is decoded.
+    for ([_]u8{ 3, 26, 28, 0, 0xff }) |control| {
+        const packet = [_]u8{ 27, '[', '2', '0', '0', '~', 'B', control, 'D', 27, '[', '2', '0', '1', '~' };
+        try process.send(&packet);
+        try process.until("Unsupported paste");
+        try process.ready();
+    }
+    // Real suspension during collection discards the entire pending paste.
+    try process.send("\x1b[200~");
+    try process.ready();
+    try process.send("partial");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.signal(.TSTP);
+    _ = try process.wait(true);
+    try process.until(leave);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until("Paste interrupted");
+    try process.ready();
+    try process.send("remaining\x1b[201~");
+    try equal(@as(usize, 0), try process.read(30));
+    // A following valid paste is part of the original insertion group.
+    try process.send("\x1b[200~A\nB\r\nC\rD\t\x1b[201~");
+    try process.until("XA");
+    try process.ready();
+    try editingKeys(&process, "\x03u\x12");
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try expectFile(path, "XA\r\nB\r\nC\r\nD\tbase\r\n");
+    // Keyboard suspension also retains a dirty insertion and its undo group.
+    try editingKeys(&process, "iQ");
+    try process.send("\x1a");
+    _ = try process.wait(true);
+    try process.until(leave);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until("INSERT [+]");
+    try process.ready();
+    try editingKeys(&process, "R");
+    try process.send("\x1b");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try editingKeys(&process, "u");
+    try process.send(":q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, "XA\r\nB\r\nC\r\nD\tbase\r\n");
+}
+
+fn externalChanges(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-external-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    var replacement_buffer: [128]u8 = undefined;
+    const replacement = try std.fmt.bufPrintSentinel(&replacement_buffer, "/tmp/nib-replacement-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(replacement);
+    try putFile(path, "original\nlast");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    // Idle atomic replacement reloads without keyboard activity.
+    try putFile(replacement, "renamed\n");
+    _ = try checked(linux.rename(replacement, path));
+    try process.until("renamed");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    // A pending operator retains old text until cancelled.
+    try process.send("d");
+    try process.until("OPERATOR pending");
+    try process.ready();
+    try putFile(path, "pending\n");
+    try process.until("renamed");
+    try process.until("DISK CONFLICT | OPERATOR pending");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("\x03");
+    try process.until("pending");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Even a clean insert session postpones reloading; subsequent typing is local.
+    try process.send("i");
+    try process.until("INSERT");
+    try process.ready();
+    try putFile(path, "outside\n");
+    try process.until("pending");
+    try process.until("DISK CONFLICT");
+    try process.ready();
+    try process.send("X\x03");
+    try process.until("Xpending");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("save refused");
+    try process.ready();
+    try expectFile(path, "outside\n");
+    var copy_command: [256]u8 = undefined;
+    try process.send(try std.fmt.bufPrint(&copy_command, ":w {s}\r", .{replacement}));
+    try process.until("Copy written");
+    try process.ready();
+    try expectFile(replacement, "Xpending\n");
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try process.send(":e!\r");
+    try process.until("outside");
+    try process.until("Reloaded; local edits and history discarded");
+    try process.ready();
+    try process.send("u");
+    try process.until("No more history");
+    try process.ready();
+    // Deletion retains clean text; neither :w nor a failed :e! recreates it.
+    _ = try checked(linux.unlink(path));
+    try process.until("outside");
+    try process.until("SOURCE MISSING");
+    try process.ready();
+    try process.send(":e!\r");
+    try process.until("Reload failed; local state retained");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("save refused");
+    try process.ready();
+    try equal(posix.E.NOENT, posix.errno(linux.access(path, linux.F_OK)));
+    try putFile(path, "recreated\n");
+    try process.until("recreated");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Resume validation is independent of queued events. A clean pending command
+    // survives suspension and holds the replacement until cancellation.
+    // Decoded Ctrl-Z follows the count in input order, so the count is known
+    // to be pending before suspension without racing an external signal.
+    try process.send("2\x1a");
+    try process.until(leave);
+    try equal(@as(u8, 19), try process.wait(true));
+    try process.restored();
+    try putFile(path, "resumed\n");
+    _ = try checked(linux.kill(process.pid, .CONT));
+    try process.until(enter);
+    try process.until("DISK CONFLICT");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("resumed");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Saving and processing our own notification must retain clean undo history.
+    try editingKeys(&process, "iY\x03");
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("u");
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try process.send("\x12:q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, "Yresumed\n");
 }

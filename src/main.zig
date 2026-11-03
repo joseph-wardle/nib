@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const terminal = @import("terminal.zig");
-const source = @import("snapshot.zig");
+const source = @import("file.zig");
+const Buffer = @import("buffer.zig").Buffer;
+const motion = @import("motion.zig");
 const view = @import("view.zig");
 const input = @import("input.zig");
+const commands = @import("command.zig");
+const Editor = @import("editor.zig").Editor;
+const External = @import("external.zig").External;
 
 pub fn main(init: std.process.Init) u8 {
     var args = init.minimal.args.iterate();
@@ -37,52 +42,148 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const u8) !u8 {
-    var snapshot = try source.Snapshot.load(init.gpa, init.io, .cwd(), path);
-    defer snapshot.deinit(init.gpa);
+    var document = try source.Source.load(init.gpa, init.io, .cwd(), path);
+    defer document.deinit(init.gpa);
+    const buffer = &document.buffer;
+    var editor: Editor = .{};
+    defer editor.deinit(init.gpa);
+    var external: External = .{};
+    defer external.deinit(init.gpa);
+    external.inspect(init.gpa, &document, true);
+    var suspension_count = session.suspension_count;
+    var resumption_count = session.resumption_count;
+    var save_notice: [256]u8 = undefined;
     var viewport: view.Viewport = .{};
-    var parser: input.Parser = .{};
+    var decoder: input.Decoder = .{};
+
     var dimensions: terminal.Size = .{ .rows = 0, .columns = 0 };
     while (true) {
         var redraw = false;
-        switch (try session.next()) {
-            .redraw => |size| {
-                dimensions = size;
-                viewport.clamp(snapshot, size.rows -| 1, size.columns -| 1);
-                redraw = true;
-            },
-            .input => |byte| if (parser.feed(byte)) |command| {
-                switch (command) {
-                    .quit => return 0,
-                    .move => |direction| redraw = viewport.move(snapshot, dimensions.rows -| 1, dimensions.columns -| 1, direction),
+        var events: input.Events = .{};
+        session.watch_fd = external.watch.fd;
+        switch (try session.next(decoder.deadline)) {
+            .source_changed => {
+                const old_status = external.status();
+                if (external.watch.drain()) {
+                    external.inspect(init.gpa, &document, true);
+                    redraw = !std.mem.eql(u8, old_status, external.status());
                 }
             },
+            .redraw => |size| {
+                dimensions = size;
+                viewport.follow(buffer, size.rows -| 1, size.columns -| 1, editor.inserting());
+                redraw = true;
+            },
+            .input => |byte| events = decoder.feed(byte, try terminal.milliseconds()),
+            .timeout => events = decoder.expire(try terminal.milliseconds()),
             .quit => |code| return code,
         }
-        if (redraw) draw(session, snapshot, viewport, dimensions, path) catch |err| {
+        if (suspension_count != session.suspension_count or resumption_count != session.resumption_count) {
+            suspension_count = session.suspension_count;
+            resumption_count = session.resumption_count;
+            editor.interruptPaste();
+            external.inspect(init.gpa, &document, true);
+            redraw = true;
+        }
+        for (events.items[0..events.len]) |event| {
+            if (event == .key and event.key == 26) {
+                session.requestSuspend();
+                continue;
+            }
+            const old_mode = editor.parser.mode;
+            const old_length = editor.parser.line_len;
+            const old_cursor = buffer.cursor;
+            const old_position = buffer.position;
+            const old_text_length = buffer.bytes().len;
+            const old_notice = editor.notice;
+            if (editor.feed(init.gpa, buffer, event)) |file| switch (file) {
+                .quit => |discard| {
+                    if (discard or !buffer.modified()) return 0;
+                    editor.notice = "Unsaved changes; use :q! to discard";
+                },
+                .write => |copy_path| {
+                    const result = if (copy_path.len == 0)
+                        document.source.save(init.gpa, buffer, .{})
+                    else
+                        source.copy(init.gpa, init.io, .cwd(), copy_path, buffer, .{});
+                    if (copy_path.len == 0) external.inspect(init.gpa, &document, true);
+                    editor.notice = saveNotice(result, copy_path.len != 0);
+                    if (result.cleanup_failure) editor.notice = std.fmt.bufPrint(&save_notice, "{s}; cleanup failed", .{editor.notice}) catch unreachable;
+                },
+                .reload => {
+                    _ = external.reload(init.gpa, init.io, &document, &editor, true);
+                    redraw = true;
+                },
+            };
+            redraw = redraw or old_mode != editor.parser.mode or old_length != editor.parser.line_len or old_cursor != buffer.cursor or old_position != buffer.position or old_text_length != buffer.bytes().len or !std.mem.eql(u8, old_notice, editor.notice);
+        }
+        redraw = external.automatic(init.gpa, init.io, &document, &editor) or redraw;
+        viewport.follow(buffer, dimensions.rows -| 1, dimensions.columns -| 1, editor.inserting());
+        if (redraw) draw(session, buffer, viewport, dimensions, path, &editor.parser, editor.notice, &external) catch |err| {
             if (err != error.Interrupted) return err;
         };
     }
 }
 
-fn draw(session: *terminal.Terminal, snapshot: source.Snapshot, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8) terminal.Error!void {
-    try session.write("\x1b[H\x1b[2J");
+fn saveNotice(result: source.Report, copy: bool) []const u8 {
+    if (result.publication == .uncertain) return "Save outcome uncertain; inspect disk before retrying";
+    if (result.publication == .installed and !result.verified) return "Bytes installed but changed/unverified; local edits retained";
+    if (result.publication == .installed and !result.durable) return "Bytes installed and verified; durability not confirmed";
+    if (result.publication == .installed and result.failure != null) return "Bytes installed and verified; save reported an error";
+    if (result.failure) |err| return switch (err) {
+        error.SourceChanged, error.FileNotFound, error.UnstableSource => "Source changed or missing; save refused; :e! reloads; :w <new-path> copies",
+        error.MultiplyLinked => "Hard-linked source; use :w <new-path>",
+        error.AccessDenied => "Write permission denied; save refused",
+        error.PathAlreadyExists => "Copy destination exists; choose a new path",
+        error.MetadataUnavailable, error.UnsupportedFlags => "Cannot preserve source metadata; save refused",
+        error.OutOfMemory => "Not enough memory; save refused",
+        else => @errorName(err),
+    };
+    return if (copy) "Copy written; source association and unsaved status retained" else "Written";
+}
+
+fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8, parser: *const commands.Parser, notice: []const u8, external: *const External) terminal.Error!void {
+    try session.write("\x1b[?25l\x1b[H\x1b[2J");
     // Reserve the last column on every row to avoid autowrap, including the
     // bottom-right cell. A fixed row buffer covers every u16 terminal width.
-    var buffer: [std.math.maxInt(u16)]u8 = undefined;
-    const row = buffer[0..dimensions.columns -| 1];
+    var row_buffer: [std.math.maxInt(u16)]u8 = undefined;
+    const full_row = row_buffer[0..dimensions.columns -| 1];
+    var row = full_row;
     if (dimensions.rows != 0 and row.len != 0) {
         for (0..dimensions.rows - 1) |number| {
-            viewport.renderRow(snapshot, number, row);
+            viewport.renderRow(buffer, number, row);
             try session.write(row);
             try session.write("\r\n");
         }
+        const warning = external.status();
+        const warning_len = @min(warning.len, row.len);
+        @memcpy(row[0..warning_len], warning[0..warning_len]);
+        row = row[warning_len..];
         var status: [128]u8 = undefined;
-        const label = std.fmt.bufPrint(&status, "q quit | hjkl scroll | Ctrl-Z suspend | {d}:{d} | ", .{ viewport.top + 1, viewport.left + 1 }) catch unreachable;
-        const prefix = @min(label.len, row.len);
-        @memcpy(row[0..prefix], label[0..prefix]);
-        view.renderText(path, 0, row[prefix..]);
+        const label = std.fmt.bufPrint(&status, ":q quit | Ctrl-Z suspend | {s}{s} | {d}:{d} | ", .{ if (parser.mode == .insert) "INSERT" else "NORMAL", if (buffer.modified()) " [+]" else if (!buffer.editable) " [read-only: unsupported bytes]" else "", buffer.rowAt(buffer.cursor) + 1, motion.screenColumn(buffer, buffer.cursor, parser.mode == .insert) + 1 }) catch unreachable;
+        if (row.len == 0) {
+            // The persistent disk/monitor status fills tiny status rows.
+        } else if (parser.mode == .command_line) {
+            row[0] = ':';
+            // Keep the end of a long command visible in the reserved status row.
+            const left = parser.line_len -| (row.len - 1);
+            view.renderText(parser.line[0..parser.line_len], left, row[1..]);
+        } else if (parser.mode == .operator) {
+            view.renderText("OPERATOR pending | Escape/Ctrl-C cancel", 0, row);
+        } else if (notice.len != 0) {
+            view.renderText(notice, 0, row);
+        } else {
+            const prefix = @min(label.len, row.len);
+            @memcpy(row[0..prefix], label[0..prefix]);
+            view.renderText(path, 0, row[prefix..]);
+        }
         try session.write("\x1b[7m");
-        try session.write(row);
+        try session.write(full_row);
+    }
+    try session.write("\x1b[27m");
+    if (viewport.cursor(buffer, dimensions.rows -| 1, dimensions.columns -| 1, parser.mode == .insert)) |cell| {
+        var position: [48]u8 = undefined;
+        try session.write(std.fmt.bufPrint(&position, "\x1b[{d};{d}H\x1b[?25h", .{ cell.row + 1, cell.column + 1 }) catch unreachable);
     }
     try session.write("\x1b[0m");
 }
@@ -98,6 +199,7 @@ fn report(err: anyerror) void {
         error.TooManyLines => "file exceeds the temporary 262,144-line viewer limit",
         error.OutputBlocked => "screen cleanup blocked by terminal output",
         error.OutOfMemory => "not enough memory to open the file",
+        error.UnstableSource, error.SourceChanged => "file changed while loading; try again",
         else => @errorName(err),
     };
     diagnostic(message);
@@ -110,8 +212,22 @@ fn diagnostic(message: []const u8) void {
 }
 
 test {
+    _ = @import("external.zig");
+    _ = @import("editor.zig");
+    _ = @import("file.zig");
+    _ = @import("buffer.zig");
     _ = @import("terminal.zig");
     _ = @import("snapshot.zig");
     _ = @import("view.zig");
     _ = @import("input.zig");
+    _ = @import("command.zig");
+}
+
+test "save notices distinguish failure, uncertain publication and installed durability" {
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .failure = error.SourceChanged }, false), "Source changed"));
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .uncertain, .failure = error.PublishFailed }, false), "Save outcome uncertain"));
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .installed, .failure = error.SourceChanged }, false), "Bytes installed but changed/unverified"));
+    try std.testing.expectEqualStrings("Bytes installed and verified; durability not confirmed", saveNotice(.{ .publication = .installed, .verified = true, .failure = error.SyncFailed }, false));
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .installed, .verified = true, .durable = true, .failure = error.InjectedFailure }, false), "Bytes installed and verified"));
+    try std.testing.expectEqualStrings("Written", saveNotice(.{ .publication = .installed, .verified = true, .durable = true }, false));
 }

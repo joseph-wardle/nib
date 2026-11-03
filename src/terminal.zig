@@ -4,7 +4,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 pub const Size = struct { rows: u16, columns: u16 };
-pub const Event = union(enum) { input: u8, redraw: Size, quit: u8 };
+pub const Event = union(enum) { input: u8, redraw: Size, quit: u8, timeout, source_changed };
 pub const Error = error{
     NotATerminal,
     NotForeground,
@@ -37,6 +37,9 @@ pub const Terminal = struct {
     saved_mode: posix.termios,
     saved_mask: posix.sigset_t,
     signal_fd: posix.fd_t,
+    suspension_count: usize = 0,
+    resumption_count: usize = 0,
+    watch_fd: posix.fd_t = -1,
     saved_output_flags: usize,
     output_flags_active: bool = false,
     pending: Signals = .{},
@@ -79,6 +82,12 @@ pub const Terminal = struct {
         mode.lflag.ECHONL = false;
         mode.lflag.IEXTEN = false;
         mode.lflag.ISIG = true;
+        // Deliver control keys to the decoder, including inside bracketed
+        // paste. The application requests suspension for an ordinary Ctrl-Z.
+        // External lifecycle signals still arrive through signalfd.
+        mode.cc[@backingInt(linux.V.INTR)] = 0;
+        mode.cc[@backingInt(linux.V.SUSP)] = 0;
+        mode.cc[@backingInt(linux.V.QUIT)] = 0;
         mode.iflag.IXON = false;
         mode.iflag.ICRNL = false;
         mode.oflag.OPOST = false;
@@ -142,15 +151,21 @@ pub const Terminal = struct {
         if (failure) |err| return err;
     }
 
-    /// Blocks until input or a lifecycle event. Signals are drained before
-    /// entering/redrawing, so a queued termination wins over resume or input.
-    pub fn next(self: *Terminal) Error!Event {
+    /// Request the existing lifecycle transition for a decoded keyboard Ctrl-Z.
+    pub fn requestSuspend(self: *Terminal) void {
+        self.pending.should_suspend = true;
+    }
+
+    /// Blocks until input, lifecycle activity, or an optional monotonic deadline.
+    /// Signals are drained first; queued termination wins over resume or input.
+    pub fn next(self: *Terminal, deadline: ?i64) Error!Event {
         while (true) {
             try self.readSignals();
             const signals = self.pending;
             self.pending = .{};
             if (signals.exit_code) |code| return .{ .quit = code };
             if (signals.should_suspend) {
+                self.suspension_count +%= 1;
                 self.leave() catch |err| {
                     if (err != error.OutputBlocked) return err;
                     // Termios/descriptor flags are already restored. A stalled
@@ -186,8 +201,10 @@ pub const Terminal = struct {
             var fds = [_]linux.pollfd{
                 .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 },
                 .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 },
+                .{ .fd = self.watch_fd, .events = linux.POLL.IN, .revents = 0 },
             };
-            const result = linux.poll(&fds, fds.len, -1);
+            const timeout: i32 = if (deadline) |end| @intCast(@min(std.math.maxInt(i32), @max(0, end - try milliseconds()))) else -1;
+            const result = linux.poll(&fds, fds.len, timeout);
             switch (posix.errno(result)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -198,6 +215,7 @@ pub const Terminal = struct {
                     return error.SignalReadFailed;
                 continue;
             }
+            if (result == 0) return .timeout;
             if (fds[1].revents & (linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL) != 0)
                 return error.TerminalUnavailable;
             if (fds[1].revents & linux.POLL.IN != 0) {
@@ -209,6 +227,7 @@ pub const Terminal = struct {
                     else => return error.InputFailed,
                 }
             }
+            if (fds[2].revents != 0) return .source_changed;
         }
     }
 
@@ -273,7 +292,10 @@ pub const Terminal = struct {
                 .INT, .TERM, .HUP => self.pending.exit_code = @intCast(128 + info.signo),
                 .TSTP => self.pending.should_suspend = true,
                 .WINCH => self.pending.resize = true,
-                .CONT => {},
+                .CONT => {
+                    self.resumption_count +%= 1;
+                    self.pending.resize = true;
+                },
                 else => unreachable,
             }
         }
@@ -311,7 +333,7 @@ fn writeAvailable(fd: posix.fd_t, remaining: *[]const u8) Error!void {
     }
 }
 
-fn milliseconds() Error!i64 {
+pub fn milliseconds() Error!i64 {
     var time: linux.timespec = undefined;
     if (posix.errno(linux.clock_gettime(.MONOTONIC, &time)) != .SUCCESS) return error.WaitFailed;
     return time.sec * 1000 + @divTrunc(time.nsec, 1_000_000);
