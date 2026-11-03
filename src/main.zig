@@ -7,6 +7,7 @@ const motion = @import("motion.zig");
 const view = @import("view.zig");
 const input = @import("input.zig");
 const commands = @import("command.zig");
+const Editor = @import("editor.zig").Editor;
 
 pub fn main(init: std.process.Init) u8 {
     var args = init.minimal.args.iterate();
@@ -43,11 +44,13 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
     var document = try source.Source.load(init.gpa, init.io, .cwd(), path);
     defer document.deinit(init.gpa);
     const buffer = &document.buffer;
-    var goal: motion.Goal = 0;
+    var editor: Editor = .{};
+    defer editor.deinit(init.gpa);
+    var suspension_count = session.suspension_count;
+    var save_notice: [256]u8 = undefined;
     var viewport: view.Viewport = .{};
     var decoder: input.Decoder = .{};
-    var parser: commands.Parser = .{};
-    var notice: []const u8 = "";
+
     var dimensions: terminal.Size = .{ .rows = 0, .columns = 0 };
     while (true) {
         var redraw = false;
@@ -55,49 +58,67 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
         switch (try session.next(decoder.deadline)) {
             .redraw => |size| {
                 dimensions = size;
-                viewport.follow(buffer, size.rows -| 1, size.columns -| 1, false);
+                viewport.follow(buffer, size.rows -| 1, size.columns -| 1, editor.inserting());
                 redraw = true;
             },
             .input => |byte| events = decoder.feed(byte, try terminal.milliseconds()),
             .timeout => events = decoder.expire(try terminal.milliseconds()),
             .quit => |code| return code,
         }
-        for (events.items[0..events.len]) |event| {
-            const old_mode = parser.mode;
-            const old_length = parser.line_len;
-            const old_notice = notice;
-            if (event == .escape or (event == .key and event.key == 3)) notice = "";
-            if (parser.feed(event)) |action| switch (action) {
-                .move => |movement| {
-                    notice = "";
-                    if (motion.resolve(buffer, goal, movement.motion, movement.count, null)) |result| {
-                        redraw = redraw or result.destination != buffer.cursor;
-                        buffer.cursor = result.destination;
-                        goal = result.goal;
-                        viewport.follow(buffer, dimensions.rows -| 1, dimensions.columns -| 1, false);
-                    }
-                },
-                .file => |file| switch (file) {
-                    .quit => |discard| {
-                        if (discard or !buffer.modified()) return 0;
-                        notice = "Unsaved changes; use :q! to discard";
-                    },
-                    .write, .reload => notice = "Saving/reloading is not available yet",
-                },
-                .invalid => notice = "Unsupported command or count",
-                else => {
-                    // Do not expose mutations until saving and grouped editing
-                    // are connected. Refused insert entry returns to normal.
-                    parser.cancel();
-                    notice = "Editing is not available yet";
-                },
-            };
-            redraw = redraw or old_mode != parser.mode or old_length != parser.line_len or !std.mem.eql(u8, old_notice, notice);
+        if (suspension_count != session.suspension_count) {
+            suspension_count = session.suspension_count;
+            editor.interruptPaste();
         }
-        if (redraw) draw(session, buffer, viewport, dimensions, path, &parser, notice) catch |err| {
+        for (events.items[0..events.len]) |event| {
+            if (event == .key and event.key == 26) {
+                session.requestSuspend();
+                continue;
+            }
+            const old_mode = editor.parser.mode;
+            const old_length = editor.parser.line_len;
+            const old_cursor = buffer.cursor;
+            const old_position = buffer.position;
+            const old_text_length = buffer.bytes().len;
+            const old_notice = editor.notice;
+            if (editor.feed(init.gpa, buffer, event)) |file| switch (file) {
+                .quit => |discard| {
+                    if (discard or !buffer.modified()) return 0;
+                    editor.notice = "Unsaved changes; use :q! to discard";
+                },
+                .write => |copy_path| {
+                    const result = if (copy_path.len == 0)
+                        document.source.save(init.gpa, buffer, .{})
+                    else
+                        source.copy(init.gpa, init.io, .cwd(), copy_path, buffer, .{});
+                    editor.notice = saveNotice(result, copy_path.len != 0);
+                    if (result.cleanup_failure) editor.notice = std.fmt.bufPrint(&save_notice, "{s}; cleanup failed", .{editor.notice}) catch unreachable;
+                },
+                .reload => editor.notice = "Reloading is not available yet",
+            };
+            redraw = redraw or old_mode != editor.parser.mode or old_length != editor.parser.line_len or old_cursor != buffer.cursor or old_position != buffer.position or old_text_length != buffer.bytes().len or !std.mem.eql(u8, old_notice, editor.notice);
+        }
+        viewport.follow(buffer, dimensions.rows -| 1, dimensions.columns -| 1, editor.inserting());
+        if (redraw) draw(session, buffer, viewport, dimensions, path, &editor.parser, editor.notice) catch |err| {
             if (err != error.Interrupted) return err;
         };
     }
+}
+
+fn saveNotice(result: source.Report, copy: bool) []const u8 {
+    if (result.publication == .uncertain) return "Save outcome uncertain; inspect disk before retrying";
+    if (result.publication == .installed and !result.verified) return "Bytes installed but changed/unverified; local edits retained";
+    if (result.publication == .installed and !result.durable) return "Bytes installed and verified; durability not confirmed";
+    if (result.publication == .installed and result.failure != null) return "Bytes installed and verified; save reported an error";
+    if (result.failure) |err| return switch (err) {
+        error.SourceChanged, error.FileNotFound, error.UnstableSource => "Source changed or missing; save refused; use :w <new-path>",
+        error.MultiplyLinked => "Hard-linked source; use :w <new-path>",
+        error.AccessDenied => "Write permission denied; save refused",
+        error.PathAlreadyExists => "Copy destination exists; choose a new path",
+        error.MetadataUnavailable, error.UnsupportedFlags => "Cannot preserve source metadata; save refused",
+        error.OutOfMemory => "Not enough memory; save refused",
+        else => @errorName(err),
+    };
+    return if (copy) "Copy written; source association and unsaved status retained" else "Written";
 }
 
 fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8, parser: *const commands.Parser, notice: []const u8) terminal.Error!void {
@@ -113,7 +134,7 @@ fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewp
             try session.write("\r\n");
         }
         var status: [128]u8 = undefined;
-        const label = std.fmt.bufPrint(&status, ":q quit | Ctrl-Z suspend | {d}:{d} | ", .{ buffer.rowAt(buffer.cursor) + 1, motion.screenColumn(buffer, buffer.cursor, false) + 1 }) catch unreachable;
+        const label = std.fmt.bufPrint(&status, ":q quit | Ctrl-Z suspend | {s}{s} | {d}:{d} | ", .{ if (parser.mode == .insert) "INSERT" else "NORMAL", if (buffer.modified()) " [+]" else if (!buffer.editable) " [read-only: unsupported bytes]" else "", buffer.rowAt(buffer.cursor) + 1, motion.screenColumn(buffer, buffer.cursor, parser.mode == .insert) + 1 }) catch unreachable;
         if (parser.mode == .command_line) {
             row[0] = ':';
             // Keep the end of a long command visible in the reserved status row.
@@ -132,7 +153,7 @@ fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewp
         try session.write(row);
     }
     try session.write("\x1b[27m");
-    if (viewport.cursor(buffer, dimensions.rows -| 1, dimensions.columns -| 1, false)) |cell| {
+    if (viewport.cursor(buffer, dimensions.rows -| 1, dimensions.columns -| 1, parser.mode == .insert)) |cell| {
         var position: [48]u8 = undefined;
         try session.write(std.fmt.bufPrint(&position, "\x1b[{d};{d}H\x1b[?25h", .{ cell.row + 1, cell.column + 1 }) catch unreachable);
     }
@@ -163,6 +184,7 @@ fn diagnostic(message: []const u8) void {
 }
 
 test {
+    _ = @import("editor.zig");
     _ = @import("file.zig");
     _ = @import("buffer.zig");
     _ = @import("terminal.zig");
@@ -170,4 +192,13 @@ test {
     _ = @import("view.zig");
     _ = @import("input.zig");
     _ = @import("command.zig");
+}
+
+test "save notices distinguish failure, uncertain publication and installed durability" {
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .failure = error.SourceChanged }, false), "Source changed"));
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .uncertain, .failure = error.PublishFailed }, false), "Save outcome uncertain"));
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .installed, .failure = error.SourceChanged }, false), "Bytes installed but changed/unverified"));
+    try std.testing.expectEqualStrings("Bytes installed and verified; durability not confirmed", saveNotice(.{ .publication = .installed, .verified = true, .failure = error.SyncFailed }, false));
+    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .installed, .verified = true, .durable = true, .failure = error.InjectedFailure }, false), "Bytes installed and verified"));
+    try std.testing.expectEqualStrings("Written", saveNotice(.{ .publication = .installed, .verified = true, .durable = true }, false));
 }

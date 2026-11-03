@@ -49,6 +49,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "viewerWorkflow", viewerWorkflow },
         .{ "cursorMotions", cursorMotions },
         .{ "modalCommands", modalCommands },
+        .{ "editingWorkflow", editingWorkflow },
+        .{ "pasteLifecycle", pasteLifecycle },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
@@ -273,6 +275,8 @@ const Process = struct {
         try expect(!mode.lflag.ECHO and !mode.lflag.ICANON);
         try expect(mode.lflag.ISIG and !mode.iflag.IXON);
         try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.INTR)]);
+        try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.SUSP)]);
+        try equal(@as(u8, 0), mode.cc[@backingInt(linux.V.QUIT)]);
     }
 
     // Wait without reading: the 60 KiB frame cannot fit in the PTY output
@@ -688,16 +692,15 @@ fn modalCommands(executable: [:0]const u8) !void {
     var process = try Process.start(executable, .{});
     defer process.close();
     try process.ready();
-    // Normal q cannot exit. Restricted Ex commands and refusal messages do not
-    // expose editing before saving is available.
+    // Normal q cannot exit. Editing and saving use explicit modal commands.
     try process.send("q");
     try process.until("Unsupported command or count");
     try process.ready();
     try process.send("\x03");
     try process.until(":q quit");
     try process.ready();
-    try process.send(":w\r");
-    try process.until("Saving/reloading is not available yet");
+    try process.send(":e!\r");
+    try process.until("Reloading is not available yet");
     try process.ready();
     try process.send("\x03d");
     try process.until("OPERATOR pending");
@@ -711,9 +714,9 @@ fn modalCommands(executable: [:0]const u8) !void {
     // With no Escape pending the loop returns to indefinite idle waiting.
     try equal(@as(usize, 0), try process.read(200));
     try process.send("O");
-    try process.until("Editing is not available yet");
+    try process.until("INSERT");
     try process.ready();
-    try process.send("\x03d");
+    try process.send("\x03ud");
     try process.until("OPERATOR pending");
     try process.ready();
     // An unambiguous following key cancels the operator immediately, rather
@@ -741,10 +744,177 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until("3:1 | ");
     try process.ready();
     try process.send("2d3w");
-    try process.until("Editing is not available yet");
+    try process.until("NORMAL [+]");
     try process.ready();
     try process.send(":q!\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
+}
+
+fn putFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd: posix.fd_t = @intCast(try checked(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600)));
+    defer _ = linux.close(fd);
+    try write(fd, bytes);
+}
+
+fn expectFile(path: [:0]const u8, bytes: []const u8) !void {
+    const fd: posix.fd_t = @intCast(try checked(linux.open(path, .{ .ACCMODE = .RDONLY }, 0)));
+    defer _ = linux.close(fd);
+    var buffer: [1024]u8 = undefined;
+    const count = try checked(linux.read(fd, &buffer, buffer.len));
+    try std.testing.expectEqualStrings(bytes, buffer[0..count]);
+}
+
+// Synchronize each input byte with its resulting frame. This keeps tests about
+// editing independent of PTY backpressure and bounded frame-capture capacity.
+fn editingKeys(process: *Process, bytes: []const u8) !void {
+    for (bytes) |byte| {
+        try process.send(&.{byte});
+        try process.ready();
+    }
+}
+
+fn editingWorkflow(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-edit-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    var copy_buffer: [128]u8 = undefined;
+    const copy_path = try std.fmt.bufPrintSentinel(&copy_buffer, "/tmp/nib-copy-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(copy_path);
+    try putFile(path, "abc\r\nlast");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    try editingKeys(&process, "G$a\rX\tY\x7fZ");
+    try process.send("\x03");
+    try process.until("3:9 | ");
+    try process.until("\x1b[3;9H\x1b[?25h");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try expectFile(path, "abc\r\nlast");
+    var command: [256]u8 = undefined;
+    try process.send(try std.fmt.bufPrint(&command, ":w {s}\r", .{copy_path}));
+    try process.until("Copy written");
+    try process.ready();
+    try expectFile(copy_path, "abc\r\nlast\r\nX\tZ");
+    try process.send(try std.fmt.bufPrint(&command, ":w {s}\r", .{copy_path}));
+    try process.until("Copy destination exists");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try expectFile(path, "abc\r\nlast\r\nX\tZ");
+    try process.send("u");
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try editingKeys(&process, "\x12");
+    try process.send(":q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    // Reopen saved bytes, then let an independent writer change the source.
+    var reopened = try Process.start(executable, .{ .path = path });
+    defer reopened.close();
+    try reopened.until("last");
+    try reopened.ready();
+    try editingKeys(&reopened, "cwLOCAL\x03");
+    try putFile(path, "external\n");
+    try reopened.send(":w\r");
+    try reopened.until("Source changed or missing");
+    try reopened.ready();
+    try expectFile(path, "external\n");
+    // The refused save retains undo: undo the local command, redo, then discard.
+    try editingKeys(&reopened, "u\x12");
+    try reopened.send(":q!\r");
+    try equal(@as(u8, 0), try reopened.wait(false));
+    try reopened.until(leave);
+    try reopened.restored();
+    try expectFile(path, "external\n");
+    // Unsupported source bytes stay exact and visibly read-only.
+    try putFile(path, "raw\xff\r");
+    var readonly = try Process.start(executable, .{ .path = path });
+    defer readonly.close();
+    try readonly.until("read-only");
+    try readonly.ready();
+    try readonly.send("i");
+    try readonly.until("Read-only: non-ASCII");
+    try readonly.ready();
+    try readonly.send(":w\r");
+    try readonly.until("Written");
+    try readonly.ready();
+    try readonly.send(":q\r");
+    try equal(@as(u8, 0), try readonly.wait(false));
+    try readonly.restored();
+    try expectFile(path, "raw\xff\r");
+}
+
+fn pasteLifecycle(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-paste-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    try putFile(path, "base\r\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    try editingKeys(&process, "iX");
+    // Signal characters must reach paste validation, even if the whole frame
+    // is already queued in the kernel before its begin delimiter is decoded.
+    for ([_]u8{ 3, 26, 28, 0, 0xff }) |control| {
+        const packet = [_]u8{ 27, '[', '2', '0', '0', '~', 'B', control, 'D', 27, '[', '2', '0', '1', '~' };
+        try process.send(&packet);
+        try process.until("Unsupported paste");
+        try process.ready();
+    }
+    // Real suspension during collection discards the entire pending paste.
+    try process.send("\x1b[200~");
+    try process.ready();
+    try process.send("partial");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.signal(.TSTP);
+    _ = try process.wait(true);
+    try process.until(leave);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until("Paste interrupted");
+    try process.ready();
+    try process.send("remaining\x1b[201~");
+    try equal(@as(usize, 0), try process.read(30));
+    // A following valid paste is part of the original insertion group.
+    try process.send("\x1b[200~A\nB\r\nC\rD\t\x1b[201~");
+    try process.until("XA");
+    try process.ready();
+    try editingKeys(&process, "\x03u\x12");
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try expectFile(path, "XA\r\nB\r\nC\r\nD\tbase\r\n");
+    // Keyboard suspension also retains a dirty insertion and its undo group.
+    try editingKeys(&process, "iQ");
+    try process.send("\x1a");
+    _ = try process.wait(true);
+    try process.until(leave);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until("INSERT [+]");
+    try process.ready();
+    try editingKeys(&process, "R");
+    try process.send("\x1b");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try editingKeys(&process, "u");
+    try process.send(":q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, "XA\r\nB\r\nC\r\nD\tbase\r\n");
 }

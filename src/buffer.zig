@@ -54,6 +54,7 @@ pub const Buffer = struct {
     saved_position: ?usize = 0,
     grouping: bool = false,
     active_group: bool = false,
+    group_cursor: usize = 0,
 
     pub fn fromBytes(allocator: Allocator, content: []const u8) (Allocator.Error || error{ FileTooLarge, TooManyLines })!Buffer {
         if (content.len > source.max_file_bytes) return error.FileTooLarge;
@@ -144,11 +145,20 @@ pub const Buffer = struct {
         self.active_group = false;
     }
 
+    /// Complete a modal command with its final normal-mode cursor. Ordinary
+    /// endGroup leaves the replacement API's cursor accounting unchanged.
+    pub fn endCommand(self: *Buffer) void {
+        if (self.active_group) self.history.items[self.position - 1].after = self.cursor;
+        self.endGroup();
+    }
+
+    /// Capture the command cursor now, before insertion entry can move it.
     /// The next successful edit starts one group; further edits join it until
     /// endGroup. Failed edits retain earlier successful edits in the group.
     pub fn beginGroup(self: *Buffer) void {
         self.endGroup();
         self.grouping = true;
+        self.group_cursor = self.cursor;
     }
 
     /// In-memory convenience. Filesystem saves prepare the owned base before
@@ -194,18 +204,20 @@ pub const Buffer = struct {
         @memcpy(owned[0..removed.len], removed);
         @memcpy(owned[removed.len..], inserted);
         const edit: Edit = .{ .start = range.start, .data = .fromOwnedSlice(owned), .removed_len = removed.len };
-        // Typing inside the last newly inserted region can share one delta.
-        // This also makes undo of a long insertion one range replacement rather
-        // than one full suffix move per key. Other edits retain separate deltas.
-        const merge = if (self.active_group) merge: {
+        // Coalesce edits inside newly typed text, and consecutive backwards
+        // deletions. Long insert/Backspace sessions then replay a few ranges
+        // instead of moving a large suffix once per original keystroke.
+        const merge: enum { none, typed, backwards } = if (self.active_group) merge: {
             const edits = self.history.items[self.position - 1].edits.items;
             const last = edits[edits.len - 1];
-            break :merge last.removed_len == 0 and range.start == range.end and
-                range.start >= last.start and range.start - last.start <= last.inserted().len;
-        } else false;
-        var new_group: Group = .{ .before = self.cursor, .after = cursor_after };
+            if (last.removed_len == 0 and range.start >= last.start and
+                range.end - last.start <= last.inserted().len) break :merge .typed;
+            if (inserted.len == 0 and last.inserted().len == 0 and range.end == last.start) break :merge .backwards;
+            break :merge .none;
+        } else .none;
+        var new_group: Group = .{ .before = if (self.grouping) self.group_cursor else self.cursor, .after = cursor_after };
         errdefer new_group.edits.deinit(allocator);
-        if (self.active_group and !merge) {
+        if (self.active_group and merge == .none) {
             try self.history.items[self.position - 1].edits.ensureUnusedCapacity(allocator, 1);
         } else if (!self.active_group) {
             try new_group.edits.ensureUnusedCapacity(allocator, 1);
@@ -213,9 +225,9 @@ pub const Buffer = struct {
         }
         try self.text.ensureTotalCapacity(allocator, length);
         try self.starts.ensureTotalCapacity(allocator, rows);
-        if (merge) {
+        if (merge != .none) {
             const edits = self.history.items[self.position - 1].edits.items;
-            try edits[edits.len - 1].data.ensureUnusedCapacity(allocator, inserted.len);
+            try edits[edits.len - 1].data.ensureUnusedCapacity(allocator, if (merge == .typed) inserted.len else removed.len);
         }
 
         // Discarding redo is part of the successful edit, never its preparation.
@@ -231,9 +243,15 @@ pub const Buffer = struct {
         const group = &self.history.items[self.position - 1];
         group.after = cursor_after;
         self.apply(range, edit.inserted());
-        if (merge) {
+        if (merge != .none) {
             const last = &group.edits.items[group.edits.items.len - 1];
-            last.data.replaceRangeAssumeCapacity(range.start - last.start, 0, edit.inserted());
+            if (merge == .typed) {
+                last.data.replaceRangeAssumeCapacity(range.start - last.start, range.end - range.start, edit.inserted());
+            } else {
+                last.data.replaceRangeAssumeCapacity(0, 0, edit.removed());
+                last.start = range.start;
+                last.removed_len += edit.removed_len;
+            }
             allocator.free(owned);
         } else group.edits.appendAssumeCapacity(edit);
         self.cursor = cursor_after;
@@ -613,4 +631,30 @@ fn coalescingWorkflow(allocator: Allocator) !void {
     try std.testing.expectEqualStrings("abc", buffer.bytes());
     try std.testing.expect(try buffer.redo(allocator));
     try std.testing.expectEqualStrings("aXlong insertion\n\nbc", buffer.bytes());
+}
+
+test "backwards deletion coalescing prepares all storage before changing prior history" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, backwardsWorkflow, .{});
+}
+
+fn backwardsWorkflow(allocator: Allocator) !void {
+    const before = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\r\nsuffix";
+    var buffer = try Buffer.fromBytes(allocator, before);
+    defer buffer.deinit(allocator);
+    buffer.cursor = 50;
+    buffer.beginGroup();
+    try buffer.replace(allocator, .{ .start = 49, .end = 50 }, "", 49);
+    buffer.replace(allocator, .{ .start = 0, .end = 49 }, "", 0) catch |err| {
+        try std.testing.expectEqualStrings(before[0..49] ++ before[50..], buffer.bytes());
+        try std.testing.expectEqual(@as(usize, 49), buffer.cursor);
+        try std.testing.expect(try buffer.undo(allocator));
+        try std.testing.expectEqualStrings(before, buffer.bytes());
+        return err;
+    };
+    try std.testing.expectEqualStrings(before[50..], buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 1), buffer.history.items[0].edits.items.len);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings(before, buffer.bytes());
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqualStrings(before[50..], buffer.bytes());
 }

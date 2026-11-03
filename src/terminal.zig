@@ -37,6 +37,7 @@ pub const Terminal = struct {
     saved_mode: posix.termios,
     saved_mask: posix.sigset_t,
     signal_fd: posix.fd_t,
+    suspension_count: usize = 0,
     saved_output_flags: usize,
     output_flags_active: bool = false,
     pending: Signals = .{},
@@ -79,9 +80,12 @@ pub const Terminal = struct {
         mode.lflag.ECHONL = false;
         mode.lflag.IEXTEN = false;
         mode.lflag.ISIG = true;
-        // Linux _POSIX_VDISABLE: keep VSUSP/ISIG for shell job control while
-        // delivering keyboard Ctrl-C as input. External SIGINT still terminates.
+        // Deliver control keys to the decoder, including inside bracketed
+        // paste. The application requests suspension for an ordinary Ctrl-Z.
+        // External lifecycle signals still arrive through signalfd.
         mode.cc[@backingInt(linux.V.INTR)] = 0;
+        mode.cc[@backingInt(linux.V.SUSP)] = 0;
+        mode.cc[@backingInt(linux.V.QUIT)] = 0;
         mode.iflag.IXON = false;
         mode.iflag.ICRNL = false;
         mode.oflag.OPOST = false;
@@ -145,6 +149,11 @@ pub const Terminal = struct {
         if (failure) |err| return err;
     }
 
+    /// Request the existing lifecycle transition for a decoded keyboard Ctrl-Z.
+    pub fn requestSuspend(self: *Terminal) void {
+        self.pending.should_suspend = true;
+    }
+
     /// Blocks until input, lifecycle activity, or an optional monotonic deadline.
     /// Signals are drained first; queued termination wins over resume or input.
     pub fn next(self: *Terminal, deadline: ?i64) Error!Event {
@@ -154,6 +163,7 @@ pub const Terminal = struct {
             self.pending = .{};
             if (signals.exit_code) |code| return .{ .quit = code };
             if (signals.should_suspend) {
+                self.suspension_count +%= 1;
                 self.leave() catch |err| {
                     if (err != error.OutputBlocked) return err;
                     // Termios/descriptor flags are already restored. A stalled
