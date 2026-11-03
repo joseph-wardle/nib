@@ -13,7 +13,11 @@ zig build
 zig build run -- README.md
 ```
 
-The installed executable is `zig-out/bin/nib`. For development:
+The installed executable is `zig-out/bin/nib`. Run `nib <path>` in a Linux terminal
+to open one regular file read-only. Scroll with `h/j/k/l`, quit with `q`, and use
+Ctrl-Z/`fg` to suspend/resume.
+
+For development (checks require zsh):
 
 ```sh
 zig fmt build.zig build.zig.zon src tests
