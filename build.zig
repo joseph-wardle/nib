@@ -19,14 +19,26 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = module });
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Compile and execute project tests").dependOn(&run_tests.step);
+    const terminal_harness = b.addExecutable(.{
+        .name = "terminal-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/terminal.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const terminal_tests = b.addRunArtifact(terminal_harness);
+    terminal_tests.addArtifactArg(executable);
+    const test_step = b.step("test", "Run unit tests and Linux PTY viewer checks");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&terminal_tests.step);
 
     const format = b.addFmt(.{
-        .paths = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src") },
+        .paths = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src"), b.path("tests") },
         .check = true,
     });
     const check = b.step("check", "Build, check formatting, and run tests");
     check.dependOn(b.getInstallStep());
     check.dependOn(&format.step);
-    check.dependOn(&run_tests.step);
+    check.dependOn(test_step);
 }
