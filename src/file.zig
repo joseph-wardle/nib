@@ -5,6 +5,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
 const limits = @import("snapshot.zig");
+const Watch = @import("watch.zig").Watch;
 
 pub const Error = Allocator.Error || error{
     FileNotFound,
@@ -99,6 +100,17 @@ pub const Source = struct {
         const fd = try open(current.target(), .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .NOFOLLOW = true, .CLOEXEC = true });
         defer _ = linux.close(fd);
         try verifyBytes(fd, self.version, base);
+    }
+
+    /// Rebuild watches along the current spelling, including intermediate links.
+    /// Register before validation so changes during registration remain queued.
+    pub fn monitor(self: *const Source, allocator: Allocator, watch: *Watch) void {
+        watch.reset(allocator);
+        const current = resolveWatching(self.path, allocator, watch) catch |err| {
+            if (err != error.FileNotFound) watch.degraded = true;
+            return;
+        };
+        watch.add(allocator, current.target(), "");
     }
 
     pub fn save(self: *Source, allocator: Allocator, buffer: *Buffer, options: Options) Report {
@@ -308,6 +320,10 @@ const Resolved = struct {
 /// Resolve one component at a time so directory symlinks and '..' retain Linux
 /// meaning. Re-resolution detects link-chain replacement as well as retargeting.
 fn resolve(path: []const u8) Error!Resolved {
+    return resolveWatching(path, undefined, null);
+}
+
+fn resolveWatching(path: []const u8, allocator: Allocator, watch: ?*Watch) Error!Resolved {
     var pending = try terminated(path);
     var result: Resolved = .{ .path = try terminated("/"), .version = undefined };
     var offset: usize = 0;
@@ -322,6 +338,7 @@ fn resolve(path: []const u8) Error!Resolved {
             result.path = try terminated(std.fs.path.dirname(result.target()) orelse "/");
             continue;
         }
+        if (watch) |monitor| monitor.add(allocator, result.target(), component);
         const parent_len = result.path.len;
         if (parent_len != 1) {
             if (result.path.len + 1 >= 4096) return error.NameTooLong;

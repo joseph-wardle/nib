@@ -8,6 +8,7 @@ const view = @import("view.zig");
 const input = @import("input.zig");
 const commands = @import("command.zig");
 const Editor = @import("editor.zig").Editor;
+const External = @import("external.zig").External;
 
 pub fn main(init: std.process.Init) u8 {
     var args = init.minimal.args.iterate();
@@ -46,7 +47,11 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
     const buffer = &document.buffer;
     var editor: Editor = .{};
     defer editor.deinit(init.gpa);
+    var external: External = .{};
+    defer external.deinit(init.gpa);
+    external.inspect(init.gpa, &document, true);
     var suspension_count = session.suspension_count;
+    var resumption_count = session.resumption_count;
     var save_notice: [256]u8 = undefined;
     var viewport: view.Viewport = .{};
     var decoder: input.Decoder = .{};
@@ -55,7 +60,15 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
     while (true) {
         var redraw = false;
         var events: input.Events = .{};
+        session.watch_fd = external.watch.fd;
         switch (try session.next(decoder.deadline)) {
+            .source_changed => {
+                const old_status = external.status();
+                if (external.watch.drain()) {
+                    external.inspect(init.gpa, &document, true);
+                    redraw = !std.mem.eql(u8, old_status, external.status());
+                }
+            },
             .redraw => |size| {
                 dimensions = size;
                 viewport.follow(buffer, size.rows -| 1, size.columns -| 1, editor.inserting());
@@ -65,9 +78,12 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
             .timeout => events = decoder.expire(try terminal.milliseconds()),
             .quit => |code| return code,
         }
-        if (suspension_count != session.suspension_count) {
+        if (suspension_count != session.suspension_count or resumption_count != session.resumption_count) {
             suspension_count = session.suspension_count;
+            resumption_count = session.resumption_count;
             editor.interruptPaste();
+            external.inspect(init.gpa, &document, true);
+            redraw = true;
         }
         for (events.items[0..events.len]) |event| {
             if (event == .key and event.key == 26) {
@@ -90,15 +106,20 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
                         document.source.save(init.gpa, buffer, .{})
                     else
                         source.copy(init.gpa, init.io, .cwd(), copy_path, buffer, .{});
+                    if (copy_path.len == 0) external.inspect(init.gpa, &document, true);
                     editor.notice = saveNotice(result, copy_path.len != 0);
                     if (result.cleanup_failure) editor.notice = std.fmt.bufPrint(&save_notice, "{s}; cleanup failed", .{editor.notice}) catch unreachable;
                 },
-                .reload => editor.notice = "Reloading is not available yet",
+                .reload => {
+                    _ = external.reload(init.gpa, init.io, &document, &editor, true);
+                    redraw = true;
+                },
             };
             redraw = redraw or old_mode != editor.parser.mode or old_length != editor.parser.line_len or old_cursor != buffer.cursor or old_position != buffer.position or old_text_length != buffer.bytes().len or !std.mem.eql(u8, old_notice, editor.notice);
         }
+        redraw = external.automatic(init.gpa, init.io, &document, &editor) or redraw;
         viewport.follow(buffer, dimensions.rows -| 1, dimensions.columns -| 1, editor.inserting());
-        if (redraw) draw(session, buffer, viewport, dimensions, path, &editor.parser, editor.notice) catch |err| {
+        if (redraw) draw(session, buffer, viewport, dimensions, path, &editor.parser, editor.notice, &external) catch |err| {
             if (err != error.Interrupted) return err;
         };
     }
@@ -110,7 +131,7 @@ fn saveNotice(result: source.Report, copy: bool) []const u8 {
     if (result.publication == .installed and !result.durable) return "Bytes installed and verified; durability not confirmed";
     if (result.publication == .installed and result.failure != null) return "Bytes installed and verified; save reported an error";
     if (result.failure) |err| return switch (err) {
-        error.SourceChanged, error.FileNotFound, error.UnstableSource => "Source changed or missing; save refused; use :w <new-path>",
+        error.SourceChanged, error.FileNotFound, error.UnstableSource => "Source changed or missing; save refused; :e! reloads; :w <new-path> copies",
         error.MultiplyLinked => "Hard-linked source; use :w <new-path>",
         error.AccessDenied => "Write permission denied; save refused",
         error.PathAlreadyExists => "Copy destination exists; choose a new path",
@@ -121,21 +142,28 @@ fn saveNotice(result: source.Report, copy: bool) []const u8 {
     return if (copy) "Copy written; source association and unsaved status retained" else "Written";
 }
 
-fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8, parser: *const commands.Parser, notice: []const u8) terminal.Error!void {
+fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8, parser: *const commands.Parser, notice: []const u8, external: *const External) terminal.Error!void {
     try session.write("\x1b[?25l\x1b[H\x1b[2J");
     // Reserve the last column on every row to avoid autowrap, including the
     // bottom-right cell. A fixed row buffer covers every u16 terminal width.
     var row_buffer: [std.math.maxInt(u16)]u8 = undefined;
-    const row = row_buffer[0..dimensions.columns -| 1];
+    const full_row = row_buffer[0..dimensions.columns -| 1];
+    var row = full_row;
     if (dimensions.rows != 0 and row.len != 0) {
         for (0..dimensions.rows - 1) |number| {
             viewport.renderRow(buffer, number, row);
             try session.write(row);
             try session.write("\r\n");
         }
+        const warning = external.status();
+        const warning_len = @min(warning.len, row.len);
+        @memcpy(row[0..warning_len], warning[0..warning_len]);
+        row = row[warning_len..];
         var status: [128]u8 = undefined;
         const label = std.fmt.bufPrint(&status, ":q quit | Ctrl-Z suspend | {s}{s} | {d}:{d} | ", .{ if (parser.mode == .insert) "INSERT" else "NORMAL", if (buffer.modified()) " [+]" else if (!buffer.editable) " [read-only: unsupported bytes]" else "", buffer.rowAt(buffer.cursor) + 1, motion.screenColumn(buffer, buffer.cursor, parser.mode == .insert) + 1 }) catch unreachable;
-        if (parser.mode == .command_line) {
+        if (row.len == 0) {
+            // The persistent disk/monitor status fills tiny status rows.
+        } else if (parser.mode == .command_line) {
             row[0] = ':';
             // Keep the end of a long command visible in the reserved status row.
             const left = parser.line_len -| (row.len - 1);
@@ -150,7 +178,7 @@ fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewp
             view.renderText(path, 0, row[prefix..]);
         }
         try session.write("\x1b[7m");
-        try session.write(row);
+        try session.write(full_row);
     }
     try session.write("\x1b[27m");
     if (viewport.cursor(buffer, dimensions.rows -| 1, dimensions.columns -| 1, parser.mode == .insert)) |cell| {
@@ -184,6 +212,7 @@ fn diagnostic(message: []const u8) void {
 }
 
 test {
+    _ = @import("external.zig");
     _ = @import("editor.zig");
     _ = @import("file.zig");
     _ = @import("buffer.zig");

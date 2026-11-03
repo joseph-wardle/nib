@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "modalCommands", modalCommands },
         .{ "editingWorkflow", editingWorkflow },
         .{ "pasteLifecycle", pasteLifecycle },
+        .{ "externalChanges", externalChanges },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
@@ -700,7 +701,7 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until(":q quit");
     try process.ready();
     try process.send(":e!\r");
-    try process.until("Reloading is not available yet");
+    try process.until("Reloaded; local edits and history discarded");
     try process.ready();
     try process.send("\x03d");
     try process.until("OPERATOR pending");
@@ -917,4 +918,114 @@ fn pasteLifecycle(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try expectFile(path, "XA\r\nB\r\nC\r\nD\tbase\r\n");
+}
+
+fn externalChanges(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-external-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    var replacement_buffer: [128]u8 = undefined;
+    const replacement = try std.fmt.bufPrintSentinel(&replacement_buffer, "/tmp/nib-replacement-{d}", .{linux.getpid()}, 0);
+    defer _ = linux.unlink(replacement);
+    try putFile(path, "original\nlast");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    // Idle atomic replacement reloads without keyboard activity.
+    try putFile(replacement, "renamed\n");
+    _ = try checked(linux.rename(replacement, path));
+    try process.until("renamed");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    // A pending operator retains old text until cancelled.
+    try process.send("d");
+    try process.until("OPERATOR pending");
+    try process.ready();
+    try putFile(path, "pending\n");
+    try process.until("renamed");
+    try process.until("DISK CONFLICT | OPERATOR pending");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("\x03");
+    try process.until("pending");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Even a clean insert session postpones reloading; subsequent typing is local.
+    try process.send("i");
+    try process.until("INSERT");
+    try process.ready();
+    try putFile(path, "outside\n");
+    try process.until("pending");
+    try process.until("DISK CONFLICT");
+    try process.ready();
+    try process.send("X\x03");
+    try process.until("Xpending");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("save refused");
+    try process.ready();
+    try expectFile(path, "outside\n");
+    var copy_command: [256]u8 = undefined;
+    try process.send(try std.fmt.bufPrint(&copy_command, ":w {s}\r", .{replacement}));
+    try process.until("Copy written");
+    try process.ready();
+    try expectFile(replacement, "Xpending\n");
+    try process.send(":q\r");
+    try process.until("Unsaved changes");
+    try process.ready();
+    try process.send(":e!\r");
+    try process.until("outside");
+    try process.until("Reloaded; local edits and history discarded");
+    try process.ready();
+    try process.send("u");
+    try process.until("No more history");
+    try process.ready();
+    // Deletion retains clean text; neither :w nor a failed :e! recreates it.
+    _ = try checked(linux.unlink(path));
+    try process.until("outside");
+    try process.until("SOURCE MISSING");
+    try process.ready();
+    try process.send(":e!\r");
+    try process.until("Reload failed; local state retained");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("save refused");
+    try process.ready();
+    try equal(posix.E.NOENT, posix.errno(linux.access(path, linux.F_OK)));
+    try putFile(path, "recreated\n");
+    try process.until("recreated");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Resume validation is independent of queued events. A clean pending command
+    // survives suspension and holds the replacement until cancellation.
+    // Decoded Ctrl-Z follows the count in input order, so the count is known
+    // to be pending before suspension without racing an external signal.
+    try process.send("2\x1a");
+    try process.until(leave);
+    try equal(@as(u8, 19), try process.wait(true));
+    try process.restored();
+    try putFile(path, "resumed\n");
+    _ = try checked(linux.kill(process.pid, .CONT));
+    try process.until(enter);
+    try process.until("DISK CONFLICT");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("resumed");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Saving and processing our own notification must retain clean undo history.
+    try editingKeys(&process, "iY\x03");
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("u");
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try process.send("\x12:q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, "Yresumed\n");
 }

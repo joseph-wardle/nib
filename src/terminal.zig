@@ -4,7 +4,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 pub const Size = struct { rows: u16, columns: u16 };
-pub const Event = union(enum) { input: u8, redraw: Size, quit: u8, timeout };
+pub const Event = union(enum) { input: u8, redraw: Size, quit: u8, timeout, source_changed };
 pub const Error = error{
     NotATerminal,
     NotForeground,
@@ -38,6 +38,8 @@ pub const Terminal = struct {
     saved_mask: posix.sigset_t,
     signal_fd: posix.fd_t,
     suspension_count: usize = 0,
+    resumption_count: usize = 0,
+    watch_fd: posix.fd_t = -1,
     saved_output_flags: usize,
     output_flags_active: bool = false,
     pending: Signals = .{},
@@ -199,6 +201,7 @@ pub const Terminal = struct {
             var fds = [_]linux.pollfd{
                 .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 },
                 .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 },
+                .{ .fd = self.watch_fd, .events = linux.POLL.IN, .revents = 0 },
             };
             const timeout: i32 = if (deadline) |end| @intCast(@min(std.math.maxInt(i32), @max(0, end - try milliseconds()))) else -1;
             const result = linux.poll(&fds, fds.len, timeout);
@@ -224,6 +227,7 @@ pub const Terminal = struct {
                     else => return error.InputFailed,
                 }
             }
+            if (fds[2].revents != 0) return .source_changed;
         }
     }
 
@@ -288,7 +292,10 @@ pub const Terminal = struct {
                 .INT, .TERM, .HUP => self.pending.exit_code = @intCast(128 + info.signo),
                 .TSTP => self.pending.should_suspend = true,
                 .WINCH => self.pending.resize = true,
-                .CONT => {},
+                .CONT => {
+                    self.resumption_count +%= 1;
+                    self.pending.resize = true;
+                },
                 else => unreachable,
             }
         }
