@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const terminal = @import("terminal.zig");
-const source = @import("snapshot.zig");
+const source = @import("file.zig");
 const Buffer = @import("buffer.zig").Buffer;
 const motion = @import("motion.zig");
 const view = @import("view.zig");
@@ -40,12 +40,9 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const u8) !u8 {
-    var buffer = block: {
-        var snapshot = try source.Snapshot.load(init.gpa, init.io, .cwd(), path);
-        defer snapshot.deinit(init.gpa);
-        break :block try Buffer.fromBytes(init.gpa, snapshot.bytes);
-    };
-    defer buffer.deinit(init.gpa);
+    var document = try source.Source.load(init.gpa, init.io, .cwd(), path);
+    defer document.deinit(init.gpa);
+    const buffer = &document.buffer;
     var goal: motion.Goal = 0;
     var viewport: view.Viewport = .{};
     var decoder: input.Decoder = .{};
@@ -58,7 +55,7 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
         switch (try session.next(decoder.deadline)) {
             .redraw => |size| {
                 dimensions = size;
-                viewport.follow(&buffer, size.rows -| 1, size.columns -| 1, false);
+                viewport.follow(buffer, size.rows -| 1, size.columns -| 1, false);
                 redraw = true;
             },
             .input => |byte| events = decoder.feed(byte, try terminal.milliseconds()),
@@ -73,11 +70,11 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
             if (parser.feed(event)) |action| switch (action) {
                 .move => |movement| {
                     notice = "";
-                    if (motion.resolve(&buffer, goal, movement.motion, movement.count, null)) |result| {
+                    if (motion.resolve(buffer, goal, movement.motion, movement.count, null)) |result| {
                         redraw = redraw or result.destination != buffer.cursor;
                         buffer.cursor = result.destination;
                         goal = result.goal;
-                        viewport.follow(&buffer, dimensions.rows -| 1, dimensions.columns -| 1, false);
+                        viewport.follow(buffer, dimensions.rows -| 1, dimensions.columns -| 1, false);
                     }
                 },
                 .file => |file| switch (file) {
@@ -97,7 +94,7 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
             };
             redraw = redraw or old_mode != parser.mode or old_length != parser.line_len or !std.mem.eql(u8, old_notice, notice);
         }
-        if (redraw) draw(session, &buffer, viewport, dimensions, path, &parser, notice) catch |err| {
+        if (redraw) draw(session, buffer, viewport, dimensions, path, &parser, notice) catch |err| {
             if (err != error.Interrupted) return err;
         };
     }
@@ -153,6 +150,7 @@ fn report(err: anyerror) void {
         error.TooManyLines => "file exceeds the temporary 262,144-line viewer limit",
         error.OutputBlocked => "screen cleanup blocked by terminal output",
         error.OutOfMemory => "not enough memory to open the file",
+        error.UnstableSource, error.SourceChanged => "file changed while loading; try again",
         else => @errorName(err),
     };
     diagnostic(message);
@@ -165,6 +163,7 @@ fn diagnostic(message: []const u8) void {
 }
 
 test {
+    _ = @import("file.zig");
     _ = @import("buffer.zig");
     _ = @import("terminal.zig");
     _ = @import("snapshot.zig");

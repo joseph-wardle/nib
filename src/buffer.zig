@@ -151,11 +151,17 @@ pub const Buffer = struct {
         self.grouping = true;
     }
 
-    /// Called only after a successful load/save. Allocation failure retains the
-    /// old base and clean position. Publishing a file will need preparation of
-    /// this owned base before publication, supplied by the later save engine.
+    /// In-memory convenience. Filesystem saves prepare the owned base before
+    /// publication and use acceptSaved so accounting afterward cannot allocate.
     pub fn markSaved(self: *Buffer, allocator: Allocator) Allocator.Error!void {
         const base = try allocator.dupe(u8, self.bytes());
+        self.acceptSaved(allocator, base);
+    }
+
+    /// Takes ownership of a preallocated copy of the successfully saved bytes.
+    /// The caller must verify publication before transferring this allocation.
+    pub fn acceptSaved(self: *Buffer, allocator: Allocator, base: []const u8) void {
+        std.debug.assert(std.mem.eql(u8, base, self.bytes()));
         allocator.free(self.base);
         self.base = base;
         self.saved_position = self.position;
