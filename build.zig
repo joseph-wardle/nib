@@ -17,6 +17,21 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run Nib").dependOn(&run.step);
 
+    const buffer_bench = b.addExecutable(.{
+        .name = "buffer-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/buffer_bench.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "buffer", .module = b.createModule(.{
+                .root_source_file = b.path("src/buffer.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseFast,
+            }) }},
+        }),
+    });
+    b.step("bench-buffer", "Measure ReleaseFast buffer edits, history, and retained bytes").dependOn(&b.addRunArtifact(buffer_bench).step);
+
     const tests = b.addTest(.{ .root_module = module });
     const run_tests = b.addRunArtifact(tests);
     const terminal_harness = b.addExecutable(.{

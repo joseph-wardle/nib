@@ -22,6 +22,12 @@ For development (checks require zsh):
 ```sh
 zig fmt build.zig build.zig.zon src tests
 zig build check
+zig build bench-buffer
 ```
+
+`bench-buffer` measures the internal mutable buffer in ReleaseFast: insertion
+latency, grouped undo/redo, and retained allocation bytes on source, long-line,
+and near-limit fixtures. It does not measure terminal or editor responsiveness.
+The buffer is not yet connected to interactive editing.
 
 Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

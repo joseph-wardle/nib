@@ -1,0 +1,610 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const source = @import("snapshot.zig");
+
+pub const Range = struct { start: usize, end: usize };
+pub const Error = Allocator.Error || error{
+    FileTooLarge,
+    TooManyLines,
+    InvalidRange,
+    InvalidCursor,
+    UnsupportedText,
+};
+
+const Edit = struct {
+    start: usize,
+    // One allocation owns removed bytes followed by inserted bytes.
+    data: std.ArrayList(u8),
+    removed_len: usize,
+
+    fn removed(self: Edit) []const u8 {
+        return self.data.items[0..self.removed_len];
+    }
+
+    fn inserted(self: Edit) []const u8 {
+        return self.data.items[self.removed_len..];
+    }
+};
+
+const Group = struct {
+    edits: std.ArrayList(Edit) = .empty,
+    before: usize,
+    after: usize,
+
+    fn deinit(self: *Group, allocator: Allocator) void {
+        for (self.edits.items) |*edit| edit.data.deinit(allocator);
+        self.edits.deinit(allocator);
+    }
+};
+
+/// Owns mutable bytes, a detached loaded/saved base, and linear edit history.
+/// All borrowed slices expire on mutation. Release with the original allocator.
+/// Cursor offsets are byte boundaries, never between CR and LF. Mode-specific
+/// cursor landing and display columns belong to navigation, not this storage.
+pub const Buffer = struct {
+    text: std.ArrayList(u8) = .empty,
+    // Unlike the viewer index, includes the insertion row after a final LF.
+    starts: std.ArrayList(usize) = .empty,
+    base: []const u8,
+    cursor: usize = 0,
+    editable: bool,
+    history: std.ArrayList(Group) = .empty,
+    position: usize = 0,
+    saved_position: ?usize = 0,
+    grouping: bool = false,
+    active_group: bool = false,
+
+    pub fn fromBytes(allocator: Allocator, content: []const u8) (Allocator.Error || error{ FileTooLarge, TooManyLines })!Buffer {
+        if (content.len > source.max_file_bytes) return error.FileTooLarge;
+        const count = 1 + std.mem.count(u8, content, "\n");
+        if (logicalLines(content, count) > source.max_lines) return error.TooManyLines;
+        var self: Buffer = .{ .base = try allocator.dupe(u8, content), .editable = supported(content) };
+        errdefer self.deinit(allocator);
+        try self.text.appendSlice(allocator, content);
+        try self.starts.ensureTotalCapacity(allocator, count);
+        self.starts.appendAssumeCapacity(0);
+        for (content, 0..) |byte, offset| {
+            if (byte == '\n') self.starts.appendAssumeCapacity(offset + 1);
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *Buffer, allocator: Allocator) void {
+        for (self.history.items) |*group| group.deinit(allocator);
+        self.history.deinit(allocator);
+        self.starts.deinit(allocator);
+        self.text.deinit(allocator);
+        allocator.free(self.base);
+        self.* = undefined;
+    }
+
+    pub fn bytes(self: *const Buffer) []const u8 {
+        return self.text.items;
+    }
+
+    /// Logical file lines match Snapshot; insertionRows also exposes EOF after LF.
+    pub fn lineCount(self: *const Buffer) usize {
+        return logicalLines(self.bytes(), self.starts.items.len);
+    }
+
+    pub fn insertionRows(self: *const Buffer) usize {
+        return self.starts.items.len;
+    }
+
+    pub fn lineRange(self: *const Buffer, row: usize) Range {
+        return .{
+            .start = self.starts.items[row],
+            .end = if (row + 1 < self.starts.items.len) self.starts.items[row + 1] else self.text.items.len,
+        };
+    }
+
+    pub fn line(self: *const Buffer, row: usize) []const u8 {
+        const range = self.lineRange(row);
+        var end = range.end;
+        if (end > range.start and self.text.items[end - 1] == '\n') {
+            end -= 1;
+            if (end > range.start and self.text.items[end - 1] == '\r') end -= 1;
+        }
+        return self.text.items[range.start..end];
+    }
+
+    /// Last line start at or before a validated offset, including trailing EOF.
+    pub fn rowAt(self: *const Buffer, offset: usize) usize {
+        std.debug.assert(offset <= self.text.items.len);
+        var low: usize = 0;
+        var high = self.starts.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.starts.items[middle] <= offset) low = middle + 1 else high = middle;
+        }
+        return low - 1;
+    }
+
+    pub fn setCursor(self: *Buffer, offset: usize) error{InvalidCursor}!void {
+        if (!boundary(self.bytes(), offset)) return error.InvalidCursor;
+        self.cursor = offset;
+    }
+
+    /// Current terminator, otherwise first existing terminator, otherwise LF.
+    pub fn newlineAt(self: *const Buffer, offset: usize) []const u8 {
+        const range = self.lineRange(self.rowAt(offset));
+        if (range.end > range.start and self.text.items[range.end - 1] == '\n') return terminator(self.bytes(), range.end - 1);
+        if (std.mem.indexOfScalar(u8, self.bytes(), '\n')) |lf| return terminator(self.bytes(), lf);
+        return "\n";
+    }
+
+    pub fn modified(self: *const Buffer) bool {
+        return self.saved_position == null or self.saved_position.? != self.position;
+    }
+
+    /// Ends an insertion group; subsequent edits form a new command.
+    pub fn endGroup(self: *Buffer) void {
+        self.grouping = false;
+        self.active_group = false;
+    }
+
+    /// The next successful edit starts one group; further edits join it until
+    /// endGroup. Failed edits retain earlier successful edits in the group.
+    pub fn beginGroup(self: *Buffer) void {
+        self.endGroup();
+        self.grouping = true;
+    }
+
+    /// Called only after a successful load/save. Allocation failure retains the
+    /// old base and clean position. Publishing a file will need preparation of
+    /// this owned base before publication, supplied by the later save engine.
+    pub fn markSaved(self: *Buffer, allocator: Allocator) Allocator.Error!void {
+        const base = try allocator.dupe(u8, self.bytes());
+        allocator.free(self.base);
+        self.base = base;
+        self.saved_position = self.position;
+        self.endGroup();
+    }
+
+    /// Replaces a half-open range, then sets a byte cursor in the result.
+    /// Input may alias this buffer. No-op replacements create no history and
+    /// leave the cursor unchanged. Every fallible operation precedes mutation.
+    pub fn replace(self: *Buffer, allocator: Allocator, range: Range, inserted: []const u8, cursor_after: usize) Error!void {
+        if (range.start > range.end or !boundary(self.bytes(), range.start) or !boundary(self.bytes(), range.end)) return error.InvalidRange;
+        if (!self.editable or !supported(inserted)) return error.UnsupportedText;
+        const removed = self.text.items[range.start..range.end];
+        const remaining = self.text.items.len - removed.len;
+        if (inserted.len > source.max_file_bytes - remaining) return error.FileTooLarge;
+        const length = remaining + inserted.len;
+        const rows = self.starts.items.len - std.mem.count(u8, removed, "\n") + std.mem.count(u8, inserted, "\n");
+        const final_byte: ?u8 = if (range.end < self.text.items.len) self.text.items[self.text.items.len - 1] else if (inserted.len != 0) inserted[inserted.len - 1] else if (range.start != 0) self.text.items[range.start - 1] else null;
+        if (rows - @intFromBool(final_byte == '\n') > source.max_lines) return error.TooManyLines;
+        if (cursor_after > length) return error.InvalidCursor;
+        // Replacement cannot split existing CRLF and supported input cannot
+        // contain lone CR, so only its resulting cursor needs a virtual read.
+        if (cursor_after > 0 and cursor_after < length and
+            self.resultByte(range, inserted, cursor_after - 1) == '\r' and
+            self.resultByte(range, inserted, cursor_after) == '\n') return error.InvalidCursor;
+        if (std.mem.eql(u8, removed, inserted)) return;
+
+        const owned = try allocator.alloc(u8, removed.len + inserted.len);
+        errdefer allocator.free(owned);
+        @memcpy(owned[0..removed.len], removed);
+        @memcpy(owned[removed.len..], inserted);
+        const edit: Edit = .{ .start = range.start, .data = .fromOwnedSlice(owned), .removed_len = removed.len };
+        // Typing inside the last newly inserted region can share one delta.
+        // This also makes undo of a long insertion one range replacement rather
+        // than one full suffix move per key. Other edits retain separate deltas.
+        const merge = if (self.active_group) merge: {
+            const edits = self.history.items[self.position - 1].edits.items;
+            const last = edits[edits.len - 1];
+            break :merge last.removed_len == 0 and range.start == range.end and
+                range.start >= last.start and range.start - last.start <= last.inserted().len;
+        } else false;
+        var new_group: Group = .{ .before = self.cursor, .after = cursor_after };
+        errdefer new_group.edits.deinit(allocator);
+        if (self.active_group and !merge) {
+            try self.history.items[self.position - 1].edits.ensureUnusedCapacity(allocator, 1);
+        } else if (!self.active_group) {
+            try new_group.edits.ensureUnusedCapacity(allocator, 1);
+            try self.history.ensureTotalCapacity(allocator, self.position + 1);
+        }
+        try self.text.ensureTotalCapacity(allocator, length);
+        try self.starts.ensureTotalCapacity(allocator, rows);
+        if (merge) {
+            const edits = self.history.items[self.position - 1].edits.items;
+            try edits[edits.len - 1].data.ensureUnusedCapacity(allocator, inserted.len);
+        }
+
+        // Discarding redo is part of the successful edit, never its preparation.
+        if (self.saved_position) |saved| {
+            if (saved > self.position) self.saved_position = null;
+        }
+        for (self.history.items[self.position..]) |*group| group.deinit(allocator);
+        self.history.shrinkRetainingCapacity(self.position);
+        if (!self.active_group) {
+            self.history.appendAssumeCapacity(new_group);
+            self.position += 1;
+        }
+        const group = &self.history.items[self.position - 1];
+        group.after = cursor_after;
+        self.apply(range, edit.inserted());
+        if (merge) {
+            const last = &group.edits.items[group.edits.items.len - 1];
+            last.data.replaceRangeAssumeCapacity(range.start - last.start, 0, edit.inserted());
+            allocator.free(owned);
+        } else group.edits.appendAssumeCapacity(edit);
+        self.cursor = cursor_after;
+        self.active_group = self.grouping;
+    }
+
+    pub fn undo(self: *Buffer, allocator: Allocator) Allocator.Error!bool {
+        return self.replay(allocator, false);
+    }
+
+    pub fn redo(self: *Buffer, allocator: Allocator) Allocator.Error!bool {
+        return self.replay(allocator, true);
+    }
+
+    fn replay(self: *Buffer, allocator: Allocator, forward: bool) Allocator.Error!bool {
+        if (if (forward) self.position == self.history.items.len else self.position == 0) return false;
+        const group = self.history.items[if (forward) self.position else self.position - 1];
+        // Every intermediate version was cap-validated when originally edited.
+        // Reserve the maxima for the entire command before replaying any edit.
+        var length = self.text.items.len;
+        var rows = self.starts.items.len;
+        var max_length = length;
+        var max_rows = rows;
+        for (0..group.edits.items.len) |i| {
+            const edit = group.edits.items[if (forward) i else group.edits.items.len - i - 1];
+            const removed = if (forward) edit.removed() else edit.inserted();
+            const inserted = if (forward) edit.inserted() else edit.removed();
+            length = length - removed.len + inserted.len;
+            rows = rows - std.mem.count(u8, removed, "\n") + std.mem.count(u8, inserted, "\n");
+            max_length = @max(max_length, length);
+            max_rows = @max(max_rows, rows);
+        }
+        try self.text.ensureTotalCapacity(allocator, max_length);
+        try self.starts.ensureTotalCapacity(allocator, max_rows);
+        for (0..group.edits.items.len) |i| {
+            const edit = group.edits.items[if (forward) i else group.edits.items.len - i - 1];
+            const removed = if (forward) edit.removed() else edit.inserted();
+            const inserted = if (forward) edit.inserted() else edit.removed();
+            self.apply(.{ .start = edit.start, .end = edit.start + removed.len }, inserted);
+        }
+        self.cursor = if (forward) group.after else group.before;
+        if (forward) self.position += 1 else self.position -= 1;
+        self.endGroup();
+        return true;
+    }
+
+    fn resultByte(self: *const Buffer, range: Range, inserted: []const u8, offset: usize) u8 {
+        if (offset < range.start) return self.text.items[offset];
+        if (offset - range.start < inserted.len) return inserted[offset - range.start];
+        return self.text.items[offset - inserted.len + (range.end - range.start)];
+    }
+
+    fn apply(self: *Buffer, range: Range, inserted: []const u8) void {
+        const first = self.rowAt(range.start) + 1;
+        const end = self.rowAt(range.end) + 1;
+        const added = std.mem.count(u8, inserted, "\n");
+        const old_rows = self.starts.items.len;
+        const new_rows = old_rows - (end - first) + added;
+        if (new_rows > old_rows) self.starts.items.len = new_rows;
+        const suffix = self.starts.items[end..old_rows];
+        const destination = self.starts.items[first + added .. new_rows];
+        if (first + added > end) std.mem.copyBackwards(usize, destination, suffix) else std.mem.copyForwards(usize, destination, suffix);
+        self.starts.items.len = new_rows;
+        for (self.starts.items[first + added ..]) |*offset| offset.* = offset.* - (range.end - range.start) + inserted.len;
+        var row = first;
+        for (inserted, 0..) |byte, i| {
+            if (byte == '\n') {
+                self.starts.items[row] = range.start + i + 1;
+                row += 1;
+            }
+        }
+        self.text.replaceRangeAssumeCapacity(range.start, range.end - range.start, inserted);
+    }
+};
+
+fn logicalLines(bytes: []const u8, rows: usize) usize {
+    return rows - @intFromBool(bytes.len != 0 and bytes[bytes.len - 1] == '\n');
+}
+
+fn boundary(bytes: []const u8, offset: usize) bool {
+    return offset <= bytes.len and !(offset > 0 and offset < bytes.len and bytes[offset - 1] == '\r' and bytes[offset] == '\n');
+}
+
+fn terminator(bytes: []const u8, lf: usize) []const u8 {
+    return if (lf > 0 and bytes[lf - 1] == '\r') "\r\n" else "\n";
+}
+
+fn supported(bytes: []const u8) bool {
+    for (bytes, 0..) |byte, i| switch (byte) {
+        '\t', '\n', 0x20...0x7e => {},
+        '\r' => if (i + 1 == bytes.len or bytes[i + 1] != '\n') return false,
+        else => return false,
+    };
+    return true;
+}
+
+test "owned base, mixed terminators, and trailing insertion rows" {
+    const allocator = std.testing.allocator;
+    var input = [_]u8{ 'a', '\r', '\n', 'b', '\n', 'c' };
+    var buffer = try Buffer.fromBytes(allocator, &input);
+    defer buffer.deinit(allocator);
+    @memset(&input, 'z');
+    try std.testing.expectEqualStrings("a\r\nb\nc", buffer.bytes());
+    try std.testing.expectEqualStrings(buffer.bytes(), buffer.base);
+    try std.testing.expectEqualStrings("a", buffer.line(0));
+    try std.testing.expectEqualStrings("b", buffer.line(1));
+    try std.testing.expectEqualStrings("c", buffer.line(2));
+    try std.testing.expectEqualStrings("\r\n", buffer.newlineAt(0));
+    try std.testing.expectEqualStrings("\n", buffer.newlineAt(3));
+    try std.testing.expectEqualStrings("\r\n", buffer.newlineAt(6));
+    try std.testing.expectError(error.InvalidCursor, buffer.setCursor(2));
+    try std.testing.expectError(error.InvalidRange, buffer.replace(allocator, .{ .start = 1, .end = 2 }, "", 1));
+    try std.testing.expectError(error.InvalidCursor, buffer.replace(allocator, .{ .start = 0, .end = 1 }, "x", 2));
+    try std.testing.expectEqual(@as(usize, 0), buffer.history.items.len);
+    try std.testing.expect(!buffer.modified());
+
+    try buffer.setCursor(6);
+    buffer.beginGroup();
+    try buffer.replace(allocator, .{ .start = 6, .end = 6 }, "\r\n", 8);
+    try std.testing.expectEqual(@as(usize, 3), buffer.lineCount());
+    try std.testing.expectEqual(@as(usize, 4), buffer.insertionRows());
+    try std.testing.expectEqualStrings("", buffer.line(buffer.rowAt(buffer.cursor)));
+    try buffer.replace(allocator, .{ .start = 8, .end = 8 }, "X", 9);
+    buffer.endGroup();
+    try std.testing.expectEqual(@as(usize, 4), buffer.lineCount());
+    try std.testing.expectEqualStrings("a\r\nb\nc\r\nX", buffer.bytes());
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings("a\r\nb\nc", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 6), buffer.cursor);
+    try std.testing.expect(!buffer.modified());
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqual(@as(usize, 9), buffer.cursor);
+    try std.testing.expectEqualStrings("a\r\nb\nc\r\nX", buffer.bytes());
+}
+
+test "empty EOF, range replacement, deletion, aliases, and no-op history" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "");
+    defer buffer.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), buffer.lineCount());
+    try std.testing.expectEqualStrings("\n", buffer.newlineAt(0));
+    try buffer.replace(allocator, .{ .start = 0, .end = 0 }, "\n", 1);
+    try std.testing.expectEqual(@as(usize, 2), buffer.insertionRows());
+    try buffer.replace(allocator, .{ .start = 1, .end = 1 }, "abc", 4);
+    try buffer.replace(allocator, .{ .start = 0, .end = 1 }, buffer.bytes()[1..], 0);
+    try std.testing.expectEqualStrings("abcabc", buffer.bytes());
+    try buffer.replace(allocator, .{ .start = 0, .end = 6 }, "", 0);
+    try std.testing.expectEqualStrings("", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 1), buffer.insertionRows());
+    try std.testing.expect(try buffer.undo(allocator));
+    const position = buffer.position;
+    try buffer.replace(allocator, .{ .start = 0, .end = 3 }, "abc", 3);
+    try std.testing.expectEqual(position, buffer.position);
+    try std.testing.expectEqual(@as(usize, 0), buffer.cursor);
+    try std.testing.expect(try buffer.redo(allocator));
+    while (try buffer.undo(allocator)) {}
+    try std.testing.expect(!try buffer.undo(allocator));
+    try std.testing.expectEqualStrings("", buffer.bytes());
+    while (try buffer.redo(allocator)) {}
+    try std.testing.expectEqualStrings("", buffer.bytes());
+}
+
+test "saved positions survive undo and redo but not discarded branches" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "abc");
+    defer buffer.deinit(allocator);
+    try buffer.replace(allocator, .{ .start = 1, .end = 2 }, "B", 2);
+    try buffer.markSaved(allocator);
+    try std.testing.expectEqualStrings("aBc", buffer.base);
+    try std.testing.expect(!buffer.modified());
+    try buffer.replace(allocator, .{ .start = 2, .end = 3 }, "C", 3);
+    try std.testing.expect(buffer.modified());
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expect(!buffer.modified());
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expect(buffer.modified());
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expect(!buffer.modified());
+    try std.testing.expect(try buffer.undo(allocator));
+    try buffer.replace(allocator, .{ .start = 0, .end = 1 }, "A", 1);
+    try std.testing.expect(!try buffer.redo(allocator));
+    try std.testing.expect(buffer.modified());
+    try std.testing.expectEqual(@as(?usize, null), buffer.saved_position);
+    try std.testing.expectEqualStrings("aBc", buffer.base);
+}
+
+test "unsupported bytes are retained read-only and unsupported replacements are atomic" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "a\x00b", "a\x1bb", "\xc3\xa9", "a\rb" }) |input| {
+        var buffer = try Buffer.fromBytes(allocator, input);
+        defer buffer.deinit(allocator);
+        try std.testing.expect(!buffer.editable);
+        try std.testing.expectEqualStrings(input, buffer.bytes());
+        try std.testing.expectError(error.UnsupportedText, buffer.replace(allocator, .{ .start = 0, .end = input.len }, "", 0));
+        try std.testing.expect(!buffer.modified());
+    }
+    var buffer = try Buffer.fromBytes(allocator, "ok\t\r\n");
+    defer buffer.deinit(allocator);
+    try std.testing.expect(buffer.editable);
+    try std.testing.expectError(error.UnsupportedText, buffer.replace(allocator, .{ .start = 0, .end = 0 }, "a\rb", 0));
+    try std.testing.expectEqualStrings("ok\t\r\n", buffer.bytes());
+}
+
+test "byte and logical line limits include EOF transitions and reversible edits" {
+    const allocator = std.testing.allocator;
+    const large = try allocator.alloc(u8, source.max_file_bytes + 1);
+    defer allocator.free(large);
+    @memset(large, 'x');
+    try std.testing.expectError(error.FileTooLarge, Buffer.fromBytes(allocator, large));
+    var buffer = try Buffer.fromBytes(allocator, large[0 .. source.max_file_bytes - 1]);
+    defer buffer.deinit(allocator);
+    buffer.beginGroup();
+    try buffer.replace(allocator, .{ .start = 0, .end = 0 }, "a", 1);
+    try std.testing.expectError(error.FileTooLarge, buffer.replace(allocator, .{ .start = 1, .end = 1 }, "bc", 3));
+    try std.testing.expectEqual(@as(usize, source.max_file_bytes), buffer.bytes().len);
+    try std.testing.expectEqual(@as(usize, 1), buffer.cursor);
+    try std.testing.expectEqual(@as(usize, 1), buffer.history.items[0].edits.items.len);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqual(@as(usize, source.max_file_bytes), buffer.bytes().len);
+
+    @memset(large[0 .. source.max_lines + 1], '\n');
+    try std.testing.expectError(error.TooManyLines, Buffer.fromBytes(allocator, large[0 .. source.max_lines + 1]));
+    var lines = try Buffer.fromBytes(allocator, large[0 .. source.max_lines - 1]);
+    defer lines.deinit(allocator);
+    const eof = lines.bytes().len;
+    try lines.replace(allocator, .{ .start = eof, .end = eof }, "x", eof + 1);
+    try std.testing.expectEqual(@as(usize, source.max_lines), lines.lineCount());
+    // A final LF terminates the last line, without adding a logical line.
+    try lines.replace(allocator, .{ .start = eof + 1, .end = eof + 1 }, "\n", eof + 2);
+    try std.testing.expectEqual(@as(usize, source.max_lines), lines.lineCount());
+    try std.testing.expectEqual(@as(usize, source.max_lines + 1), lines.insertionRows());
+    const position = lines.position;
+    try std.testing.expectError(error.TooManyLines, lines.replace(allocator, .{ .start = eof + 2, .end = eof + 2 }, "X", eof + 3));
+    try std.testing.expectError(error.TooManyLines, lines.replace(allocator, .{ .start = 0, .end = 0 }, "\n", 1));
+    try std.testing.expectEqual(position, lines.position);
+    try std.testing.expect(try lines.undo(allocator));
+    try std.testing.expect(try lines.redo(allocator));
+    var reopened = try source.Snapshot.fromBytes(allocator, lines.bytes());
+    defer reopened.deinit(allocator);
+    try std.testing.expectEqual(lines.lineCount(), reopened.line_starts.len);
+    try std.testing.expectEqualStrings(lines.bytes(), reopened.bytes);
+}
+
+test "edit, branch, grouped insertion, and saved-base failures retain observable state" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationWorkflow, .{});
+}
+
+fn allocationWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, "a\r\nb");
+    defer buffer.deinit(allocator);
+    try buffer.setCursor(3);
+    buffer.replace(allocator, .{ .start = 0, .end = 1 }, "FIRST\n", 6) catch |err| {
+        try expectState(&buffer, "a\r\nb", 3, 0, 0, false);
+        return err;
+    };
+    try std.testing.expect(try buffer.undo(allocator));
+    buffer.replace(allocator, .{ .start = 0, .end = 1 }, "branch\n", 7) catch |err| {
+        try expectState(&buffer, "a\r\nb", 3, 0, 1, false);
+        try std.testing.expect(try buffer.redo(allocator));
+        try std.testing.expectEqualStrings("FIRST\n\r\nb", buffer.bytes());
+        return err;
+    };
+    buffer.beginGroup();
+    buffer.replace(allocator, .{ .start = 0, .end = 6 }, "", 0) catch |err| {
+        try expectState(&buffer, "branch\n\r\nb", 7, 1, 1, true);
+        return err;
+    };
+    buffer.replace(allocator, .{ .start = 0, .end = 0 }, "much longer insertion\n\n\n", 24) catch |err| {
+        try expectState(&buffer, "\n\r\nb", 0, 2, 2, true);
+        try std.testing.expectEqual(@as(usize, 1), buffer.history.items[1].edits.items.len);
+        return err;
+    };
+    buffer.markSaved(allocator) catch |err| {
+        try std.testing.expectEqualStrings("a\r\nb", buffer.base);
+        try std.testing.expect(buffer.modified());
+        try std.testing.expectEqual(@as(usize, 24), buffer.cursor);
+        return err;
+    };
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings("branch\n\r\nb", buffer.bytes());
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expect(!buffer.modified());
+}
+
+fn expectState(buffer: *const Buffer, bytes: []const u8, cursor: usize, position: usize, groups: usize, dirty: bool) !void {
+    try std.testing.expectEqualStrings(bytes, buffer.bytes());
+    try std.testing.expectEqual(cursor, buffer.cursor);
+    try std.testing.expectEqual(position, buffer.position);
+    try std.testing.expectEqual(groups, buffer.history.items.len);
+    try std.testing.expectEqual(dirty, buffer.modified());
+    try expectIndex(buffer);
+}
+
+fn expectIndex(buffer: *const Buffer) !void {
+    var row: usize = 1;
+    try std.testing.expectEqual(@as(usize, 0), buffer.starts.items[0]);
+    for (buffer.bytes(), 0..) |byte, offset| {
+        if (byte == '\n') {
+            try std.testing.expectEqual(offset + 1, buffer.starts.items[row]);
+            row += 1;
+        }
+    }
+    try std.testing.expectEqual(row, buffer.insertionRows());
+}
+
+test "incremental index and history agree with independent replacement over varied ranges" {
+    const allocator = std.testing.allocator;
+    const original = "first\r\nsecond\n\r\nthird\r\n";
+    var buffer = try Buffer.fromBytes(allocator, original);
+    defer buffer.deinit(allocator);
+    var random = std.Random.DefaultPrng.init(0x45a8);
+    const rng = random.random();
+    const replacements = [_][]const u8{ "", "x", "\n", "\r\n", "\n\n", "abc\r\ndef", "\tline\n" };
+    for (0..500) |i| {
+        if (i % 7 == 0) buffer.beginGroup();
+        var start = rng.uintLessThan(usize, buffer.bytes().len + 1);
+        var end = start + rng.uintLessThan(usize, buffer.bytes().len - start + 1);
+        if (!boundary(buffer.bytes(), start)) start -= 1;
+        if (!boundary(buffer.bytes(), end)) end += 1;
+        const inserted = replacements[rng.uintLessThan(usize, replacements.len)];
+        const expected = try std.mem.concat(allocator, u8, &.{ buffer.bytes()[0..start], inserted, buffer.bytes()[end..] });
+        defer allocator.free(expected);
+        try buffer.replace(allocator, .{ .start = start, .end = end }, inserted, start + inserted.len);
+        try std.testing.expectEqualStrings(expected, buffer.bytes());
+        try expectIndex(&buffer);
+    }
+    buffer.endGroup();
+    const final = try allocator.dupe(u8, buffer.bytes());
+    defer allocator.free(final);
+    while (try buffer.undo(allocator)) try expectIndex(&buffer);
+    try std.testing.expectEqualStrings(original, buffer.bytes());
+    while (try buffer.redo(allocator)) try expectIndex(&buffer);
+    try std.testing.expectEqualStrings(final, buffer.bytes());
+}
+
+test "one insertion region coalesces at either edge and inside with exact replay" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "left right\r\n");
+    defer buffer.deinit(allocator);
+    try buffer.setCursor(5);
+    buffer.beginGroup();
+    try buffer.replace(allocator, .{ .start = 5, .end = 5 }, "ac", 7);
+    try buffer.replace(allocator, .{ .start = 6, .end = 6 }, "b", 7);
+    try buffer.replace(allocator, .{ .start = 5, .end = 5 }, "[", 6);
+    try buffer.replace(allocator, .{ .start = 9, .end = 9 }, "]\n", 11);
+    try std.testing.expectEqualStrings("left [abc]\nright\r\n", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 1), buffer.history.items[0].edits.items.len);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings("left right\r\n", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 5), buffer.cursor);
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqualStrings("left [abc]\nright\r\n", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 11), buffer.cursor);
+    try expectIndex(&buffer);
+}
+
+test "failed insertion coalescing retains earlier typing and allocation-free replay" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, coalescingWorkflow, .{});
+}
+
+fn coalescingWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, "abc");
+    defer buffer.deinit(allocator);
+    buffer.beginGroup();
+    try buffer.replace(allocator, .{ .start = 1, .end = 1 }, "X", 2);
+    buffer.replace(allocator, .{ .start = 2, .end = 2 }, "long insertion\n\n", 18) catch |err| {
+        try expectState(&buffer, "aXbc", 2, 1, 1, true);
+        try std.testing.expectEqualStrings("X", buffer.history.items[0].edits.items[0].inserted());
+        try std.testing.expect(try buffer.undo(allocator));
+        try std.testing.expectEqualStrings("abc", buffer.bytes());
+        try std.testing.expect(try buffer.redo(allocator));
+        try std.testing.expectEqualStrings("aXbc", buffer.bytes());
+        return err;
+    };
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings("abc", buffer.bytes());
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqualStrings("aXlong insertion\n\nbc", buffer.bytes());
+}

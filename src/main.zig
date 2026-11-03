@@ -110,6 +110,7 @@ fn diagnostic(message: []const u8) void {
 }
 
 test {
+    _ = @import("buffer.zig");
     _ = @import("terminal.zig");
     _ = @import("snapshot.zig");
     _ = @import("view.zig");

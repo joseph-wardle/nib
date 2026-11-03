@@ -2,7 +2,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-// Temporary viewer resource bounds, not a future editing/storage contract.
+// Temporary shared loading/editing bounds; remove together when storage permits.
 pub const max_file_bytes = 8 * 1024 * 1024;
 pub const max_lines = 256 * 1024;
 
