@@ -1,43 +1,39 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const source = @import("snapshot.zig");
-const Snapshot = source.Snapshot;
+const Buffer = @import("buffer.zig").Buffer;
+const motion = @import("motion.zig");
 
-pub const Direction = enum { left, down, up, right };
-
-/// Offsets in logical lines and display columns. Geometry passed to clamp/move
-/// is the content area; terminal margins and the status row belong to the caller.
+/// Logical rows and display columns; the caller reserves terminal margins/status.
 pub const Viewport = struct {
     top: usize = 0,
     left: usize = 0,
 
-    pub fn clamp(self: *Viewport, snapshot: Snapshot, rows: usize, columns: usize) void {
-        self.top = @min(self.top, snapshot.line_starts.len -| @max(rows, 1));
-        self.left = @min(self.left, snapshot.max_columns -| @max(columns, 1));
+    pub fn follow(self: *Viewport, buffer: *const Buffer, rows: usize, columns: usize, insert: bool) void {
+        const count = if (insert) buffer.insertionRows() else buffer.lineCount();
+        const row = @min(buffer.rowAt(buffer.cursor), count - 1);
+        const col = motion.screenColumn(buffer, buffer.cursor, insert);
+        self.top = @min(self.top, count -| @max(rows, 1));
+        if (row < self.top) self.top = row else if (row - self.top >= @max(rows, 1)) self.top = row - (@max(rows, 1) - 1);
+        if (col < self.left) self.left = col else if (col - self.left >= @max(columns, 1)) self.left = col - (@max(columns, 1) - 1);
     }
 
-    /// Returns whether the viewport changed, so callers can avoid idle redraws.
-    pub fn move(self: *Viewport, snapshot: Snapshot, rows: usize, columns: usize, direction: Direction) bool {
-        const previous = self.*;
-        self.clamp(snapshot, rows, columns);
-        switch (direction) {
-            .left => self.left -|= 1,
-            .down => self.top +|= 1,
-            .up => self.top -|= 1,
-            .right => self.left +|= 1,
-        }
-        self.clamp(snapshot, rows, columns);
-        return previous.top != self.top or previous.left != self.left;
+    /// null when no content cell exists, including a one-row terminal. Returned
+    /// coordinates are zero-based, relative to the content area, never status.
+    pub fn cursor(self: Viewport, buffer: *const Buffer, rows: usize, columns: usize, insert: bool) ?struct { row: usize, column: usize } {
+        const row = buffer.rowAt(buffer.cursor);
+        const col = motion.screenColumn(buffer, buffer.cursor, insert);
+        if (row < self.top or col < self.left or row - self.top >= rows or col - self.left >= columns) return null;
+        return .{ .row = row - self.top, .column = col - self.left };
     }
 
-    /// Fills one content row, padding beyond end-of-line/file with spaces.
-    /// Does not mutate the snapshot or allocate. All output is printable ASCII.
-    pub fn renderRow(self: Viewport, snapshot: Snapshot, row: usize, output: []u8) void {
-        if (self.top >= snapshot.line_starts.len or row >= snapshot.line_starts.len - self.top) {
+    /// No allocation or mutation; output is padded printable ASCII.
+    pub fn renderRow(self: Viewport, buffer: *const Buffer, row: usize, output: []u8) void {
+        if (self.top >= buffer.insertionRows() or row >= buffer.insertionRows() - self.top) {
             @memset(output, ' ');
             return;
         }
-        renderText(snapshot.line(self.top + row), self.left, output);
+        renderText(buffer.line(self.top + row), self.left, output);
     }
 };
 
@@ -63,25 +59,25 @@ pub fn renderText(text: []const u8, left: usize, output: []u8) void {
 }
 
 test "rendering clips inside tabs and pads short rows" {
-    var snapshot = try Snapshot.fromBytes(std.testing.allocator, "a\tb\tc\nshort\n");
-    defer snapshot.deinit(std.testing.allocator);
+    var text = try Buffer.fromBytes(std.testing.allocator, "a\tb\tc\nshort\n");
+    defer text.deinit(std.testing.allocator);
     var buffer: [12]u8 = undefined;
     var viewport: Viewport = .{ .left = 4 };
-    viewport.renderRow(snapshot, 0, &buffer);
+    viewport.renderRow(&text, 0, &buffer);
     try std.testing.expectEqualStrings("    b       ", &buffer);
     viewport.left = 7;
-    viewport.renderRow(snapshot, 0, buffer[0..4]);
+    viewport.renderRow(&text, 0, buffer[0..4]);
     try std.testing.expectEqualStrings(" b  ", buffer[0..4]);
     viewport.left = 8;
-    viewport.renderRow(snapshot, 0, buffer[0..9]);
+    viewport.renderRow(&text, 0, buffer[0..9]);
     try std.testing.expectEqualStrings("b       c", buffer[0..9]);
     viewport.left = 16;
-    viewport.renderRow(snapshot, 0, buffer[0..4]);
+    viewport.renderRow(&text, 0, buffer[0..4]);
     try std.testing.expectEqualStrings("c   ", buffer[0..4]);
     viewport.left = 0;
-    viewport.renderRow(snapshot, 1, &buffer);
+    viewport.renderRow(&text, 1, &buffer);
     try std.testing.expectEqualStrings("short       ", &buffer);
-    viewport.renderRow(snapshot, 2, buffer[0..4]);
+    viewport.renderRow(&text, 2, buffer[0..4]);
     try std.testing.expectEqualStrings("    ", buffer[0..4]);
 }
 
@@ -95,50 +91,47 @@ test "all byte values and hostile filenames render as safe ASCII" {
     try std.testing.expectEqualStrings("file?[2J????? ", buffer[0..14]);
 }
 
-test "scrolling reaches every line and column and clamps at each boundary" {
-    var snapshot = try Snapshot.fromBytes(std.testing.allocator, "abcdef\n12\nlast\n");
-    defer snapshot.deinit(std.testing.allocator);
+test "following scrolls only to reveal the cursor and survives tiny geometry" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "abcdef\n12\nlast\n");
+    defer buffer.deinit(std.testing.allocator);
     var viewport: Viewport = .{};
-    try std.testing.expect(!viewport.move(snapshot, 2, 3, .up));
-    try std.testing.expect(!viewport.move(snapshot, 2, 3, .left));
-    try std.testing.expect(viewport.move(snapshot, 2, 3, .down));
-    try std.testing.expect(!viewport.move(snapshot, 2, 3, .down));
-    try std.testing.expectEqual(@as(usize, 1), viewport.top);
-    for (0..3) |_| try std.testing.expect(viewport.move(snapshot, 2, 3, .right));
-    try std.testing.expect(!viewport.move(snapshot, 2, 3, .right));
-    try std.testing.expectEqual(@as(usize, 3), viewport.left);
-    try std.testing.expect(viewport.move(snapshot, 2, 3, .up));
-    var buffer: [3]u8 = undefined;
-    viewport.renderRow(snapshot, 0, &buffer);
-    try std.testing.expectEqualStrings("def", &buffer);
-    viewport.clamp(snapshot, 1, 1);
-    try std.testing.expect(viewport.move(snapshot, 1, 1, .down));
-    try std.testing.expect(viewport.move(snapshot, 1, 1, .down));
-    try std.testing.expectEqual(@as(usize, 2), viewport.top);
-    viewport.clamp(snapshot, 100, 100);
+    buffer.cursor = 4;
+    viewport.follow(&buffer, 2, 3, false);
+    try std.testing.expectEqualDeep(Viewport{ .left = 2 }, viewport);
+    buffer.cursor = 12;
+    viewport.follow(&buffer, 2, 3, false);
+    try std.testing.expectEqualDeep(Viewport{ .top = 1, .left = 2 }, viewport);
+    const cell = viewport.cursor(&buffer, 2, 3, false).?;
+    try std.testing.expectEqual(@as(usize, 1), cell.row);
+    try std.testing.expectEqual(@as(usize, 0), cell.column);
+    viewport.follow(&buffer, 0, 0, false);
+    try std.testing.expect(viewport.cursor(&buffer, 0, 0, false) == null);
+    viewport.follow(&buffer, 100, 100, false);
+    try std.testing.expectEqual(@as(usize, 0), viewport.top);
+    buffer.cursor = 0;
+    viewport.follow(&buffer, 2, 3, false);
+    try std.testing.expectEqualDeep(Viewport{}, viewport);
+    viewport.top = std.math.maxInt(usize);
+    viewport.left = std.math.maxInt(usize);
+    var output: [3]u8 = undefined;
+    viewport.renderRow(&buffer, std.math.maxInt(usize), &output);
+    try std.testing.expectEqualStrings("   ", &output);
+    viewport.follow(&buffer, 0, 0, false);
     try std.testing.expectEqualDeep(Viewport{}, viewport);
 }
 
-test "zero geometry and extreme offsets never underflow or overflow" {
-    var snapshot = try Snapshot.fromBytes(std.testing.allocator, "\n\tX");
-    defer snapshot.deinit(std.testing.allocator);
-    var viewport: Viewport = .{ .top = std.math.maxInt(usize), .left = std.math.maxInt(usize) };
-    var buffer: [3]u8 = undefined;
-    viewport.renderRow(snapshot, std.math.maxInt(usize), &buffer);
-    try std.testing.expectEqualStrings("   ", &buffer);
-    renderText("\tX", viewport.left, &buffer);
-    try std.testing.expectEqualStrings("   ", &buffer);
-    viewport.clamp(snapshot, 0, 0);
-    try std.testing.expectEqualDeep(Viewport{ .top = 1, .left = 8 }, viewport);
-    try std.testing.expect(!viewport.move(snapshot, 0, 0, .down));
-    try std.testing.expect(!viewport.move(snapshot, 0, 0, .right));
-    viewport.renderRow(snapshot, 0, &.{});
-    viewport.clamp(snapshot, std.math.maxInt(usize), std.math.maxInt(usize));
-    try std.testing.expectEqualDeep(Viewport{}, viewport);
-    var empty = try Snapshot.fromBytes(std.testing.allocator, "");
-    defer empty.deinit(std.testing.allocator);
-    try std.testing.expect(!viewport.move(empty, 0, 0, .down));
-    try std.testing.expect(!viewport.move(empty, 0, 0, .right));
+test "tab cursor and trailing insertion row have visible cells only in content" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "\tX\r\n");
+    defer buffer.deinit(std.testing.allocator);
+    var viewport: Viewport = .{};
+    viewport.follow(&buffer, 1, 3, false);
+    try std.testing.expectEqual(@as(usize, 5), viewport.left);
+    try std.testing.expectEqual(@as(usize, 2), viewport.cursor(&buffer, 1, 3, false).?.column);
+    buffer.cursor = buffer.bytes().len;
+    viewport.follow(&buffer, 1, 3, true);
+    try std.testing.expectEqualDeep(Viewport{ .top = 1 }, viewport);
+    try std.testing.expectEqual(@as(usize, 0), viewport.cursor(&buffer, 1, 3, true).?.column);
+    try std.testing.expect(viewport.cursor(&buffer, 0, 3, true) == null);
 }
 
 test "a long line can be clipped near its end without wrapping or modification" {
@@ -147,14 +140,15 @@ test "a long line can be clipped near its end without wrapping or modification" 
     defer allocator.free(bytes);
     @memset(bytes, 'a');
     @memcpy(bytes[bytes.len - 4 ..], "tail");
-    var snapshot = try Snapshot.fromBytes(allocator, bytes);
-    defer snapshot.deinit(allocator);
-    var viewport: Viewport = .{ .left = std.math.maxInt(usize) };
-    viewport.clamp(snapshot, 1, 4);
+    var text = try Buffer.fromBytes(allocator, bytes);
+    defer text.deinit(allocator);
+    var viewport: Viewport = .{};
+    text.cursor = text.bytes().len - 1;
+    viewport.follow(&text, 1, 4, false);
     var buffer: [4]u8 = undefined;
-    viewport.renderRow(snapshot, 0, &buffer);
+    viewport.renderRow(&text, 0, &buffer);
     try std.testing.expectEqualStrings("tail", &buffer);
-    try std.testing.expectEqualSlices(u8, bytes, snapshot.bytes);
+    try std.testing.expectEqualSlices(u8, bytes, text.bytes());
 }
 
 test "every clipping boundary agrees with a fully expanded line" {

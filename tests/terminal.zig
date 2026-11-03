@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "disconnect", disconnect },
         .{ "shellJobControl", shellJobControl },
         .{ "viewerWorkflow", viewerWorkflow },
+        .{ "cursorMotions", cursorMotions },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
@@ -339,10 +340,23 @@ fn resizeAndSuspend(executable: [:0]const u8) !void {
     var process = try Process.start(executable, .{});
     defer process.close();
     try process.ready();
-    for ([_][2]u16{ .{ 1, 1 }, .{ 0, 0 }, .{ 30, 100 } }) |size| {
+    for ([_][2]u16{ .{ 1, 1 }, .{ 0, 0 }, .{ 2, 2 }, .{ 30, 100 } }) |size| {
         var dimensions: posix.winsize = .{ .row = size[0], .col = size[1], .xpixel = 0, .ypixel = 0 };
         _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
         try process.until(frame);
+        if (size[0] <= 1 or size[1] <= 1) {
+            // Inspect the complete frame before ready consumes it.
+            const deadline = try now() + 5000;
+            while (std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m") == null) {
+                if (process.eof or try now() >= deadline) return error.OutputTimeout;
+                _ = try process.read(50);
+            }
+            try process.excludes("\x1b[?25h");
+            try process.ready();
+        } else if (size[0] == 2 and size[1] == 2) {
+            try process.until("\x1b[1;1H\x1b[?25h");
+            try process.ready();
+        }
     }
     try process.until("Ctrl-Z suspend");
     for (0..3) |_| {
@@ -462,7 +476,7 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.until("line000 ");
     try process.until("source'?[2J");
     try process.ready();
-    try process.send("jjlll");
+    try process.send("2j3l");
     try process.until("3:4 | ");
     try process.until("\x1b[0m");
     // Fragmented CSI, SS3, OSC, DCS, Alt-q and pasted commands are ignored.
@@ -477,18 +491,24 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     var dimensions: posix.winsize = .{ .row = 4, .col = 12, .xpixel = 0, .ypixel = 0 };
     _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
     try process.signal(.CONT);
-    try process.until("e002 xxxxxx");
+    try process.until("line000 xxx");
+    try process.until("\x1b[3;4H\x1b[?25h");
     try process.ready();
     // Reach the final row and the final display column, then check the whole
     // clipped frame. The fixture ends with CRLF and contains an eight-stop tab.
     var movement: [128]u8 = undefined;
     @memset(&movement, 'j');
     try process.send(&movement);
-    try process.until("e059 xxxxxx\r\n");
+    try process.until("line059 xxx\r\n");
     try process.until("\x1b[0m");
     @memset(&movement, 'l');
     try process.send(&movement);
     try process.until("\x1b[H\x1b[2JxxTAIL    !\r\nxxTAIL    !\r\nxxTAIL    !\r\n");
+    try process.until("\x1b[3;11H\x1b[?25h");
+    try process.ready();
+    try process.send("gg0");
+    try process.until("line000 xxx\r\nline001 xxx\r\nline002 xxx\r\n");
+    try process.until("\x1b[1;1H\x1b[?25h");
     try process.ready();
     try equal(@as(usize, 0), try process.read(100));
     try process.send("q");
@@ -508,6 +528,39 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
         for (bytes[number * 128 + 8 ..][0..112]) |byte| try equal(@as(u8, 'x'), byte);
         try std.testing.expectEqualStrings("TAIL\t!\r\n", bytes[number * 128 + 120 ..][0..8]);
     }
+}
+
+fn cursorMotions(executable: [:0]const u8) !void {
+    var process = try Process.start(executable, .{});
+    defer process.close();
+    try process.ready();
+    const cases = [_]struct { keys: []const u8, position: []const u8 }{
+        .{ .keys = "w", .position = "1:9 | " },
+        .{ .keys = "e", .position = "1:124 | " },
+        .{ .keys = "b", .position = "1:9 | " },
+        .{ .keys = "$", .position = "1:129 | " },
+        .{ .keys = "h", .position = "1:128 | " },
+        .{ .keys = "j", .position = "2:128 | " },
+        .{ .keys = "k", .position = "1:128 | " },
+        .{ .keys = "0", .position = "1:1 | " },
+        .{ .keys = "3G", .position = "3:1 | " },
+        .{ .keys = "G", .position = "60:1 | " },
+        .{ .keys = "gg", .position = "1:1 | " },
+        .{ .keys = "6w", .position = "3:1 | " },
+        .{ .keys = "2l^", .position = "3:1 | " },
+    };
+    for (cases) |case| {
+        try process.send(case.keys);
+        try process.until(case.position);
+        try process.ready();
+    }
+    // A refused count and an unsupported editing command cannot execute a
+    // truncated movement, redraw continuously, or modify this read-only viewer.
+    try process.send("99999999999999999999999999999999jdi");
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("q");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.restored();
 }
 
 fn startupFailures(executable: [:0]const u8) !void {

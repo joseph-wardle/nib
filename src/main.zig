@@ -2,6 +2,8 @@
 const std = @import("std");
 const terminal = @import("terminal.zig");
 const source = @import("snapshot.zig");
+const Buffer = @import("buffer.zig").Buffer;
+const motion = @import("motion.zig");
 const view = @import("view.zig");
 const input = @import("input.zig");
 
@@ -37,8 +39,13 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const u8) !u8 {
-    var snapshot = try source.Snapshot.load(init.gpa, init.io, .cwd(), path);
-    defer snapshot.deinit(init.gpa);
+    var buffer = block: {
+        var snapshot = try source.Snapshot.load(init.gpa, init.io, .cwd(), path);
+        defer snapshot.deinit(init.gpa);
+        break :block try Buffer.fromBytes(init.gpa, snapshot.bytes);
+    };
+    defer buffer.deinit(init.gpa);
+    var goal: motion.Goal = 0;
     var viewport: view.Viewport = .{};
     var parser: input.Parser = .{};
     var dimensions: terminal.Size = .{ .rows = 0, .columns = 0 };
@@ -47,42 +54,52 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
         switch (try session.next()) {
             .redraw => |size| {
                 dimensions = size;
-                viewport.clamp(snapshot, size.rows -| 1, size.columns -| 1);
+                viewport.follow(&buffer, size.rows -| 1, size.columns -| 1, false);
                 redraw = true;
             },
             .input => |byte| if (parser.feed(byte)) |command| {
                 switch (command) {
                     .quit => return 0,
-                    .move => |direction| redraw = viewport.move(snapshot, dimensions.rows -| 1, dimensions.columns -| 1, direction),
+                    .move => |movement| if (motion.resolve(&buffer, goal, movement.motion, movement.count, null)) |result| {
+                        redraw = result.destination != buffer.cursor;
+                        buffer.cursor = result.destination;
+                        goal = result.goal;
+                        viewport.follow(&buffer, dimensions.rows -| 1, dimensions.columns -| 1, false);
+                    },
                 }
             },
             .quit => |code| return code,
         }
-        if (redraw) draw(session, snapshot, viewport, dimensions, path) catch |err| {
+        if (redraw) draw(session, &buffer, viewport, dimensions, path) catch |err| {
             if (err != error.Interrupted) return err;
         };
     }
 }
 
-fn draw(session: *terminal.Terminal, snapshot: source.Snapshot, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8) terminal.Error!void {
-    try session.write("\x1b[H\x1b[2J");
+fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8) terminal.Error!void {
+    try session.write("\x1b[?25l\x1b[H\x1b[2J");
     // Reserve the last column on every row to avoid autowrap, including the
     // bottom-right cell. A fixed row buffer covers every u16 terminal width.
-    var buffer: [std.math.maxInt(u16)]u8 = undefined;
-    const row = buffer[0..dimensions.columns -| 1];
+    var row_buffer: [std.math.maxInt(u16)]u8 = undefined;
+    const row = row_buffer[0..dimensions.columns -| 1];
     if (dimensions.rows != 0 and row.len != 0) {
         for (0..dimensions.rows - 1) |number| {
-            viewport.renderRow(snapshot, number, row);
+            viewport.renderRow(buffer, number, row);
             try session.write(row);
             try session.write("\r\n");
         }
         var status: [128]u8 = undefined;
-        const label = std.fmt.bufPrint(&status, "q quit | hjkl scroll | Ctrl-Z suspend | {d}:{d} | ", .{ viewport.top + 1, viewport.left + 1 }) catch unreachable;
+        const label = std.fmt.bufPrint(&status, "q quit | motions | Ctrl-Z suspend | {d}:{d} | ", .{ buffer.rowAt(buffer.cursor) + 1, motion.screenColumn(buffer, buffer.cursor, false) + 1 }) catch unreachable;
         const prefix = @min(label.len, row.len);
         @memcpy(row[0..prefix], label[0..prefix]);
         view.renderText(path, 0, row[prefix..]);
         try session.write("\x1b[7m");
         try session.write(row);
+    }
+    try session.write("\x1b[27m");
+    if (viewport.cursor(buffer, dimensions.rows -| 1, dimensions.columns -| 1, false)) |cell| {
+        var position: [48]u8 = undefined;
+        try session.write(std.fmt.bufPrint(&position, "\x1b[{d};{d}H\x1b[?25h", .{ cell.row + 1, cell.column + 1 }) catch unreachable);
     }
     try session.write("\x1b[0m");
 }

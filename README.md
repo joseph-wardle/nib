@@ -14,8 +14,10 @@ zig build run -- README.md
 ```
 
 The installed executable is `zig-out/bin/nib`. Run `nib <path>` in a Linux terminal
-to open one regular file read-only. Scroll with `h/j/k/l`, quit with `q`, and use
-Ctrl-Z/`fg` to suspend/resume.
+to open one regular file read-only. Move the text cursor with `h/j/k/l`, `0`,
+`^`, `$`, `w`, `b`, `e`, `gg`, and `G`; motions accept counts (`3w`, `20G`).
+The view scrolls to follow the cursor. Quit with `q`, and use Ctrl-Z/`fg` to
+suspend/resume. Editing and saving are not yet available.
 
 For development (checks require zsh):
 
