@@ -53,7 +53,7 @@ pub const External = struct {
         document.deinit(allocator);
         document.* = replacement;
         editor.parser.cancel();
-        editor.goal = motion.column(&document.buffer, document.buffer.cursor);
+        editor.goal = motion.screenColumn(&document.buffer, document.buffer.cursor, false);
         editor.notice = if (explicit) "Reloaded; local edits and history discarded" else "Reloaded external changes; history cleared";
         self.inspect(allocator, document, true);
         return true;
@@ -93,6 +93,69 @@ fn changed(external: *External) !void {
     var fds = [_]linux.pollfd{.{ .fd = external.watch.fd, .events = linux.POLL.IN, .revents = 0 }};
     try testing.expect(linux.poll(&fds, 1, 1000) > 0);
     try testing.expect(external.watch.drain());
+}
+
+test "explicit and automatic reload keep vertical movement aligned with a normal tab cursor" {
+    for ([_]bool{ false, true }) |explicit| {
+        var temp = testing.tmpDir(.{});
+        defer temp.cleanup();
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "\tfirst\n0123456789\n" });
+        var document = try file.Source.load(testing.allocator, testing.io, temp.dir, "source");
+        defer document.deinit(testing.allocator);
+        var editor: Editor = .{};
+        defer editor.deinit(testing.allocator);
+        var external: External = .{};
+        defer external.deinit(testing.allocator);
+        for ("lh") |byte| _ = editor.feed(testing.allocator, &document.buffer, .{ .key = byte });
+        try testing.expectEqual(@as(usize, 0), document.buffer.cursor);
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "\tother\n0123456789\n" });
+        if (explicit) {
+            try testing.expect(external.reload(testing.allocator, testing.io, &document, &editor, true));
+        } else {
+            external.inspect(testing.allocator, &document, true);
+            try testing.expect(external.automatic(testing.allocator, testing.io, &document, &editor));
+        }
+        _ = editor.feed(testing.allocator, &document.buffer, .{ .key = 'j' });
+        try testing.expectEqual(@as(usize, 14), document.buffer.cursor);
+        try testing.expectEqual(@as(u8, '7'), document.buffer.bytes()[document.buffer.cursor]);
+        _ = editor.feed(testing.allocator, &document.buffer, .{ .key = 'k' });
+        try testing.expectEqual(@as(usize, 0), document.buffer.cursor);
+    }
+}
+
+test "reload recomputes the vertical goal after clamping to shorter or empty text" {
+    const cases = [_]struct { text: []const u8, cursor: usize, up: usize, goal: usize }{
+        .{ .text = "ab\n0123456789\n", .cursor = 12, .up = 1, .goal = 9 },
+        .{ .text = "\t\n", .cursor = 0, .up = 0, .goal = 7 },
+        .{ .text = "", .cursor = 0, .up = 0, .goal = 0 },
+    };
+    for ([_]bool{ false, true }) |explicit| {
+        for (cases) |case| {
+            var temp = testing.tmpDir(.{});
+            defer temp.cleanup();
+            try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "abcdefghijklmnopqrstuvwxyz\nlast\n" });
+            var document = try file.Source.load(testing.allocator, testing.io, temp.dir, "source");
+            defer document.deinit(testing.allocator);
+            var editor: Editor = .{};
+            defer editor.deinit(testing.allocator);
+            var external: External = .{};
+            defer external.deinit(testing.allocator);
+            _ = editor.feed(testing.allocator, &document.buffer, .{ .key = '$' });
+            try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
+            if (explicit) {
+                try testing.expect(external.reload(testing.allocator, testing.io, &document, &editor, true));
+            } else {
+                external.inspect(testing.allocator, &document, true);
+                try testing.expect(external.automatic(testing.allocator, testing.io, &document, &editor));
+            }
+            try testing.expectEqual(case.cursor, document.buffer.cursor);
+            try testing.expectEqual(@as(?usize, case.goal), editor.goal);
+            _ = editor.feed(testing.allocator, &document.buffer, .{ .key = 'k' });
+            try testing.expectEqual(case.up, document.buffer.cursor);
+            _ = editor.feed(testing.allocator, &document.buffer, .{ .key = 'j' });
+            try testing.expectEqual(case.cursor, document.buffer.cursor);
+        }
+    }
 }
 
 test "notifications reload only clean command boundaries and keep dirty history until explicit reload" {
