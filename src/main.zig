@@ -9,6 +9,7 @@ const input = @import("input.zig");
 const command = @import("command.zig");
 const Editor = @import("editor.zig").Editor;
 const External = @import("external.zig").External;
+const Session = @import("session.zig").Session;
 
 pub fn main(init: std.process.Init) u8 {
     var args = init.minimal.args.iterate();
@@ -42,36 +43,32 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const u8) !u8 {
-    var document = try file.Source.load(init.gpa, init.io, .cwd(), path);
-    defer document.deinit(init.gpa);
-    const buffer = &document.buffer;
     var editor: Editor = .{};
     defer editor.deinit(init.gpa);
-    var external: External = .{};
-    defer external.deinit(init.gpa);
-    external.inspect(init.gpa, &document, true);
+    var documents: Session = .{};
+    defer documents.deinit(init.gpa);
+    _ = try documents.open(init.gpa, init.io, .cwd(), path, &editor);
     var suspension_count = session.suspension_count;
     var resumption_count = session.resumption_count;
     var save_notice: [256]u8 = undefined;
-    var viewport: view.Viewport = .{};
     var decoder: input.Decoder = .{};
 
     var dimensions: terminal.Size = .{ .rows = 0, .columns = 0 };
-    while (true) {
+    // Until the finder exists, closing the last document exits.
+    while (documents.current()) |active| {
         var redraw = false;
         var bytes: []const u8 = &.{};
         var expired = false;
-        switch (try session.next(decoder.deadline, external.watch.fd)) {
+        switch (try session.next(decoder.deadline, active.disk.watch.fd)) {
             .watch => {
-                const old_status = external.status();
-                if (external.watch.drain()) {
-                    external.inspect(init.gpa, &document, true);
-                    redraw = !std.mem.eql(u8, old_status, external.status());
+                const old_status = active.disk.status();
+                if (active.disk.watch.drain()) {
+                    active.disk.inspect(init.gpa, &active.document, true);
+                    redraw = !std.mem.eql(u8, old_status, active.disk.status());
                 }
             },
             .redraw => |size| {
                 dimensions = size;
-                viewport.follow(buffer, size.rows -| 1, size.columns -| 1, editor.inserting());
                 redraw = true;
             },
             .input => |chunk| bytes = chunk,
@@ -82,7 +79,7 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
             suspension_count = session.suspension_count;
             resumption_count = session.resumption_count;
             editor.interruptPaste();
-            external.inspect(init.gpa, &document, true);
+            active.disk.inspect(init.gpa, &active.document, true);
             redraw = true;
         }
         // One read can hold many keys or a large paste; they share a timestamp.
@@ -96,40 +93,71 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
                     session.requestSuspend();
                     continue;
                 }
+                // Closing a document moves entries; look the active one up per event.
+                const entry = documents.current() orelse return 0;
+                const buffer = &entry.document.buffer;
                 const old_mode = editor.parser.mode;
                 const old_length = editor.parser.line_len;
                 const old_cursor = buffer.cursor;
                 const old_position = buffer.position;
                 const old_text_length = buffer.bytes().len;
                 const old_notice = editor.notice;
-                if (editor.feed(init.gpa, buffer, event)) |action| switch (action) {
+                if (editor.feed(init.gpa, buffer, &entry.goal, event)) |action| switch (action) {
                     .quit => |discard| {
-                        if (discard or !buffer.modified()) return 0;
-                        editor.notice = "Unsaved changes; use :q! to discard";
+                        documents.close(init.gpa, init.io, entry.id, discard, &editor) catch {
+                            editor.notice = "Unsaved changes; use :q! to discard";
+                        };
+                        redraw = true;
+                        continue;
                     },
                     .write => |copy_path| {
                         const result = if (copy_path.len == 0)
-                            document.source.save(init.gpa, buffer, .{})
+                            documents.save(init.gpa, .{})
                         else
                             file.copy(init.gpa, init.io, .cwd(), copy_path, buffer, .{});
-                        if (copy_path.len == 0) external.inspect(init.gpa, &document, true);
                         editor.notice = saveNotice(result, copy_path.len != 0);
                         if (result.cleanup_failure) editor.notice = std.fmt.bufPrint(&save_notice, "{s}; cleanup failed", .{editor.notice}) catch unreachable;
                     },
                     .reload => {
-                        _ = external.reload(init.gpa, init.io, &document, &editor, true);
+                        _ = entry.disk.reload(
+                            init.gpa,
+                            init.io,
+                            &entry.document,
+                            &entry.goal,
+                            &editor,
+                            true,
+                        );
                         redraw = true;
                     },
                 };
                 redraw = redraw or old_mode != editor.parser.mode or old_length != editor.parser.line_len or old_cursor != buffer.cursor or old_position != buffer.position or old_text_length != buffer.bytes().len or !std.mem.eql(u8, old_notice, editor.notice);
             }
         }
-        redraw = external.automatic(init.gpa, init.io, &document, &editor) or redraw;
-        viewport.follow(buffer, dimensions.rows -| 1, dimensions.columns -| 1, editor.inserting());
-        if (redraw) draw(session, buffer, viewport, dimensions, path, &editor.parser, editor.notice, &external) catch |err| {
+        const entry = documents.current() orelse return 0;
+        const buffer = &entry.document.buffer;
+        redraw = entry.disk.automatic(
+            init.gpa,
+            init.io,
+            &entry.document,
+            &entry.goal,
+            &editor,
+        ) or redraw;
+        const rows = dimensions.rows -| 1;
+        entry.viewport.follow(buffer, rows, dimensions.columns -| 1, editor.inserting());
+        if (redraw) draw(
+            session,
+            buffer,
+            entry.viewport,
+            dimensions,
+            path,
+            &editor.parser,
+            editor.notice,
+            &entry.disk,
+        ) catch |err| {
             if (err != error.Interrupted) return err;
         };
     }
+    return 0;
 }
 
 fn saveNotice(result: file.Report, copy: bool) []const u8 {
@@ -253,6 +281,7 @@ test {
     _ = @import("input.zig");
     _ = @import("command.zig");
     _ = @import("jobs.zig");
+    _ = @import("session.zig");
 }
 
 test "save notices distinguish failure, uncertain publication and installed durability" {
