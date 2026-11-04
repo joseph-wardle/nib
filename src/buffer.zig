@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const source = @import("snapshot.zig");
+
+// Temporary loading/editing bounds; the roadmap records their removal criteria.
+pub const max_file_bytes = 8 * 1024 * 1024;
+pub const max_lines = 256 * 1024;
+
+/// Display cells used by a byte starting at a column. Tabs stop every eight.
+pub fn cellWidth(byte: u8, column: usize) usize {
+    return if (byte == '\t') 8 - column % 8 else 1;
+}
 
 pub const Range = struct { start: usize, end: usize };
 pub const Error = Allocator.Error || error{
@@ -57,9 +65,9 @@ pub const Buffer = struct {
     group_cursor: usize = 0,
 
     pub fn fromBytes(allocator: Allocator, content: []const u8) (Allocator.Error || error{ FileTooLarge, TooManyLines })!Buffer {
-        if (content.len > source.max_file_bytes) return error.FileTooLarge;
+        if (content.len > max_file_bytes) return error.FileTooLarge;
         const count = 1 + std.mem.count(u8, content, "\n");
-        if (logicalLines(content, count) > source.max_lines) return error.TooManyLines;
+        if (logicalLines(content, count) > max_lines) return error.TooManyLines;
         var self: Buffer = .{ .base = try allocator.dupe(u8, content), .editable = supported(content) };
         errdefer self.deinit(allocator);
         try self.text.appendSlice(allocator, content);
@@ -84,7 +92,8 @@ pub const Buffer = struct {
         return self.text.items;
     }
 
-    /// Logical file lines match Snapshot; insertionRows also exposes EOF after LF.
+    /// A final LF ends the last line rather than starting another;
+    /// insertionRows also counts the empty row after it.
     pub fn lineCount(self: *const Buffer) usize {
         return logicalLines(self.bytes(), self.starts.items.len);
     }
@@ -186,11 +195,11 @@ pub const Buffer = struct {
         if (!self.editable or !supported(inserted)) return error.UnsupportedText;
         const removed = self.text.items[range.start..range.end];
         const remaining = self.text.items.len - removed.len;
-        if (inserted.len > source.max_file_bytes - remaining) return error.FileTooLarge;
+        if (inserted.len > max_file_bytes - remaining) return error.FileTooLarge;
         const length = remaining + inserted.len;
         const rows = self.starts.items.len - std.mem.count(u8, removed, "\n") + std.mem.count(u8, inserted, "\n");
         const final_byte: ?u8 = if (range.end < self.text.items.len) self.text.items[self.text.items.len - 1] else if (inserted.len != 0) inserted[inserted.len - 1] else if (range.start != 0) self.text.items[range.start - 1] else null;
-        if (rows - @intFromBool(final_byte == '\n') > source.max_lines) return error.TooManyLines;
+        if (rows - @intFromBool(final_byte == '\n') > max_lines) return error.TooManyLines;
         if (cursor_after > length) return error.InvalidCursor;
         // Replacement cannot split existing CRLF and supported input cannot
         // contain lone CR, so only its resulting cursor needs a virtual read.
@@ -457,43 +466,62 @@ test "unsupported bytes are retained read-only and unsupported replacements are 
 
 test "byte and logical line limits include EOF transitions and reversible edits" {
     const allocator = std.testing.allocator;
-    const large = try allocator.alloc(u8, source.max_file_bytes + 1);
+    const large = try allocator.alloc(u8, max_file_bytes + 1);
     defer allocator.free(large);
     @memset(large, 'x');
     try std.testing.expectError(error.FileTooLarge, Buffer.fromBytes(allocator, large));
-    var buffer = try Buffer.fromBytes(allocator, large[0 .. source.max_file_bytes - 1]);
+    var buffer = try Buffer.fromBytes(allocator, large[0 .. max_file_bytes - 1]);
     defer buffer.deinit(allocator);
     buffer.beginGroup();
     try buffer.replace(allocator, .{ .start = 0, .end = 0 }, "a", 1);
     try std.testing.expectError(error.FileTooLarge, buffer.replace(allocator, .{ .start = 1, .end = 1 }, "bc", 3));
-    try std.testing.expectEqual(@as(usize, source.max_file_bytes), buffer.bytes().len);
+    try std.testing.expectEqual(@as(usize, max_file_bytes), buffer.bytes().len);
     try std.testing.expectEqual(@as(usize, 1), buffer.cursor);
     try std.testing.expectEqual(@as(usize, 1), buffer.history.items[0].edits.items.len);
     try std.testing.expect(try buffer.undo(allocator));
     try std.testing.expect(try buffer.redo(allocator));
-    try std.testing.expectEqual(@as(usize, source.max_file_bytes), buffer.bytes().len);
+    try std.testing.expectEqual(@as(usize, max_file_bytes), buffer.bytes().len);
 
-    @memset(large[0 .. source.max_lines + 1], '\n');
-    try std.testing.expectError(error.TooManyLines, Buffer.fromBytes(allocator, large[0 .. source.max_lines + 1]));
-    var lines = try Buffer.fromBytes(allocator, large[0 .. source.max_lines - 1]);
+    @memset(large[0 .. max_lines + 1], '\n');
+    try std.testing.expectError(error.TooManyLines, Buffer.fromBytes(allocator, large[0 .. max_lines + 1]));
+    var lines = try Buffer.fromBytes(allocator, large[0 .. max_lines - 1]);
     defer lines.deinit(allocator);
     const eof = lines.bytes().len;
     try lines.replace(allocator, .{ .start = eof, .end = eof }, "x", eof + 1);
-    try std.testing.expectEqual(@as(usize, source.max_lines), lines.lineCount());
+    try std.testing.expectEqual(@as(usize, max_lines), lines.lineCount());
     // A final LF terminates the last line, without adding a logical line.
     try lines.replace(allocator, .{ .start = eof + 1, .end = eof + 1 }, "\n", eof + 2);
-    try std.testing.expectEqual(@as(usize, source.max_lines), lines.lineCount());
-    try std.testing.expectEqual(@as(usize, source.max_lines + 1), lines.insertionRows());
+    try std.testing.expectEqual(@as(usize, max_lines), lines.lineCount());
+    try std.testing.expectEqual(@as(usize, max_lines + 1), lines.insertionRows());
     const position = lines.position;
     try std.testing.expectError(error.TooManyLines, lines.replace(allocator, .{ .start = eof + 2, .end = eof + 2 }, "X", eof + 3));
     try std.testing.expectError(error.TooManyLines, lines.replace(allocator, .{ .start = 0, .end = 0 }, "\n", 1));
     try std.testing.expectEqual(position, lines.position);
     try std.testing.expect(try lines.undo(allocator));
     try std.testing.expect(try lines.redo(allocator));
-    var reopened = try source.Snapshot.fromBytes(allocator, lines.bytes());
+    var reopened = try Buffer.fromBytes(allocator, lines.bytes());
     defer reopened.deinit(allocator);
-    try std.testing.expectEqual(lines.lineCount(), reopened.line_starts.len);
-    try std.testing.expectEqualStrings(lines.bytes(), reopened.bytes);
+    try std.testing.expectEqual(lines.lineCount(), reopened.lineCount());
+}
+
+test "line boundaries preserve empty lines and strip only LF or CRLF" {
+    const Case = struct { text: []const u8, lines: []const []const u8 };
+    const cases = [_]Case{
+        .{ .text = "", .lines = &.{""} },
+        .{ .text = "\n", .lines = &.{""} },
+        .{ .text = "\n\n", .lines = &.{ "", "" } },
+        .{ .text = "abc", .lines = &.{"abc"} },
+        .{ .text = "abc\n", .lines = &.{"abc"} },
+        .{ .text = "a\n\nb", .lines = &.{ "a", "", "b" } },
+        .{ .text = "a\r\n\r\nb\r", .lines = &.{ "a", "", "b\r" } },
+        .{ .text = "\r\r\n", .lines = &.{"\r"} },
+    };
+    for (cases) |case| {
+        var buffer = try Buffer.fromBytes(std.testing.allocator, case.text);
+        defer buffer.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.lines.len, buffer.lineCount());
+        for (case.lines, 0..) |expected, row| try std.testing.expectEqualStrings(expected, buffer.line(row));
+    }
 }
 
 test "edit, branch, grouped insertion, and saved-base failures retain observable state" {

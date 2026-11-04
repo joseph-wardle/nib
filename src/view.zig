@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const source = @import("snapshot.zig");
 const Buffer = @import("buffer.zig").Buffer;
+const cellWidth = @import("buffer.zig").cellWidth;
 const motion = @import("motion.zig");
 
 /// Logical rows and display columns; the caller reserves terminal margins/status.
@@ -45,7 +45,7 @@ pub fn renderText(text: []const u8, left: usize, output: []u8) void {
     if (output.len == 0) return;
     var column: usize = 0;
     for (text) |byte| {
-        const width = source.cellWidth(byte, column);
+        const width = cellWidth(byte, column);
         const skipped = left -| column;
         const offset = column -| left;
         if (offset >= output.len) break;

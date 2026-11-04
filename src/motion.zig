@@ -2,7 +2,7 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
 const Range = @import("buffer.zig").Range;
-const cellWidth = @import("snapshot.zig").cellWidth;
+const cellWidth = @import("buffer.zig").cellWidth;
 
 pub const Motion = enum { left, down, up, right, start, first, end, word, back, word_end, first_line, last_line };
 pub const Operator = enum { delete, change };

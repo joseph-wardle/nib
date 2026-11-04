@@ -4,7 +4,8 @@ const linux = std.os.linux;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
-const limits = @import("snapshot.zig");
+const max_file_bytes = @import("buffer.zig").max_file_bytes;
+const max_lines = @import("buffer.zig").max_lines;
 const Watch = @import("watch.zig").Watch;
 
 pub const Error = Allocator.Error || error{
@@ -411,7 +412,7 @@ fn syncDirectory(fd: posix.fd_t, options: Options) Error!void {
     try sync(fd);
 }
 fn readAll(allocator: Allocator, fd: posix.fd_t, size: u64) Error![]u8 {
-    if (size > limits.max_file_bytes) return error.FileTooLarge;
+    if (size > max_file_bytes) return error.FileTooLarge;
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(allocator);
     var chunk: [16384]u8 = undefined;
@@ -420,7 +421,7 @@ fn readAll(allocator: Allocator, fd: posix.fd_t, size: u64) Error![]u8 {
         if (posix.errno(result) == .INTR) continue;
         const count = try checked(result, error.ReadFailed);
         if (count == 0) break;
-        if (count > limits.max_file_bytes - bytes.items.len) return error.FileTooLarge;
+        if (count > max_file_bytes - bytes.items.len) return error.FileTooLarge;
         try bytes.appendSlice(allocator, chunk[0..count]);
     }
     return bytes.toOwnedSlice(allocator);
@@ -1096,22 +1097,22 @@ test "validated loading enforces exact byte and logical line limits" {
     defer temp.cleanup();
     const large = try temp.dir.createFile(testing.io, "large", .{});
     defer large.close(testing.io);
-    try large.setLength(testing.io, limits.max_file_bytes);
+    try large.setLength(testing.io, max_file_bytes);
     {
         var exact = try Source.load(testing.allocator, testing.io, temp.dir, "large");
         defer exact.deinit(testing.allocator);
-        try testing.expectEqual(limits.max_file_bytes, exact.buffer.bytes().len);
+        try testing.expectEqual(max_file_bytes, exact.buffer.bytes().len);
     }
-    try large.setLength(testing.io, limits.max_file_bytes + 1);
+    try large.setLength(testing.io, max_file_bytes + 1);
     try testing.expectError(error.FileTooLarge, Source.load(testing.allocator, testing.io, temp.dir, "large"));
-    const newlines = try testing.allocator.alloc(u8, limits.max_lines + 1);
+    const newlines = try testing.allocator.alloc(u8, max_lines + 1);
     defer testing.allocator.free(newlines);
     @memset(newlines, '\n');
-    try temp.dir.writeFile(testing.io, .{ .sub_path = "lines", .data = newlines[0..limits.max_lines] });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "lines", .data = newlines[0..max_lines] });
     {
         var exact = try Source.load(testing.allocator, testing.io, temp.dir, "lines");
         defer exact.deinit(testing.allocator);
-        try testing.expectEqual(limits.max_lines, exact.buffer.lineCount());
+        try testing.expectEqual(max_lines, exact.buffer.lineCount());
     }
     try temp.dir.writeFile(testing.io, .{ .sub_path = "lines", .data = newlines });
     try testing.expectError(error.TooManyLines, Source.load(testing.allocator, testing.io, temp.dir, "lines"));

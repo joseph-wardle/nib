@@ -2,15 +2,17 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Buffer = @import("buffer.zig").Buffer;
+const EditError = @import("buffer.zig").Error;
+const max_file_bytes = @import("buffer.zig").max_file_bytes;
+const max_lines = @import("buffer.zig").max_lines;
 const motion = @import("motion.zig");
 const input = @import("input.zig");
-const commands = @import("command.zig");
-const limits = @import("snapshot.zig");
+const command = @import("command.zig");
 
 /// Modal editing state. The caller owns the document and handles file actions
 /// immediately (their paths borrow parser storage). No terminal or I/O ownership.
 pub const Editor = struct {
-    parser: commands.Parser = .{},
+    parser: command.Parser = .{},
     goal: motion.Goal = 0,
     notice: []const u8 = "",
     paste: std.ArrayList(u8) = .empty,
@@ -35,7 +37,7 @@ pub const Editor = struct {
         }
     }
 
-    pub fn feed(self: *Editor, allocator: Allocator, buffer: *Buffer, event: input.Event) ?commands.File {
+    pub fn feed(self: *Editor, allocator: Allocator, buffer: *Buffer, event: input.Event) ?command.File {
         if (event == .escape or (event == .key and event.key == 3)) self.notice = "";
         const action = self.parser.feed(event) orelse return null;
         switch (action) {
@@ -54,7 +56,7 @@ pub const Editor = struct {
         return null;
     }
 
-    fn edit(self: *Editor, allocator: Allocator, buffer: *Buffer, action: commands.Action) @import("buffer.zig").Error!void {
+    fn edit(self: *Editor, allocator: Allocator, buffer: *Buffer, action: command.Action) EditError!void {
         switch (action) {
             .move => |movement| {
                 self.notice = "";
@@ -162,7 +164,7 @@ pub const Editor = struct {
                         return;
                     },
                 };
-                if (bytes.len > limits.max_file_bytes - self.paste.items.len) {
+                if (bytes.len > max_file_bytes - self.paste.items.len) {
                     self.paste_failed = true;
                     self.notice = "Paste exceeds temporary 8 MiB limit; nothing inserted";
                     return;
@@ -181,7 +183,7 @@ pub const Editor = struct {
     }
 };
 
-fn insert(allocator: Allocator, buffer: *Buffer, bytes: []const u8) @import("buffer.zig").Error!void {
+fn insert(allocator: Allocator, buffer: *Buffer, bytes: []const u8) EditError!void {
     try buffer.replace(allocator, .{ .start = buffer.cursor, .end = buffer.cursor }, bytes, buffer.cursor + bytes.len);
 }
 
@@ -293,11 +295,11 @@ test "paste validates atomically, normalizes breaks, joins insert group and neve
 
 test "refused input at byte and line caps keeps earlier typing and all undo and save positions" {
     const allocator = std.testing.allocator;
-    const large = try allocator.alloc(u8, limits.max_file_bytes);
+    const large = try allocator.alloc(u8, max_file_bytes);
     defer allocator.free(large);
     for ([_]bool{ false, true }) |lines| {
         @memset(large, if (lines) '\n' else 'x');
-        const before = large[0..if (lines) limits.max_lines - 1 else limits.max_file_bytes - 1];
+        const before = large[0..if (lines) max_lines - 1 else max_file_bytes - 1];
         var buffer = try Buffer.fromBytes(allocator, before);
         defer buffer.deinit(allocator);
         var editor: Editor = .{};
@@ -399,9 +401,9 @@ test "paste collection overflow is bounded and inserts nothing" {
     defer editor.deinit(allocator);
     keys(&editor, allocator, &buffer, "iX");
     _ = editor.feed(allocator, &buffer, .paste_begin);
-    for (0..limits.max_file_bytes + 1) |_| _ = editor.feed(allocator, &buffer, .{ .paste_byte = 'a' });
+    for (0..max_file_bytes + 1) |_| _ = editor.feed(allocator, &buffer, .{ .paste_byte = 'a' });
     try std.testing.expect(editor.paste_failed);
-    try std.testing.expectEqual(@as(usize, limits.max_file_bytes), editor.paste.items.len);
+    try std.testing.expectEqual(@as(usize, max_file_bytes), editor.paste.items.len);
     _ = editor.feed(allocator, &buffer, .paste_end);
     try std.testing.expectEqualStrings("Xbase", buffer.bytes());
     keys(&editor, allocator, &buffer, "\x03u");

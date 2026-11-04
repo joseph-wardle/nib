@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const terminal = @import("terminal.zig");
-const source = @import("file.zig");
+const file = @import("file.zig");
 const Buffer = @import("buffer.zig").Buffer;
 const motion = @import("motion.zig");
 const view = @import("view.zig");
 const input = @import("input.zig");
-const commands = @import("command.zig");
+const command = @import("command.zig");
 const Editor = @import("editor.zig").Editor;
 const External = @import("external.zig").External;
 
@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const u8) !u8 {
-    var document = try source.Source.load(init.gpa, init.io, .cwd(), path);
+    var document = try file.Source.load(init.gpa, init.io, .cwd(), path);
     defer document.deinit(init.gpa);
     const buffer = &document.buffer;
     var editor: Editor = .{};
@@ -61,9 +61,8 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
         var redraw = false;
         var bytes: []const u8 = &.{};
         var expired = false;
-        session.watch_fd = external.watch.fd;
-        switch (try session.next(decoder.deadline)) {
-            .source_changed => {
+        switch (try session.next(decoder.deadline, external.watch.fd)) {
+            .watch => {
                 const old_status = external.status();
                 if (external.watch.drain()) {
                     external.inspect(init.gpa, &document, true);
@@ -103,7 +102,7 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
                 const old_position = buffer.position;
                 const old_text_length = buffer.bytes().len;
                 const old_notice = editor.notice;
-                if (editor.feed(init.gpa, buffer, event)) |file| switch (file) {
+                if (editor.feed(init.gpa, buffer, event)) |action| switch (action) {
                     .quit => |discard| {
                         if (discard or !buffer.modified()) return 0;
                         editor.notice = "Unsaved changes; use :q! to discard";
@@ -112,7 +111,7 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
                         const result = if (copy_path.len == 0)
                             document.source.save(init.gpa, buffer, .{})
                         else
-                            source.copy(init.gpa, init.io, .cwd(), copy_path, buffer, .{});
+                            file.copy(init.gpa, init.io, .cwd(), copy_path, buffer, .{});
                         if (copy_path.len == 0) external.inspect(init.gpa, &document, true);
                         editor.notice = saveNotice(result, copy_path.len != 0);
                         if (result.cleanup_failure) editor.notice = std.fmt.bufPrint(&save_notice, "{s}; cleanup failed", .{editor.notice}) catch unreachable;
@@ -133,7 +132,7 @@ fn loadAndRun(init: std.process.Init, session: *terminal.Terminal, path: []const
     }
 }
 
-fn saveNotice(result: source.Report, copy: bool) []const u8 {
+fn saveNotice(result: file.Report, copy: bool) []const u8 {
     if (result.publication == .uncertain) return "Save outcome uncertain; inspect disk before retrying";
     if (result.publication == .installed and !result.verified) return "Bytes installed but changed/unverified; local edits retained";
     if (result.publication == .installed and !result.durable) return "Bytes installed and verified; durability not confirmed";
@@ -150,7 +149,7 @@ fn saveNotice(result: source.Report, copy: bool) []const u8 {
     return if (copy) "Copy written; source association and unsaved status retained" else "Written";
 }
 
-fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8, parser: *const commands.Parser, notice: []const u8, external: *const External) terminal.Error!void {
+fn draw(session: *terminal.Terminal, buffer: *const Buffer, viewport: view.Viewport, dimensions: terminal.Size, path: []const u8, parser: *const command.Parser, notice: []const u8, external: *const External) terminal.Error!void {
     var frame: Frame = .{ .session = session };
     try frame.append("\x1b[?25l\x1b[H\x1b[2J");
     // Reserve the last column on every row to avoid autowrap, including the
@@ -250,7 +249,6 @@ test {
     _ = @import("file.zig");
     _ = @import("buffer.zig");
     _ = @import("terminal.zig");
-    _ = @import("snapshot.zig");
     _ = @import("view.zig");
     _ = @import("input.zig");
     _ = @import("command.zig");

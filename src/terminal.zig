@@ -5,7 +5,7 @@ const linux = std.os.linux;
 
 pub const Size = struct { rows: u16, columns: u16 };
 /// `input` borrows the terminal's read buffer until the next call to `next`.
-pub const Event = union(enum) { input: []const u8, redraw: Size, quit: u8, timeout, source_changed };
+pub const Event = union(enum) { input: []const u8, redraw: Size, quit: u8, timeout, watch };
 pub const Error = error{
     NotATerminal,
     NotForeground,
@@ -40,7 +40,6 @@ pub const Terminal = struct {
     signal_fd: posix.fd_t,
     suspension_count: usize = 0,
     resumption_count: usize = 0,
-    watch_fd: posix.fd_t = -1,
     saved_output_flags: usize,
     output_flags_active: bool = false,
     pending: Signals = .{},
@@ -158,9 +157,10 @@ pub const Terminal = struct {
         self.pending.should_suspend = true;
     }
 
-    /// Blocks until input, lifecycle activity, or an optional monotonic deadline.
-    /// Signals are drained first; queued termination wins over resume or input.
-    pub fn next(self: *Terminal, deadline: ?i64) Error!Event {
+    /// Blocks until input, lifecycle activity, readiness of `watch_fd` (-1 for
+    /// none), or an optional monotonic deadline. Signals are drained first;
+    /// queued termination wins over resume or input.
+    pub fn next(self: *Terminal, deadline: ?i64, watch_fd: posix.fd_t) Error!Event {
         while (true) {
             try self.readSignals();
             const signals = self.pending;
@@ -203,7 +203,7 @@ pub const Terminal = struct {
             var fds = [_]linux.pollfd{
                 .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 },
                 .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 },
-                .{ .fd = self.watch_fd, .events = linux.POLL.IN, .revents = 0 },
+                .{ .fd = watch_fd, .events = linux.POLL.IN, .revents = 0 },
             };
             const timeout: i32 = if (deadline) |end| @intCast(@min(std.math.maxInt(i32), @max(0, end - try milliseconds()))) else -1;
             const result = linux.poll(&fds, fds.len, timeout);
@@ -228,7 +228,7 @@ pub const Terminal = struct {
                     else => return error.InputFailed,
                 }
             }
-            if (fds[2].revents != 0) return .source_changed;
+            if (fds[2].revents != 0) return .watch;
         }
     }
 
