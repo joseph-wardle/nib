@@ -305,6 +305,27 @@ const Process = struct {
         return error.OutputDidNotStall;
     }
 
+    /// Fill any slack left in a stalled output queue, so even short cleanup
+    /// output cannot fit. How full a renderer leaves the queue depends on how
+    /// the kernel splits its writes. A separate description keeps Nib's flags.
+    fn saturate(self: *Process) !void {
+        const peer: posix.fd_t = @intCast(try checked(linux.ioctl(self.master.?, linux.T.IOCGPTPEER, @as(u32, @bitCast(linux.O{ .ACCMODE = .WRONLY, .NOCTTY = true, .CLOEXEC = true, .NONBLOCK = true })))));
+        defer _ = linux.close(peer);
+        const filler: [256]u8 = @splat('.');
+        var size = filler.len;
+        while (true) {
+            const count = linux.write(peer, &filler, size);
+            switch (posix.errno(count)) {
+                .SUCCESS => {},
+                .INTR => continue,
+                .AGAIN => if (size == 1) return else {
+                    size = 1;
+                },
+                else => return error.WriteFailed,
+            }
+        }
+    }
+
     fn rejected(self: *Process, message: []const u8) !void {
         try equal(@as(u8, 1), try self.wait(false));
         _ = try self.read(50);
@@ -629,6 +650,7 @@ fn stalledOutputSuspend(executable: [:0]const u8) !void {
         var process = try Process.start(executable, .{ .size = .{ 200, 300 }, .nonblocking_output = nonblocking_output });
         defer process.close();
         try process.stalled();
+        try process.saturate();
         const start = try now();
         try process.signal(.TSTP);
         try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));

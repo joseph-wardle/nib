@@ -4,7 +4,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 pub const Size = struct { rows: u16, columns: u16 };
-pub const Event = union(enum) { input: u8, redraw: Size, quit: u8, timeout, source_changed };
+/// `input` borrows the terminal's read buffer until the next call to `next`.
+pub const Event = union(enum) { input: []const u8, redraw: Size, quit: u8, timeout, source_changed };
 pub const Error = error{
     NotATerminal,
     NotForeground,
@@ -45,6 +46,7 @@ pub const Terminal = struct {
     pending: Signals = .{},
     mode_active: bool = false,
     entry_written: usize = 0,
+    input: [4096]u8 = undefined,
 
     pub fn open() Error!Terminal {
         const saved_mode = posix.tcgetattr(0) catch return error.NotATerminal;
@@ -219,10 +221,9 @@ pub const Terminal = struct {
             if (fds[1].revents & (linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL) != 0)
                 return error.TerminalUnavailable;
             if (fds[1].revents & linux.POLL.IN != 0) {
-                var byte: [1]u8 = undefined;
-                const count = linux.read(0, &byte, 1);
+                const count = linux.read(0, &self.input, self.input.len);
                 switch (posix.errno(count)) {
-                    .SUCCESS => if (count == 0) return error.TerminalUnavailable else return .{ .input = byte[0] },
+                    .SUCCESS => if (count == 0) return error.TerminalUnavailable else return .{ .input = self.input[0..count] },
                     .INTR, .AGAIN => continue,
                     else => return error.InputFailed,
                 }
