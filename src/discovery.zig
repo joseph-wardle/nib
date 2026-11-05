@@ -50,8 +50,7 @@ pub const Cancel = struct {
     }
 };
 
-/// Raw relative paths, each followed by a NUL, so `bytes` is also the input
-/// `git check-ignore -z --stdin` expects. Owns its memory.
+/// Raw relative paths, each followed by a NUL. Owns its memory.
 pub const Inventory = struct {
     bytes: []u8 = &.{},
     /// Offset of the NUL that ends each path.
@@ -74,8 +73,13 @@ pub const Inventory = struct {
     }
 
     /// Takes ownership of NUL-terminated `bytes`, even on failure. Entries
-    /// ending in `/` name nested repositories rather than files and are dropped.
-    fn fromNulTerminated(gpa: Allocator, bytes: []u8) Allocator.Error!Inventory {
+    /// ending in `/` name nested repositories rather than files; they are
+    /// kept only when `directories` is set.
+    fn fromNulTerminated(
+        gpa: Allocator,
+        bytes: []u8,
+        directories: bool,
+    ) Allocator.Error!Inventory {
         errdefer gpa.free(bytes);
         var ends: std.ArrayList(usize) = .empty;
         errdefer ends.deinit(gpa);
@@ -83,7 +87,8 @@ pub const Inventory = struct {
         var start: usize = 0;
         while (std.mem.indexOfScalarPos(u8, bytes, start, 0)) |end| : (start = end + 1) {
             const entry = bytes[start..end];
-            if (entry.len == 0 or entry[entry.len - 1] == '/') continue;
+            if (entry.len == 0) continue;
+            if (!directories and entry[entry.len - 1] == '/') continue;
             std.mem.copyForwards(u8, bytes[kept..], bytes[start .. end + 1]);
             kept += entry.len + 1;
             try ends.append(gpa, kept - 1);
@@ -172,10 +177,18 @@ pub const Listing = struct {
     unfiltered: bool,
     /// Why the listing is unfiltered or partial. Owned; may be empty.
     reason: []u8 = &.{},
+    /// All in a worktree: the untracked paths Git ignores, with nested
+    /// repositories as directories ending in `/`. Null when not asked or
+    /// unknown.
+    ignored: ?Inventory = null,
+    /// Why Git could not say which paths it ignores. Owned; may be empty.
+    ignore_reason: []u8 = &.{},
 
     pub fn deinit(self: *Listing, gpa: Allocator) void {
         self.paths.deinit(gpa);
         gpa.free(self.reason);
+        if (self.ignored) |*ignored| ignored.deinit(gpa);
+        gpa.free(self.ignore_reason);
     }
 };
 
@@ -204,61 +217,39 @@ pub fn listProject(
         }) catch unreachable;
         return walk(gpa, root, cancel, why);
     }
-    return .{ .paths = try .fromNulTerminated(gpa, output.stdout), .unfiltered = false };
+    return .{ .paths = try .fromNulTerminated(gpa, output.stdout, false), .unfiltered = false };
 }
 
-/// Every regular file under `root`, including hidden and ignored ones.
-pub fn listAll(gpa: Allocator, root: Io.Dir, cancel: *const Cancel) Error!Listing {
+/// Every regular file under `root`, including hidden and ignored ones. In a
+/// worktree, Git then lists the ignored ones; tracked files are never
+/// ignored. The walk comes first, so a path it found and Git missed was
+/// removed in between, not ignored.
+pub fn listAll(gpa: Allocator, io: Io, root: Io.Dir, git: bool, cancel: *const Cancel) Error!Listing {
     var listing = try walk(gpa, root, cancel, "");
+    errdefer listing.deinit(gpa);
     listing.unfiltered = false;
-    return listing;
-}
-
-/// Git's verdict on one batch.
-pub const Classified = union(enum) {
-    /// Per path, in batch order. Owned.
-    ignored: []bool,
-    /// Git refused the batch; the first line of its error output. Owned.
-    failed: []u8,
-
-    pub fn deinit(self: *Classified, gpa: Allocator) void {
-        switch (self.*) {
-            .ignored => |ignored| gpa.free(ignored),
-            .failed => |reason| gpa.free(reason),
+    if (!git) return listing;
+    const arguments = [_][]const u8{
+        "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ".",
+    };
+    const why: []const u8 = why: {
+        var output = runGit(gpa, io, root, &arguments, null, cancel) catch |err| switch (err) {
+            error.Canceled, error.OutOfMemory => |e| return e,
+            error.GitUnavailable => break :why "Git not found",
+            else => break :why "Git failed",
+        };
+        if (output.succeeded()) {
+            listing.ignored = try .fromNulTerminated(gpa, output.stdout, true);
+            return listing;
         }
-    }
-};
-
-/// For each path in `batch`, whether Git ignores it. Tracked files are never
-/// ignored. Any failure leaves the whole batch unknown.
-pub fn classify(
-    gpa: Allocator,
-    io: Io,
-    root: Io.Dir,
-    batch: *const Inventory,
-    cancel: *const Cancel,
-) Error!Classified {
-    const arguments = [_][]const u8{ "check-ignore", "-z", "--stdin" };
-    const output = try runGit(gpa, io, root, &arguments, batch.bytes, cancel);
-    defer gpa.free(output.stdout);
-    // Exit status 1 with no output means no path is ignored.
-    const none = output.term == .exited and output.term.exited == 1 and output.stdout.len == 0;
-    if (!none and !output.succeeded()) return .{ .failed = try gpa.dupe(u8, output.diagnostic()) };
-    const ignored = try gpa.alloc(bool, batch.count());
-    errdefer gpa.free(ignored);
-    @memset(ignored, false);
-    // Ignored paths are echoed in input order, each followed by a NUL.
-    var index: usize = 0;
-    var start: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, output.stdout, start, 0)) |end| : (start = end + 1) {
-        const echoed = output.stdout[start..end];
-        while (index < batch.count() and !std.mem.eql(u8, batch.path(index), echoed)) index += 1;
-        if (index == batch.count()) return error.UnexpectedOutput;
-        ignored[index] = true;
-        index += 1;
-    }
-    if (start != output.stdout.len) return error.UnexpectedOutput;
-    return .{ .ignored = ignored };
+        gpa.free(output.stdout);
+        listing.ignore_reason = try std.fmt.allocPrint(gpa, "Ignore status unknown: {s}", .{
+            output.diagnostic(),
+        });
+        return listing;
+    };
+    listing.ignore_reason = try std.fmt.allocPrint(gpa, "Ignore status unknown: {s}", .{why});
+    return listing;
 }
 
 const max_diagnostic = 200;
@@ -709,13 +700,6 @@ fn expectPaths(expected: []const []const u8, paths: *const Inventory) !void {
     for (sorted, actual.items) |want, have| try testing.expectEqualSlices(u8, want, have);
 }
 
-fn inventoryOf(paths: []const []const u8) !Inventory {
-    var builder: Builder = .{};
-    defer builder.deinit(testing.allocator);
-    for (paths) |relative| try builder.append(testing.allocator, "", relative);
-    return builder.toInventory(testing.allocator);
-}
-
 fn expectRoot(start: Start, scratch: *const Scratch, expected: []const u8, git: bool) !void {
     var cancel: Cancel = try .init();
     defer cancel.deinit();
@@ -795,7 +779,7 @@ test "the walk lists hidden and ignored files, skips .git and never follows dire
     const expected = [_][]const u8{
         "f", ".hidden", "d/g", "d/e/h", "nested/n", "nl\nname", "bad\xff", "link",
     };
-    var all = try listAll(testing.allocator, scratch.dir, &cancel);
+    var all = try listAll(testing.allocator, testing.io, scratch.dir, false, &cancel);
     defer all.deinit(testing.allocator);
     if (privileged) return error.SkipZigTest;
     try expectPaths(&expected, &all.paths);
@@ -809,37 +793,53 @@ test "the walk lists hidden and ignored files, skips .git and never follows dire
     const why = "Not a Git worktree; listing unfiltered; 1 unreadable";
     try testing.expect(std.mem.startsWith(u8, project.reason, why));
     cancel.request();
-    try testing.expectError(error.Canceled, listAll(testing.allocator, scratch.dir, &cancel));
+    const canceled = listAll(testing.allocator, testing.io, scratch.dir, false, &cancel);
+    try testing.expectError(error.Canceled, canceled);
 }
 
-test "classification marks ignored paths and leaves tracked matches unignored" {
+test "All asks Git once for its ignored paths and never lists tracked ones" {
     var scratch = try Scratch.init();
     defer scratch.deinit();
     try repository(&scratch);
+    try scratch.git(&.{ "init", "-q", "repo/build/inner" });
+    try scratch.put("repo/build/inner/f");
     var cancel: Cancel = try .init();
     defer cancel.deinit();
     var repo = try scratch.dir.openDir(testing.io, "repo", .{});
     defer repo.close(testing.io);
-    var batch = try inventoryOf(&.{
-        "a", "x.log", "ign1", "nl\nname", "build/out", "sub/new.log", "-dash",
-    });
-    defer batch.deinit(testing.allocator);
-    var ignored = try classify(testing.allocator, testing.io, repo, &batch, &cancel);
-    defer ignored.deinit(testing.allocator);
-    const expected = [_]bool{ false, false, true, false, true, true, false };
-    try testing.expectEqualSlices(bool, &expected, ignored.ignored);
-    // Exit status 1 with no output means nothing in the batch is ignored.
-    var clean = try inventoryOf(&.{"a"});
-    defer clean.deinit(testing.allocator);
-    var none = try classify(testing.allocator, testing.io, repo, &clean, &cancel);
-    defer none.deinit(testing.allocator);
-    try testing.expectEqualSlices(bool, &.{false}, none.ignored);
-    // A failed batch is unknown, never guessed either way, and says why.
-    var outside = try inventoryOf(&.{ "a", "../out" });
-    defer outside.deinit(testing.allocator);
-    var failed = try classify(testing.allocator, testing.io, repo, &outside, &cancel);
-    defer failed.deinit(testing.allocator);
-    try testing.expect(std.mem.indexOf(u8, failed.failed, "outside repository") != null);
+    var all = try listAll(testing.allocator, testing.io, repo, true, &cancel);
+    defer all.deinit(testing.allocator);
+    try testing.expect(!all.unfiltered and all.ignore_reason.len == 0);
+    // Tracked x.log matches a pattern but is not ignored; an ignored nested
+    // repository is one directory entry.
+    try expectPaths(&.{ "build/inner/", "build/out", "ign1", "sub/new.log" }, &all.ignored.?);
+    // A narrowed root gets paths relative to itself.
+    var sub = try repo.openDir(testing.io, "sub", .{});
+    defer sub.close(testing.io);
+    var narrowed = try listAll(testing.allocator, testing.io, sub, true, &cancel);
+    defer narrowed.deinit(testing.allocator);
+    try expectPaths(&.{"new.log"}, &narrowed.ignored.?);
+    // Without Git the status stays unknown and nothing is asked.
+    var plain = try listAll(testing.allocator, testing.io, repo, false, &cancel);
+    defer plain.deinit(testing.allocator);
+    try testing.expect(plain.ignored == null and plain.ignore_reason.len == 0);
+}
+
+test "when Git cannot list ignored paths, All says why and guesses nothing" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try scratch.put("plain/a");
+    var cancel: Cancel = try .init();
+    defer cancel.deinit();
+    var plain = try scratch.dir.openDir(testing.io, "plain", .{});
+    defer plain.close(testing.io);
+    // Claiming a worktree where there is none makes Git refuse.
+    var all = try listAll(testing.allocator, testing.io, plain, true, &cancel);
+    defer all.deinit(testing.allocator);
+    try expectPaths(&.{"a"}, &all.paths);
+    try testing.expect(all.ignored == null);
+    try testing.expect(std.mem.startsWith(u8, all.ignore_reason, "Ignore status unknown: "));
+    try testing.expect(all.ignore_reason.len > "Ignore status unknown: ".len);
 }
 
 /// Waits for a helper's process to disappear; reparenting makes the final
@@ -916,10 +916,14 @@ test "a finished helper's group is killed, so stragglers do not outlive it" {
     try expectGone(scratch.dir, "straggler.pid");
 }
 
-test "inventories drop nested repository markers and empty entries" {
+test "inventories drop empty entries and, unless asked, nested repository markers" {
     const bytes = try testing.allocator.dupe(u8, "a\x00nested/\x00\x00dir/b\x00");
-    var inventory = try Inventory.fromNulTerminated(testing.allocator, bytes);
+    var inventory = try Inventory.fromNulTerminated(testing.allocator, bytes, false);
     defer inventory.deinit(testing.allocator);
     try expectPaths(&.{ "a", "dir/b" }, &inventory);
     try testing.expectEqualSlices(u8, "a\x00dir/b\x00", inventory.bytes);
+    const kept_bytes = try testing.allocator.dupe(u8, "a\x00nested/\x00\x00dir/b\x00");
+    var kept = try Inventory.fromNulTerminated(testing.allocator, kept_bytes, true);
+    defer kept.deinit(testing.allocator);
+    try expectPaths(&.{ "a", "nested/", "dir/b" }, &kept);
 }

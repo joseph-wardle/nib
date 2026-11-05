@@ -21,8 +21,8 @@ pub fn main(init: std.process.Init) !void {
         for ([_]bool{ true, false }) |git| {
             var fixture = try Fixture.create(init.gpa, io, size, git);
             defer fixture.remove(io);
-            try measure(gpa, io, &counting, &fixture);
-            try cancellation(gpa, io, &fixture);
+            const listing = try measure(gpa, io, &counting, &fixture);
+            try cancellation(gpa, io, &fixture, listing);
         }
     }
     var usage: linux.rusage = undefined;
@@ -30,7 +30,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("process max RSS {d} KiB (all fixtures, excluding Git helpers)\n", .{usage.maxrss});
 }
 
-fn measure(gpa: Allocator, io: Io, counting: *Counting, fixture: *const Fixture) !void {
+/// Returns how long All took to list.
+fn measure(gpa: Allocator, io: Io, counting: *Counting, fixture: *const Fixture) !u64 {
     const base_live = counting.live.load(.monotonic);
     counting.peak.store(base_live, .monotonic);
     var background: jobs.Jobs = try .init();
@@ -79,18 +80,24 @@ fn measure(gpa: Allocator, io: Io, counting: *Counting, fixture: *const Fixture)
     run.ui(cleared);
     std.debug.print("  empty query inline {d:.2} ms\n", .{ms(inline_time)});
 
-    // All, then Git's ignore classification in batches.
+    // All: the walk, then Git's list of ignored paths, marked in the job.
     const all = now(io);
     try finder.focus(gpa, io, &background, .all, &.{});
     run.ui(all);
     const all_listed = try run.until(allListed);
-    const all_classified = try run.until(allClassified);
-    const list = finder.lists.get(.all);
-    std.debug.print("  All listed {d:.2} ms ({d} paths); classified {d:.2} ms ({d} unknown)\n", .{
+    const catalog = finder.lists.get(.all).catalog.?;
+    var ignored: usize = 0;
+    var unknown: usize = 0;
+    for (catalog.ignored) |status| switch (status) {
+        .ignored => ignored += 1,
+        .unknown => unknown += 1,
+        .visible => {},
+    };
+    std.debug.print("  All listed with ignores {d:.2} ms ({d} paths, {d} ignored, {d} unknown)\n", .{
         ms(all_listed - all),
-        list.catalog.?.entries.len,
-        ms(all_classified - all),
-        list.unclassified,
+        catalog.entries.len,
+        ignored,
+        unknown,
     });
 
     // Settled, with the selection's preview read: nothing should wake the loop.
@@ -112,27 +119,33 @@ fn measure(gpa: Allocator, io: Io, counting: *Counting, fixture: *const Fixture)
     std.debug.print("  UI work per call: max {d:.2} ms over {d} calls\n", .{ ms(run.stall), run.calls });
     background.deinit(gpa, io);
     finder.deinit(gpa, io);
+    return all_listed - all;
 }
 
 /// How long quitting waits for outstanding work: `Jobs.deinit` cancels every
 /// lane, kills any Git helper's group and joins the workers.
-fn cancellation(gpa: Allocator, io: Io, fixture: *const Fixture) !void {
+fn cancellation(gpa: Allocator, io: Io, fixture: *const Fixture, listing: u64) !void {
     var times: [2]u64 = undefined;
-    for (&times, 0..) |*time, phase| {
+    for (&times, [_]u64{ 0, listing / 2 }) |*time, delay| {
         var background: jobs.Jobs = try .init();
         var finder: Finder = .{};
         var run: Run = .{ .gpa = gpa, .io = io, .finder = &finder, .background = &background };
         finder.start(gpa, io, &background, .{ .directory = fixture.path() });
         try finder.focus(gpa, io, &background, .all, &.{});
         _ = try run.until(rooted);
-        // Phase 0 quits during All's discovery; phase 1 during classification.
-        if (phase == 1) _ = try run.until(allListed);
+        // At once, and halfway through All's usual listing time, which in a
+        // worktree may be the walk or Git's ignored list.
+        const pause: linux.timespec = .{
+            .sec = @intCast(delay / std.time.ns_per_s),
+            .nsec = @intCast(delay % std.time.ns_per_s),
+        };
+        _ = linux.nanosleep(&pause, null);
         const before = now(io);
         background.deinit(gpa, io);
         time.* = now(io) - before;
         finder.deinit(gpa, io);
     }
-    std.debug.print("  quit during All discovery {d:.2} ms; during classification {d:.2} ms\n", .{
+    std.debug.print("  quit as All starts {d:.2} ms; halfway through {d:.2} ms\n", .{
         ms(times[0]),
         ms(times[1]),
     });
@@ -174,7 +187,6 @@ const Run = struct {
                 try self.finder.receive(self.gpa, self.io, self.background, completion);
             }
             const busy = self.background.busy(.discovery) or
-                self.background.busy(.classification) or
                 self.background.busy(.filter) or self.background.busy(.preview);
             if (!busy) return;
             try self.wait();
@@ -208,12 +220,6 @@ fn allListed(finder: *const Finder) bool {
 
 fn filtered(finder: *const Finder) bool {
     return !finder.filtering;
-}
-
-fn allClassified(finder: *const Finder) bool {
-    const list = finder.lists.getPtrConst(.all);
-    if (!finder.root.?.git) return true;
-    return finder.batch == null and list.classified == list.catalog.?.entries.len;
 }
 
 /// `size` source files, 100 per directory, plus a tenth as many build outputs

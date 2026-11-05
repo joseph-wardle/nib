@@ -16,8 +16,7 @@ pub const Request = union(enum) {
     /// The start path is borrowed and must outlive the job, as argv does.
     root: discovery.Start,
     project: struct { root: Io.Dir, git: bool },
-    all: Io.Dir,
-    classify: struct { root: Io.Dir, batch: discovery.Inventory },
+    all: struct { root: Io.Dir, git: bool },
     /// Holds a reference to the catalog, which the job only reads.
     filter: struct { catalog: *match.Catalog, query: []u8 },
     /// A path relative to the borrowed root. Owned.
@@ -25,7 +24,6 @@ pub const Request = union(enum) {
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         switch (self.*) {
-            .classify => |*job| job.batch.deinit(gpa),
             .filter => |job| {
                 job.catalog.release(gpa);
                 gpa.free(job.query);
@@ -43,10 +41,13 @@ pub const Found = struct {
     unfiltered: bool,
     /// Why the listing is unfiltered or partial. Owned; may be empty.
     reason: []u8,
+    /// Why ignore status is unknown in a worktree. Owned; may be empty.
+    ignore_reason: []u8 = &.{},
 
     pub fn deinit(self: *Found, gpa: Allocator) void {
         self.catalog.release(gpa);
         gpa.free(self.reason);
+        gpa.free(self.ignore_reason);
     }
 };
 
@@ -54,7 +55,6 @@ pub const Found = struct {
 pub const Outcome = union(enum) {
     root: Error!discovery.Root,
     listing: Error!Found,
-    classified: Error!discovery.Classified,
     /// Indices into the request's catalog, best first. Owned.
     matches: Error![]match.Match,
     preview: Error!preview.Snapshot,
@@ -63,7 +63,6 @@ pub const Outcome = union(enum) {
         switch (self.*) {
             .root => |*result| if (result.*) |*root| root.deinit(gpa, io) else |_| {},
             .listing => |*result| if (result.*) |*found| found.deinit(gpa) else |_| {},
-            .classified => |*result| if (result.*) |*classified| classified.deinit(gpa) else |_| {},
             .matches => |result| if (result) |matches| gpa.free(matches) else |_| {},
             .preview => |*result| if (result.*) |*snapshot| snapshot.deinit(gpa) else |_| {},
         }
@@ -72,7 +71,7 @@ pub const Outcome = union(enum) {
 
 /// Each lane runs at most one job and holds at most one pending request, so
 /// threads and memory stay bounded however often the UI asks.
-pub const Lane = enum { discovery, classification, filter, preview };
+pub const Lane = enum { discovery, filter, preview };
 
 pub const Completion = struct {
     lane: Lane,
@@ -208,11 +207,9 @@ fn run(gpa: Allocator, io: Io, slot: *Slot, wake_fd: posix.fd_t) void {
             const listed = discovery.listProject(gpa, io, job.root, job.git, cancel);
             break :listing .{ .listing = catalogued(gpa, listed, cancel) };
         },
-        .all => |root| .{
-            .listing = catalogued(gpa, discovery.listAll(gpa, root, cancel), cancel),
-        },
-        .classify => |*job| .{
-            .classified = discovery.classify(gpa, io, job.root, &job.batch, cancel),
+        .all => |job| listing: {
+            const listed = discovery.listAll(gpa, io, job.root, job.git, cancel);
+            break :listing .{ .listing = catalogued(gpa, listed, cancel) };
         },
         .filter => |job| .{ .matches = match.filter(gpa, job.catalog, job.query, cancel) },
         .preview => |job| .{ .preview = preview.read(gpa, job.root, job.path, cancel) },
@@ -220,19 +217,25 @@ fn run(gpa: Allocator, io: Io, slot: *Slot, wake_fd: posix.fd_t) void {
     publish(slot, wake_fd);
 }
 
-/// Sorts and labels a listing off the UI thread.
+/// Sorts, labels and marks ignored paths in a listing off the UI thread.
 fn catalogued(
     gpa: Allocator,
     listed: Error!discovery.Listing,
     cancel: *const discovery.Cancel,
 ) Error!Found {
-    const listing = try listed;
+    var listing = try listed;
+    defer if (listing.ignored) |*ignored| ignored.deinit(gpa);
     errdefer gpa.free(listing.reason);
+    errdefer gpa.free(listing.ignore_reason);
+    const catalog: *match.Catalog = try .create(gpa, listing.paths, cancel);
+    errdefer catalog.release(gpa);
+    if (listing.ignored) |*ignored| try catalog.classify(gpa, ignored, cancel);
     return .{
-        .catalog = try .create(gpa, listing.paths, cancel),
+        .catalog = catalog,
         .partial = listing.partial,
         .unfiltered = listing.unfiltered,
         .reason = listing.reason,
+        .ignore_reason = listing.ignore_reason,
     };
 }
 
@@ -246,7 +249,6 @@ fn failure(request: Request, err: Error) Outcome {
     return switch (request) {
         .root => .{ .root = err },
         .project, .all => .{ .listing = err },
-        .classify => .{ .classified = err },
         .filter => .{ .matches = err },
         .preview => .{ .preview = err },
     };
@@ -281,8 +283,9 @@ test "a finished job wakes the poll loop and is reported exactly once" {
     defer temp.cleanup();
     try fixture(temp.dir);
     var jobs: Jobs = try .init();
+    const all: Request = .{ .all = .{ .root = temp.dir, .git = false } };
     defer jobs.deinit(testing.allocator, testing.io);
-    jobs.submit(testing.allocator, testing.io, .discovery, .{ .all = temp.dir });
+    jobs.submit(testing.allocator, testing.io, .discovery, all);
     var completion = (try next(&jobs, .discovery)).?;
     defer completion.deinit(testing.allocator, testing.io);
     try testing.expect(completion.lane == .discovery and completion.request == .all);
@@ -295,8 +298,9 @@ test "newer requests supersede running and pending ones; only the newest is repo
     defer temp.cleanup();
     try fixture(temp.dir);
     var jobs: Jobs = try .init();
+    const all: Request = .{ .all = .{ .root = temp.dir, .git = false } };
     defer jobs.deinit(testing.allocator, testing.io);
-    for (0..3) |_| jobs.submit(testing.allocator, testing.io, .discovery, .{ .all = temp.dir });
+    for (0..3) |_| jobs.submit(testing.allocator, testing.io, .discovery, all);
     const project: Request = .{ .project = .{ .root = temp.dir, .git = false } };
     jobs.submit(testing.allocator, testing.io, .discovery, project);
     var completion = (try next(&jobs, .discovery)).?;
@@ -312,18 +316,16 @@ test "cancelled lanes report nothing and owned requests are freed" {
     defer temp.cleanup();
     try fixture(temp.dir);
     var jobs: Jobs = try .init();
+    const all: Request = .{ .all = .{ .root = temp.dir, .git = false } };
     defer jobs.deinit(testing.allocator, testing.io);
-    const batch: discovery.Inventory = .{
-        .bytes = try testing.allocator.dupe(u8, "a\x00"),
-        .ends = try testing.allocator.dupe(usize, &.{1}),
-    };
-    const classify: Request = .{ .classify = .{ .root = temp.dir, .batch = batch } };
-    jobs.submit(testing.allocator, testing.io, .classification, classify);
-    jobs.submit(testing.allocator, testing.io, .discovery, .{ .all = temp.dir });
+    const path = try testing.allocator.dupeSentinel(u8, "d0/e/f0", 0);
+    const read: Request = .{ .preview = .{ .root = temp.dir, .path = path } };
+    jobs.submit(testing.allocator, testing.io, .preview, read);
+    jobs.submit(testing.allocator, testing.io, .discovery, all);
     jobs.cancel(testing.allocator, .discovery);
-    jobs.cancel(testing.allocator, .classification);
+    jobs.cancel(testing.allocator, .preview);
     try testing.expectEqual(@as(?Completion, null), try next(&jobs, .discovery));
-    try testing.expectEqual(@as(?Completion, null), try next(&jobs, .classification));
+    try testing.expectEqual(@as(?Completion, null), try next(&jobs, .preview));
 }
 
 test "shutdown cancels and joins outstanding jobs without leaks" {
@@ -331,7 +333,8 @@ test "shutdown cancels and joins outstanding jobs without leaks" {
     defer temp.cleanup();
     try fixture(temp.dir);
     var jobs: Jobs = try .init();
-    jobs.submit(testing.allocator, testing.io, .discovery, .{ .all = temp.dir });
-    jobs.submit(testing.allocator, testing.io, .discovery, .{ .all = temp.dir });
+    const all: Request = .{ .all = .{ .root = temp.dir, .git = false } };
+    jobs.submit(testing.allocator, testing.io, .discovery, all);
+    jobs.submit(testing.allocator, testing.io, .discovery, all);
     jobs.deinit(testing.allocator, testing.io);
 }

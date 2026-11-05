@@ -8,8 +8,8 @@ pub const Error = Allocator.Error || error{Canceled};
 /// Longest query accepted; highlight buffers are sized for it.
 pub const max_query = 256;
 
-/// Whether Git ignores a candidate. Unknown until a classification batch
-/// covering it succeeds; never guessed.
+/// Whether Git ignores a candidate. Unknown unless Git listed the ignored
+/// paths for this catalog; never guessed.
 pub const Ignore = enum(u8) { unknown, ignored, visible };
 
 /// One searchable candidate.
@@ -25,10 +25,10 @@ pub const Entry = struct {
 
 pub const Match = struct { index: u32, score: i32 };
 
-/// Candidates sorted by label, so ranking ties break by path. `entries` is
-/// immutable once created and may be read by a filter job. `ignored` and
-/// `references` belong to the UI thread, which is also the only thread that
-/// retains and releases.
+/// Candidates sorted by label, so ranking ties break by path. `entries` and
+/// `ignored` are immutable once the catalog is shared and may be read by a
+/// filter job. `references` belongs to the UI thread, which is also the only
+/// thread that retains and releases.
 pub const Catalog = struct {
     paths: discovery.Inventory,
     /// Storage for escaped labels.
@@ -87,6 +87,35 @@ pub const Catalog = struct {
         gpa.free(self.entries);
         gpa.free(self.ignored);
         gpa.destroy(self);
+    }
+
+    /// Marks each entry ignored when it, or a directory above it, is in
+    /// `ignored`, and visible otherwise. Only before the catalog is shared.
+    pub fn classify(
+        self: *Catalog,
+        gpa: Allocator,
+        ignored: *const discovery.Inventory,
+        cancel: ?*const discovery.Cancel,
+    ) Error!void {
+        const listed = try gpa.alloc([]const u8, ignored.count());
+        defer gpa.free(listed);
+        var directories = false;
+        for (listed, 0..) |*path, index| {
+            path.* = ignored.path(index);
+            if (path.*[path.len - 1] == '/') directories = true;
+        }
+        std.mem.sortUnstable([]const u8, listed, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        try check(cancel);
+        for (self.entries, self.ignored, 0..) |entry, *status, index| {
+            if (index % check_interval == 0) try check(cancel);
+            const hit = contains(listed, entry.path) or
+                (directories and beneathAny(listed, entry.path));
+            status.* = if (hit) .ignored else .visible;
+        }
     }
 
     /// The entry labelled `label`, if any.
@@ -203,6 +232,23 @@ fn better(_: void, a: Match, b: Match) bool {
 
 fn byLabel(_: void, a: Entry, b: Entry) bool {
     return std.mem.lessThan(u8, a.label, b.label);
+}
+
+fn contains(sorted: []const []const u8, path: []const u8) bool {
+    return std.sort.binarySearch([]const u8, sorted, path, struct {
+        fn compare(wanted: []const u8, item: []const u8) std.math.Order {
+            return std.mem.order(u8, wanted, item);
+        }
+    }.compare) != null;
+}
+
+/// Whether a directory above `path`, spelled with its trailing `/`, is listed.
+fn beneathAny(sorted: []const []const u8, path: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, start, '/')) |slash| : (start = slash + 1) {
+        if (contains(sorted, path[0 .. slash + 1])) return true;
+    }
+    return false;
 }
 
 fn check(cancel: ?*const discovery.Cancel) Error!void {
@@ -353,6 +399,30 @@ test "filtering stops when cancelled" {
     defer cancel.deinit();
     cancel.request();
     try testing.expectError(error.Canceled, filter(testing.allocator, catalog, "a", &cancel));
+}
+
+test "classification marks listed paths and everything under listed directories" {
+    const catalog = try catalogOf(&.{
+        "a.log", "keep", "nested/x/y", "nested.txt", "dir/ok", "bad\xff.log",
+    });
+    defer catalog.release(testing.allocator);
+    var ignored: discovery.Inventory = .{
+        .bytes = try testing.allocator.dupe(u8, "nested/\x00bad\xff.log\x00a.log\x00"),
+        .ends = try testing.allocator.dupe(usize, &.{ 7, 16, 22 }),
+    };
+    defer ignored.deinit(testing.allocator);
+    try catalog.classify(testing.allocator, &ignored, null);
+    const expected = [_]struct { []const u8, Ignore }{
+        .{ "a.log", .ignored },      .{ "keep", .visible },   .{ "nested/x/y", .ignored },
+        .{ "nested.txt", .visible }, .{ "dir/ok", .visible }, .{ "bad\\xff.log", .ignored },
+    };
+    for (expected) |pair| {
+        try testing.expectEqual(pair[1], catalog.ignored[catalog.find(pair[0]).?]);
+    }
+    var cancel: discovery.Cancel = try .init();
+    defer cancel.deinit();
+    cancel.request();
+    try testing.expectError(error.Canceled, catalog.classify(testing.allocator, &ignored, &cancel));
 }
 
 test "catalog creation frees everything on allocation failure" {

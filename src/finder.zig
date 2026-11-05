@@ -53,7 +53,7 @@ pub const Row = struct {
     modified: bool,
 };
 
-/// What one category last discovered and how far classification has got.
+/// What one category last discovered.
 pub const List = struct {
     catalog: ?*match.Catalog = null,
     /// A discovery job for this list is outstanding.
@@ -67,13 +67,7 @@ pub const List = struct {
     reason: []u8 = &.{},
     /// Open only: per catalog entry origin.
     documents: []Document = &.{},
-    /// Catalog entries before this index have been sent for classification.
-    classified: usize = 0,
-    /// Entries whose classification failed; their status stays unknown.
-    unclassified: usize = 0,
-    /// The last failed batch's error, and Git's message when Git refused it.
-    ignore_failure: ?jobs.Error = null,
-    /// Owned; may be empty.
+    /// All in a worktree: why ignore status is unknown. Owned; may be empty.
     ignore_reason: []u8 = &.{},
 
     fn deinit(self: *List, gpa: Allocator) void {
@@ -88,9 +82,6 @@ pub const List = struct {
         gpa.free(self.ignore_reason);
         self.catalog = catalog;
         self.documents = documents;
-        self.classified = 0;
-        self.unclassified = 0;
-        self.ignore_failure = null;
         self.ignore_reason = &.{};
     }
 };
@@ -113,11 +104,8 @@ pub const Preview = union(enum) {
     unavailable: jobs.Error,
 };
 
-/// Paths per `git check-ignore` process.
-pub const batch_size = 4096;
-
-/// The finder's state, independent of the terminal. Discovery, classification,
-/// filtering and previews run in `jobs` lanes; the finder submits a request
+/// The finder's state, independent of the terminal. Discovery, filtering and
+/// previews run in `jobs` lanes; the finder submits a request
 /// whenever what it shows changes and applies each completion the caller
 /// hands back. A filter result always describes the current catalog and
 /// query, and a preview the selected path, because every change to either
@@ -140,8 +128,6 @@ pub const Finder = struct {
     restart: bool = false,
     /// The label to select once results arrive after a category change.
     keep: std.ArrayList(u8) = .empty,
-    /// The classification batch in flight.
-    batch: ?Batch = null,
     /// The path whose file preview is shown or being read; empty when the
     /// selection needs none.
     previewed: std.ArrayList(u8) = .empty,
@@ -159,7 +145,6 @@ pub const Finder = struct {
         if (self.root) |*root| root.deinit(gpa, io);
         for (&self.lists.values) |*list| list.deinit(gpa);
         if (self.shown) |catalog| catalog.release(gpa);
-        if (self.batch) |batch| batch.catalog.release(gpa);
         gpa.free(self.matches);
         self.query.deinit(gpa);
         self.keep.deinit(gpa);
@@ -212,7 +197,6 @@ pub const Finder = struct {
             self.discover(gpa, io, background);
             try self.show(gpa, io, background);
         }
-        try self.classifyNext(gpa, io, background);
     }
 
     /// Focus returns to the editor. Any preview read is abandoned; the query,
@@ -271,7 +255,12 @@ pub const Finder = struct {
         const catalog = self.shown.?;
         const entry = catalog.entries[result.index];
         const modified = if (self.opened(entry.label)) |document| document.modified else false;
-        const ignore = catalog.ignored[result.index];
+        // Open takes each file's status from All's latest listing.
+        const ignore = if (self.category == .open) ignore: {
+            const all = self.lists.get(.all).catalog orelse break :ignore .unknown;
+            const index = all.find(entry.label) orelse break :ignore .unknown;
+            break :ignore all.ignored[index];
+        } else catalog.ignored[result.index];
         return .{ .label = entry.label, .ignore = ignore, .modified = modified };
     }
 
@@ -341,13 +330,9 @@ pub const Finder = struct {
                 gpa.free(list.reason);
                 list.reason = found.reason;
                 list.replace(gpa, found.catalog, &.{});
+                list.ignore_reason = found.ignore_reason;
                 if (category != self.category) return;
                 try self.show(gpa, io, background);
-                try self.classifyNext(gpa, io, background);
-            },
-            .classified => |result| {
-                self.classify(gpa, request.classify.batch.count(), result);
-                try self.classifyNext(gpa, io, background);
             },
             .matches => |result| {
                 const job = request.filter;
@@ -541,7 +526,7 @@ pub const Finder = struct {
         const root = self.root orelse return;
         const request: jobs.Request = switch (self.category) {
             .project => .{ .project = .{ .root = root.dir, .git = root.git } },
-            .all => .{ .all = root.dir },
+            .all => .{ .all = .{ .root = root.dir, .git = root.git } },
             .open => unreachable,
         };
         // The categories share a lane, so this supersedes the other one.
@@ -551,7 +536,7 @@ pub const Finder = struct {
     }
 
     /// Lists open documents: relative to the root when they lie beneath it,
-    /// otherwise by absolute path, which is never classified. Shown only when
+    /// otherwise by absolute path, which All never lists. Shown only when
     /// Open is focused; other categories look documents up by label.
     fn listOpen(
         self: *Finder,
@@ -594,103 +579,6 @@ pub const Finder = struct {
         list.replace(gpa, catalog, documents);
         self.present(gpa, catalog.retain(), matches);
     }
-
-    /// Sends the next batch of the current category's unclassified paths to
-    /// `git check-ignore`. One batch is in flight at a time.
-    fn classifyNext(
-        self: *Finder,
-        gpa: Allocator,
-        io: Io,
-        background: *jobs.Jobs,
-    ) Allocator.Error!void {
-        if (self.batch != null or self.category == .project) return;
-        const root = self.root orelse return;
-        if (!root.git) return;
-        const list = self.lists.getPtr(self.category);
-        const catalog = list.catalog orelse return;
-        var bytes: std.ArrayList(u8) = .empty;
-        defer bytes.deinit(gpa);
-        var ends: std.ArrayList(usize) = .empty;
-        defer ends.deinit(gpa);
-        var end = list.classified;
-        while (end < catalog.entries.len and ends.items.len < batch_size) : (end += 1) {
-            const path = catalog.entries[end].path;
-            if (path[0] == '/') continue;
-            try bytes.ensureUnusedCapacity(gpa, path.len + 1);
-            try ends.ensureUnusedCapacity(gpa, 1);
-            bytes.appendSliceAssumeCapacity(path);
-            ends.appendAssumeCapacity(bytes.items.len);
-            bytes.appendAssumeCapacity(0);
-        }
-        if (ends.items.len == 0) {
-            list.classified = end;
-            return;
-        }
-        const ends_owned = try ends.toOwnedSlice(gpa);
-        errdefer gpa.free(ends_owned);
-        const paths: discovery.Inventory = .{
-            .bytes = try bytes.toOwnedSlice(gpa),
-            .ends = ends_owned,
-        };
-        const request: jobs.Request = .{ .classify = .{ .root = root.dir, .batch = paths } };
-        background.submit(gpa, io, .classification, request);
-        self.batch = .{
-            .category = self.category,
-            .catalog = catalog.retain(),
-            .start = list.classified,
-            .end = end,
-        };
-        list.classified = end;
-    }
-
-    /// Records a batch's verdict on the catalog it was taken from, which may
-    /// since have been replaced. Takes ownership of `result`.
-    fn classify(
-        self: *Finder,
-        gpa: Allocator,
-        count: usize,
-        result: jobs.Error!discovery.Classified,
-    ) void {
-        const batch = self.batch.?;
-        self.batch = null;
-        defer batch.catalog.release(gpa);
-        const list = self.lists.getPtr(batch.category);
-        const current = list.catalog == batch.catalog;
-        var reason: []u8 = &.{};
-        const failure: jobs.Error = failed: {
-            const classified = result catch |err| break :failed err;
-            switch (classified) {
-                .ignored => |ignored| {
-                    defer gpa.free(ignored);
-                    var next: usize = 0;
-                    const range = batch.catalog.entries[batch.start..batch.end];
-                    for (range, batch.start..) |entry, index| {
-                        if (entry.path[0] == '/') continue;
-                        batch.catalog.ignored[index] = if (ignored[next]) .ignored else .visible;
-                        next += 1;
-                    }
-                    return;
-                },
-                .failed => |message| {
-                    reason = message;
-                    break :failed error.HelperFailed;
-                },
-            }
-        };
-        if (!current) return gpa.free(reason);
-        list.unclassified += count;
-        list.ignore_failure = failure;
-        gpa.free(list.ignore_reason);
-        list.ignore_reason = reason;
-    }
-};
-
-const Batch = struct {
-    category: Category,
-    /// Holds a reference.
-    catalog: *match.Catalog,
-    start: usize,
-    end: usize,
 };
 
 /// `path` relative to `root`, when it lies beneath it without `.` or `..`
@@ -732,7 +620,7 @@ fn settle(finder: *Finder, background: *jobs.Jobs) !void {
         while (background.collect(testing.allocator, testing.io)) |completion| {
             try finder.receive(testing.allocator, testing.io, background, completion);
         }
-        const busy = background.busy(.discovery) or background.busy(.classification) or
+        const busy = background.busy(.discovery) or
             background.busy(.filter) or background.busy(.preview);
         if (!busy) return;
         var fds = [_]std.os.linux.pollfd{
@@ -795,7 +683,7 @@ test "the project lists Git's files, searches them and chooses a raw path" {
     try expectRows(&finder, &.{
         ".gitignore", ".hidden", "README", "src/main.zig", "src/util.zig", "tracked.log",
     });
-    // Project candidates are never classified, so nothing is dimmed.
+    // Project candidates are never ignored, so their status is never asked.
     for (finder.matches) |result| {
         try testing.expectEqual(match.Ignore.unknown, finder.row(result).ignore);
     }
@@ -846,13 +734,33 @@ test "All adds hidden and ignored files and dims only those Git ignores" {
     try testing.expectEqual(match.Ignore.ignored, (try rowOf(&finder, "build/out.o")).ignore);
     try testing.expectEqual(match.Ignore.visible, (try rowOf(&finder, "tracked.log")).ignore);
     try testing.expectEqual(match.Ignore.visible, (try rowOf(&finder, ".hidden")).ignore);
-    const all = finder.lists.getPtrConst(.all);
-    try testing.expectEqual(@as(usize, 8), all.classified);
-    try testing.expectEqual(@as(usize, 0), all.unclassified);
+    try testing.expectEqualStrings("", finder.lists.getPtrConst(.all).ignore_reason);
     // Dimming never hides a match or changes its rank.
     try finder.search(testing.allocator, testing.io, &background, "log");
     try settle(&finder, &background);
     try expectRows(&finder, &.{ "debug.log", "tracked.log" });
+}
+
+test "when Git cannot list ignored paths, All shows every status unknown and says why" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var buffer: [256]u8 = undefined;
+    try begin(&finder, &background, &scratch, &buffer);
+    // The root is already known to be a worktree; now Git cannot read it.
+    try scratch.dir.writeFile(testing.io, .{ .sub_path = "repo/.git/index", .data = "corrupt" });
+    try finder.focus(testing.allocator, testing.io, &background, .all, &.{});
+    try settle(&finder, &background);
+    try testing.expectEqual(@as(usize, 8), finder.matches.len);
+    for (finder.matches) |result| {
+        try testing.expectEqual(match.Ignore.unknown, finder.row(result).ignore);
+    }
+    const reason = finder.lists.getPtrConst(.all).ignore_reason;
+    try testing.expect(std.mem.startsWith(u8, reason, "Ignore status unknown: "));
 }
 
 test "category changes and refreshes keep the query and the selected path where they can" {
@@ -913,13 +821,17 @@ test "Open lists every open document, most recent first, with markers and ignore
         openFile(4, scratch.join(&paths[2], "repo/src/../README"), false, 2),
     };
     try finder.focus(testing.allocator, testing.io, &background, .open, &open);
-    // Open needs no discovery, so its rows are there at once.
+    // Open needs no discovery, so its rows are there at once. Ignore status
+    // comes from All, which has not been listed yet.
     try expectRows(&finder, &.{ "debug.log", "src/main.zig", open[3].path, "/elsewhere/x.txt" });
     try testing.expectEqual(id(2), finder.choice().?.document);
+    try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, "debug.log")).ignore);
+    try finder.focus(testing.allocator, testing.io, &background, .all, &open);
     try settle(&finder, &background);
+    try finder.focus(testing.allocator, testing.io, &background, .open, &open);
     try testing.expectEqual(match.Ignore.ignored, (try rowOf(&finder, "debug.log")).ignore);
     try testing.expectEqual(match.Ignore.visible, (try rowOf(&finder, "src/main.zig")).ignore);
-    // Paths outside the root, or that might leave it, are never classified.
+    // Paths outside the root, or that might leave it, are not in All.
     try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, "/elsewhere/x.txt")).ignore);
     try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, open[3].path)).ignore);
     try testing.expect((try rowOf(&finder, "src/main.zig")).modified);
@@ -930,7 +842,7 @@ test "Open lists every open document, most recent first, with markers and ignore
     try testing.expect(!finder.filtering);
     try expectRows(&finder, &.{"/elsewhere/x.txt"});
     try testing.expectEqual(id(3), finder.choice().?.document);
-    // A batch Git refuses stays unknown and says why.
+    // A path through a directory symlink is not in All, so stays unknown.
     var linked: [256]u8 = undefined;
     const refused = [_]OpenFile{
         openFile(5, scratch.join(&linked, "repo/link/main.zig"), false, 6),
@@ -939,13 +851,9 @@ test "Open lists every open document, most recent first, with markers and ignore
     try finder.focus(testing.allocator, testing.io, &background, .open, &refused);
     try settle(&finder, &background);
     try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, "link/main.zig")).ignore);
-    const list = finder.lists.getPtrConst(.open);
-    try testing.expectEqual(@as(usize, 1), list.unclassified);
-    try testing.expectEqual(@as(?jobs.Error, error.HelperFailed), list.ignore_failure);
-    try testing.expect(std.mem.indexOf(u8, list.ignore_reason, "beyond a symbolic link") != null);
 }
 
-test "without Git, listings say they are unfiltered and nothing is classified" {
+test "without Git, listings say they are unfiltered and ignore status stays unknown" {
     var scratch = try Scratch.init();
     defer scratch.deinit();
     try scratch.put("plain/a.txt");
@@ -967,7 +875,7 @@ test "without Git, listings say they are unfiltered and nothing is classified" {
     try settle(&finder, &background);
     try expectRows(&finder, &.{ ".hidden", "a.txt" });
     try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, ".hidden")).ignore);
-    try testing.expectEqual(@as(usize, 0), finder.lists.getPtrConst(.all).classified);
+    try testing.expectEqualStrings("", finder.lists.getPtrConst(.all).ignore_reason);
 }
 
 test "a missing root is reported and nothing is discovered" {

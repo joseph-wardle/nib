@@ -1147,9 +1147,9 @@ const Project = struct {
     }
 };
 
-/// Waits for a finder frame showing `counts` with nothing scanning, searching
-/// or classifying, above the query row holding exactly `query`. Background
-/// work draws extra frames, so a bare count can match a stale one.
+/// Waits for a finder frame showing `counts` with nothing scanning or
+/// searching, above the query row holding exactly `query`. Background work
+/// draws extra frames, so a bare count can match a stale one.
 fn settled(process: *Process, counts: []const u8, query: []const u8) !void {
     // Rows are 79 cells in the default 80-column terminal.
     var marker: [79 + 4 + 64]u8 = undefined;
@@ -1244,7 +1244,7 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.ready();
     var beta: [192]u8 = undefined;
     try expectFile(try project.path(&beta, "beta.txt"), "Bbeta\n");
-    // All adds the ignored log, dimmed once Git classifies it.
+    // All adds the ignored log, dimmed as Git lists it.
     try process.send("\x10");
     try process.ready();
     try finderKeys(&process, "\x7f\x7f\x7f\x7f");

@@ -681,7 +681,7 @@ const App = struct {
         path: usize = 0,
     };
 
-    /// Match counts, discovery and classification state, and failures.
+    /// Match counts, discovery state, failures and unknown ignore status.
     fn progress(self: *App, row: []u8) void {
         const finder = self.finder;
         var line: Line = .init(row);
@@ -709,20 +709,15 @@ const App = struct {
             line.put(list.reason);
         }
         const root = finder.root orelse return;
-        if (finder.category == .project or !root.git or list.catalog == null) return;
-        if (finder.batch != null or list.classified < total) {
-            const text = " | Classifying ignores {d}/{d}";
-            const done = std.fmt.bufPrint(&number, text, .{ list.classified, total });
-            line.put(done catch unreachable);
-        }
-        if (list.unclassified != 0) {
-            const text = " | Ignore status unknown for {d}: ";
-            line.put(std.fmt.bufPrint(&number, text, .{list.unclassified}) catch unreachable);
-            line.put(jobFailure(list.ignore_failure.?));
-            if (list.ignore_reason.len != 0) {
-                line.put(": ");
-                line.put(list.ignore_reason);
-            }
+        if (!root.git) return;
+        // Open takes ignore status from All's listing.
+        const all = finder.lists.getPtrConst(.all);
+        if (finder.category == .project) return;
+        if (all.ignore_reason.len != 0) {
+            line.put(" | ");
+            line.put(all.ignore_reason);
+        } else if (finder.category == .open and all.catalog == null) {
+            line.put(" | Ignore status unknown until All is listed");
         }
     }
 
