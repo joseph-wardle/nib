@@ -5,6 +5,7 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const discovery = @import("discovery.zig");
+const match = @import("match.zig");
 
 pub const Error = discovery.Error || Io.ConcurrentError;
 
@@ -16,33 +17,56 @@ pub const Request = union(enum) {
     project: struct { root: Io.Dir, git: bool },
     all: Io.Dir,
     classify: struct { root: Io.Dir, batch: discovery.Inventory },
+    /// Holds a reference to the catalog, which the job only reads.
+    filter: struct { catalog: *match.Catalog, query: []u8 },
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         switch (self.*) {
             .classify => |*job| job.batch.deinit(gpa),
+            .filter => |job| {
+                job.catalog.release(gpa);
+                gpa.free(job.query);
+            },
             else => {},
         }
+    }
+};
+
+/// A discovered listing, sorted and labelled for searching.
+pub const Found = struct {
+    catalog: *match.Catalog,
+    partial: bool,
+    unfiltered: bool,
+    /// Why the listing is unfiltered or partial. Owned; may be empty.
+    reason: []u8,
+
+    pub fn deinit(self: *Found, gpa: Allocator) void {
+        self.catalog.release(gpa);
+        gpa.free(self.reason);
     }
 };
 
 /// Owned, immutable results published by a finished job.
 pub const Outcome = union(enum) {
     root: Error!discovery.Root,
-    listing: Error!discovery.Listing,
-    ignored: Error![]bool,
+    listing: Error!Found,
+    classified: Error!discovery.Classified,
+    /// Indices into the request's catalog, best first. Owned.
+    matches: Error![]match.Match,
 
     pub fn deinit(self: *Outcome, gpa: Allocator, io: Io) void {
         switch (self.*) {
             .root => |*result| if (result.*) |*root| root.deinit(gpa, io) else |_| {},
-            .listing => |*result| if (result.*) |*listing| listing.deinit(gpa) else |_| {},
-            .ignored => |result| if (result) |ignored| gpa.free(ignored) else |_| {},
+            .listing => |*result| if (result.*) |*found| found.deinit(gpa) else |_| {},
+            .classified => |*result| if (result.*) |*classified| classified.deinit(gpa) else |_| {},
+            .matches => |result| if (result) |matches| gpa.free(matches) else |_| {},
         }
     }
 };
 
 /// Each lane runs at most one job and holds at most one pending request, so
 /// threads and memory stay bounded however often the UI asks.
-pub const Lane = enum { discovery, classification };
+pub const Lane = enum { discovery, classification, filter };
 
 pub const Completion = struct {
     lane: Lane,
@@ -174,13 +198,35 @@ fn run(gpa: Allocator, io: Io, slot: *Slot, wake_fd: posix.fd_t) void {
     const cancel = &slot.cancel;
     slot.outcome = switch (slot.running.?) {
         .root => |start| .{ .root = discovery.resolveRoot(gpa, io, start, cancel) },
-        .project => |job| .{ .listing = discovery.listProject(gpa, io, job.root, job.git, cancel) },
-        .all => |root| .{ .listing = discovery.listAll(gpa, root, cancel) },
-        .classify => |*job| .{
-            .ignored = discovery.classify(gpa, io, job.root, &job.batch, cancel),
+        .project => |job| listing: {
+            const listed = discovery.listProject(gpa, io, job.root, job.git, cancel);
+            break :listing .{ .listing = catalogued(gpa, listed, cancel) };
         },
+        .all => |root| .{
+            .listing = catalogued(gpa, discovery.listAll(gpa, root, cancel), cancel),
+        },
+        .classify => |*job| .{
+            .classified = discovery.classify(gpa, io, job.root, &job.batch, cancel),
+        },
+        .filter => |job| .{ .matches = match.filter(gpa, job.catalog, job.query, cancel) },
     };
     publish(slot, wake_fd);
+}
+
+/// Sorts and labels a listing off the UI thread.
+fn catalogued(
+    gpa: Allocator,
+    listed: Error!discovery.Listing,
+    cancel: *const discovery.Cancel,
+) Error!Found {
+    const listing = try listed;
+    errdefer gpa.free(listing.reason);
+    return .{
+        .catalog = try .create(gpa, listing.paths, cancel),
+        .partial = listing.partial,
+        .unfiltered = listing.unfiltered,
+        .reason = listing.reason,
+    };
 }
 
 fn publish(slot: *Slot, wake_fd: posix.fd_t) void {
@@ -193,7 +239,8 @@ fn failure(request: Request, err: Error) Outcome {
     return switch (request) {
         .root => .{ .root = err },
         .project, .all => .{ .listing = err },
-        .classify => .{ .ignored = err },
+        .classify => .{ .classified = err },
+        .filter => .{ .matches = err },
     };
 }
 
@@ -231,7 +278,7 @@ test "a finished job wakes the poll loop and is reported exactly once" {
     var completion = (try next(&jobs, .discovery)).?;
     defer completion.deinit(testing.allocator, testing.io);
     try testing.expect(completion.lane == .discovery and completion.request == .all);
-    try testing.expectEqual(@as(usize, 64), (try completion.outcome.listing).paths.count());
+    try testing.expectEqual(@as(usize, 64), (try completion.outcome.listing).catalog.entries.len);
     try testing.expectEqual(@as(?Completion, null), try next(&jobs, .discovery));
 }
 

@@ -282,6 +282,8 @@ test {
     _ = @import("command.zig");
     _ = @import("jobs.zig");
     _ = @import("session.zig");
+    _ = @import("finder.zig");
+    _ = @import("match.zig");
 }
 
 test "save notices distinguish failure, uncertain publication and installed durability" {

@@ -45,7 +45,7 @@ pub const Cancel = struct {
         drain(self.fd);
     }
 
-    fn check(self: *const Cancel) Error!void {
+    pub fn check(self: *const Cancel) error{Canceled}!void {
         if (self.requested.load(.acquire)) return error.Canceled;
     }
 };
@@ -214,25 +214,39 @@ pub fn listAll(gpa: Allocator, root: Io.Dir, cancel: *const Cancel) Error!Listin
     return listing;
 }
 
+/// Git's verdict on one batch.
+pub const Classified = union(enum) {
+    /// Per path, in batch order. Owned.
+    ignored: []bool,
+    /// Git refused the batch; the first line of its error output. Owned.
+    failed: []u8,
+
+    pub fn deinit(self: *Classified, gpa: Allocator) void {
+        switch (self.*) {
+            .ignored => |ignored| gpa.free(ignored),
+            .failed => |reason| gpa.free(reason),
+        }
+    }
+};
+
 /// For each path in `batch`, whether Git ignores it. Tracked files are never
-/// ignored. Any failure leaves the whole batch unknown. Caller frees.
+/// ignored. Any failure leaves the whole batch unknown.
 pub fn classify(
     gpa: Allocator,
     io: Io,
     root: Io.Dir,
     batch: *const Inventory,
     cancel: *const Cancel,
-) Error![]bool {
+) Error!Classified {
     const arguments = [_][]const u8{ "check-ignore", "-z", "--stdin" };
     const output = try runGit(gpa, io, root, &arguments, batch.bytes, cancel);
     defer gpa.free(output.stdout);
+    // Exit status 1 with no output means no path is ignored.
+    const none = output.term == .exited and output.term.exited == 1 and output.stdout.len == 0;
+    if (!none and !output.succeeded()) return .{ .failed = try gpa.dupe(u8, output.diagnostic()) };
     const ignored = try gpa.alloc(bool, batch.count());
     errdefer gpa.free(ignored);
     @memset(ignored, false);
-    if (output.term != .exited) return error.HelperFailed;
-    // Exit status 1 with no output means no path is ignored.
-    if (output.term.exited == 1 and output.stdout.len == 0) return ignored;
-    if (output.term.exited != 0) return error.HelperFailed;
     // Ignored paths are echoed in input order, each followed by a NUL.
     var index: usize = 0;
     var start: usize = 0;
@@ -244,7 +258,7 @@ pub fn classify(
         index += 1;
     }
     if (start != output.stdout.len) return error.UnexpectedOutput;
-    return ignored;
+    return .{ .ignored = ignored };
 }
 
 const max_diagnostic = 200;
@@ -608,14 +622,15 @@ const Builder = struct {
 
 const testing = std.testing;
 
-/// A directory outside any worktree. `testing.tmpDir` lives inside the
-/// repository's cache, where Git would find Nib's own worktree.
-const Scratch = struct {
+/// A directory outside any worktree, for tests here and in `finder.zig`.
+/// `testing.tmpDir` lives inside the repository's cache, where Git would find
+/// Nib's own worktree.
+pub const Scratch = struct {
     dir: Io.Dir,
     path_buffer: [64]u8,
     path_len: usize,
 
-    fn init() !Scratch {
+    pub fn init() !Scratch {
         var random: [12]u8 = undefined;
         testing.io.random(&random);
         var name: [16]u8 = undefined;
@@ -626,30 +641,30 @@ const Scratch = struct {
         return self;
     }
 
-    fn deinit(self: *Scratch) void {
+    pub fn deinit(self: *Scratch) void {
         self.dir.close(testing.io);
         Io.Dir.cwd().deleteTree(testing.io, self.path()) catch {};
     }
 
-    fn path(self: *const Scratch) []const u8 {
+    pub fn path(self: *const Scratch) []const u8 {
         return self.path_buffer[0..self.path_len];
     }
 
-    fn join(self: *const Scratch, buffer: []u8, relative: []const u8) []const u8 {
+    pub fn join(self: *const Scratch, buffer: []u8, relative: []const u8) []const u8 {
         return std.fmt.bufPrint(buffer, "{s}/{s}", .{ self.path(), relative }) catch unreachable;
     }
 
-    fn put(self: *const Scratch, relative: []const u8) !void {
+    pub fn put(self: *const Scratch, relative: []const u8) !void {
         if (std.fs.path.dirname(relative)) |parent| try self.dir.createDirPath(testing.io, parent);
         try self.dir.writeFile(testing.io, .{ .sub_path = relative, .data = "" });
     }
 
-    fn link(self: *const Scratch, target: [*:0]const u8, relative: [*:0]const u8) !void {
+    pub fn link(self: *const Scratch, target: [*:0]const u8, relative: [*:0]const u8) !void {
         const result = linux.symlinkat(target, self.dir.handle, relative);
         try testing.expectEqual(posix.E.SUCCESS, posix.errno(result));
     }
 
-    fn git(self: *const Scratch, arguments: []const []const u8) !void {
+    pub fn git(self: *const Scratch, arguments: []const []const u8) !void {
         var argv: [12][]const u8 = undefined;
         argv[0..3].* = .{ "git", "-C", self.path() };
         @memcpy(argv[3..][0..arguments.len], arguments);
@@ -809,21 +824,22 @@ test "classification marks ignored paths and leaves tracked matches unignored" {
         "a", "x.log", "ign1", "nl\nname", "build/out", "sub/new.log", "-dash",
     });
     defer batch.deinit(testing.allocator);
-    const ignored = try classify(testing.allocator, testing.io, repo, &batch, &cancel);
-    defer testing.allocator.free(ignored);
+    var ignored = try classify(testing.allocator, testing.io, repo, &batch, &cancel);
+    defer ignored.deinit(testing.allocator);
     const expected = [_]bool{ false, false, true, false, true, true, false };
-    try testing.expectEqualSlices(bool, &expected, ignored);
+    try testing.expectEqualSlices(bool, &expected, ignored.ignored);
     // Exit status 1 with no output means nothing in the batch is ignored.
     var clean = try inventoryOf(&.{"a"});
     defer clean.deinit(testing.allocator);
-    const none = try classify(testing.allocator, testing.io, repo, &clean, &cancel);
-    defer testing.allocator.free(none);
-    try testing.expectEqualSlices(bool, &.{false}, none);
-    // A failed batch is unknown, never guessed either way.
+    var none = try classify(testing.allocator, testing.io, repo, &clean, &cancel);
+    defer none.deinit(testing.allocator);
+    try testing.expectEqualSlices(bool, &.{false}, none.ignored);
+    // A failed batch is unknown, never guessed either way, and says why.
     var outside = try inventoryOf(&.{ "a", "../out" });
     defer outside.deinit(testing.allocator);
-    const failed = classify(testing.allocator, testing.io, repo, &outside, &cancel);
-    try testing.expectError(error.HelperFailed, failed);
+    var failed = try classify(testing.allocator, testing.io, repo, &outside, &cancel);
+    defer failed.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, failed.failed, "outside repository") != null);
 }
 
 /// Waits for a helper's process to disappear; reparenting makes the final
