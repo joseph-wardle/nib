@@ -149,6 +149,9 @@ pub const Finder = struct {
     preview_failure: ?jobs.Error = null,
     /// A preview job for `previewed` is outstanding.
     reading: bool = false,
+    /// On screen, from `focus` until `leave`. A hidden finder discovers
+    /// nothing when the root arrives and previews nothing.
+    visible: bool = false,
 
     /// Call after `Jobs.deinit`: requests borrow the root descriptor.
     pub fn deinit(self: *Finder, gpa: Allocator, io: Io) void {
@@ -193,6 +196,7 @@ pub const Finder = struct {
         category: Category,
         open: []const OpenFile,
     ) Allocator.Error!void {
+        self.visible = true;
         defer self.look(gpa, io, background, true);
         if (category != self.category) {
             if (self.selection()) |entry| {
@@ -208,6 +212,20 @@ pub const Finder = struct {
             try self.show(gpa, io, background);
         }
         try self.classifyNext(gpa, io, background);
+    }
+
+    /// Focus returns to the editor. Any preview read is abandoned; the query,
+    /// category and results stay for the next `focus`.
+    pub fn leave(self: *Finder, gpa: Allocator, io: Io, background: *jobs.Jobs) void {
+        self.visible = false;
+        self.look(gpa, io, background, false);
+    }
+
+    /// `path`, an absolute document path, as the finder lists it: relative
+    /// when beneath the root. Borrows `path`.
+    pub fn display(self: *const Finder, path: []const u8) []const u8 {
+        const root = self.root orelse return path;
+        return beneath(root.path, path) orelse path;
     }
 
     /// Replaces the query. The next results select the best match.
@@ -279,6 +297,7 @@ pub const Finder = struct {
     /// The selection's preview. Enter still opens through `choice`, never
     /// from a preview.
     pub fn preview(self: *const Finder) Preview {
+        if (!self.visible) return .none;
         const entry = self.selection() orelse return .none;
         if (self.opened(entry.label)) |document| return .{ .document = document.id };
         if (self.preview_failure) |err| return .{ .unavailable = err };
@@ -304,7 +323,7 @@ pub const Finder = struct {
                     self.root_failure = err;
                     return;
                 };
-                if (self.category != .open) self.discover(gpa, io, background);
+                if (self.visible and self.category != .open) self.discover(gpa, io, background);
                 try self.relabel(gpa, background);
             },
             .listing => |result| {
@@ -360,12 +379,13 @@ pub const Finder = struct {
         return list.documents[catalog.entries[index].origin];
     }
 
-    /// Keeps the preview on the selection. An open document needs no read; a
-    /// file is read in the background unless it is already shown or being
-    /// read, or `reread` asks for it again. Running out of memory shows as an
-    /// unavailable preview and is retried by the next look.
+    /// Keeps the preview on the visible selection. An open document needs no
+    /// read; a file is read in the background unless it is already shown or
+    /// being read, or `reread` asks for it again. Running out of memory shows
+    /// as an unavailable preview and is retried by the next look.
     fn look(self: *Finder, gpa: Allocator, io: Io, background: *jobs.Jobs, reread: bool) void {
         const wanted: ?[]const u8 = wanted: {
+            if (!self.visible) break :wanted null;
             const entry = self.selection() orelse break :wanted null;
             if (self.opened(entry.label) != null) break :wanted null;
             break :wanted entry.path;
@@ -1138,6 +1158,46 @@ test "running out of memory shows the preview unavailable until the next look" {
     finder.move(testing.allocator, testing.io, &background, 0);
     try settle(&finder, &background);
     try testing.expectEqualStrings("", try previewText(&finder));
+}
+
+test "a hidden finder discovers and previews nothing until it is focused" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var path: [256]u8 = undefined;
+    const readme = scratch.join(&path, "repo/README");
+    const how: discovery.Start = .{ .file = readme };
+    finder.start(testing.allocator, testing.io, &background, how);
+    try settle(&finder, &background);
+    try testing.expect(!finder.resolving());
+    try testing.expect(finder.lists.getPtrConst(.project).catalog == null);
+    try testing.expectEqualStrings("README", finder.display(readme));
+    try testing.expectEqualStrings("/elsewhere/x", finder.display("/elsewhere/x"));
+    try finder.focus(testing.allocator, testing.io, &background, .project, &.{});
+    try testing.expect(finder.lists.getPtrConst(.project).discovering);
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("*.log\nbuild/\n", try previewText(&finder));
+    // Leaving abandons the read of a newly selected file and frees the last.
+    finder.move(testing.allocator, testing.io, &background, 1);
+    try testing.expect(background.busy(.preview) or finder.snapshot != null);
+    finder.leave(testing.allocator, testing.io, &background);
+    try testing.expectEqual(Preview.none, finder.preview());
+    try testing.expect(finder.snapshot == null and !finder.reading);
+    try settle(&finder, &background);
+    try testing.expect(finder.snapshot == null);
+    // Results arriving while hidden start no read.
+    try finder.search(testing.allocator, testing.io, &background, "main");
+    try settle(&finder, &background);
+    try expectRows(&finder, &.{"src/main.zig"});
+    try testing.expectEqual(@as(usize, 0), finder.previewed.items.len);
+    try finder.focus(testing.allocator, testing.io, &background, .project, &.{});
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("", try previewText(&finder));
+    try testing.expectEqualStrings("src/main.zig", finder.previewed.items);
 }
 
 test "open paths are relative only when they stay beneath the root" {

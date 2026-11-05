@@ -2,9 +2,13 @@
 const std = @import("std");
 
 pub const escape_ms = 100;
+pub const Arrow = enum { up, down, right, left };
 pub const Event = union(enum) {
     key: u8,
     escape,
+    /// An unparameterised cursor key, in CSI or SS3 form. Other sequences
+    /// stay `ignored`.
+    arrow: Arrow,
     ignored,
     paste_begin,
     paste_byte: u8,
@@ -27,12 +31,13 @@ pub const Events = struct {
 /// Paste is streamed, including hostile bytes; its consumer owns validation and
 /// atomic collection. Only an unrecognized, lone ESC has a deadline.
 pub const Decoder = struct {
-    state: enum { ground, escape, intermediate, csi, string, string_escape, paste } = .ground,
+    state: enum { ground, escape, intermediate, ss3, csi, string, string_escape, paste } = .ground,
     deadline: ?i64 = null,
     paste_end: usize = 0,
     string_bell: bool = false,
     parameter: usize = 0,
     plain_parameter: bool = true,
+    digits: bool = false,
 
     pub fn expire(self: *Decoder, now: i64) Events {
         var events: Events = .{};
@@ -59,6 +64,7 @@ pub const Decoder = struct {
                         self.state = .csi;
                         self.parameter = 0;
                         self.plain_parameter = true;
+                        self.digits = false;
                         events.add(.ignored);
                     },
                     ']', 'P', 'X', '^', '_' => {
@@ -66,7 +72,11 @@ pub const Decoder = struct {
                         self.string_bell = byte == ']';
                         events.add(.ignored);
                     },
-                    'O', 0x20...0x2f => {
+                    'O' => {
+                        self.state = .ss3;
+                        events.add(.ignored);
+                    },
+                    0x20...0x2f => {
                         self.state = .intermediate;
                         events.add(.ignored);
                     },
@@ -88,6 +98,12 @@ pub const Decoder = struct {
             .intermediate => {
                 if (byte == 0x1b) self.state = .escape else if (byte >= 0x30 and byte <= 0x7e) self.state = .ground;
             },
+            .ss3 => {
+                if (byte == 0x1b) self.state = .escape else if (byte >= 0x30 and byte <= 0x7e) {
+                    self.state = .ground;
+                    if (arrow(byte)) |direction| events.add(.{ .arrow = direction });
+                }
+            },
             .csi => {
                 if (byte == 0x1b) {
                     // An ESC inside a recognized sequence starts another
@@ -97,7 +113,10 @@ pub const Decoder = struct {
                     self.state = if (byte == '~' and self.plain_parameter and self.parameter == 200) .paste else .ground;
                     self.paste_end = 0;
                     if (self.state == .paste) events.add(.paste_begin);
+                    const bare = self.plain_parameter and !self.digits;
+                    if (bare) if (arrow(byte)) |direction| events.add(.{ .arrow = direction });
                 } else if (byte >= '0' and byte <= '9') {
+                    self.digits = true;
                     self.parameter = @min(1000, self.parameter * 10 + byte - '0');
                 } else self.plain_parameter = false;
             },
@@ -127,6 +146,16 @@ pub const Decoder = struct {
     }
 };
 
+fn arrow(final: u8) ?Arrow {
+    return switch (final) {
+        'A' => .up,
+        'B' => .down,
+        'C' => .right,
+        'D' => .left,
+        else => null,
+    };
+}
+
 test "only lone Escape expires; unambiguous rapid commands survive" {
     var decoder: Decoder = .{};
     try std.testing.expectEqual(@as(usize, 0), decoder.feed(0x1b, 0).len);
@@ -150,7 +179,9 @@ test "recognized sequences retain framing across arbitrary delays" {
         for (sequence, 0..) |byte, index| {
             // Prefix arrives promptly; recognized payload may be arbitrarily late.
             const events = decoder.feed(byte, if (index < 2) @intCast(index) else @intCast(index * 1000));
-            for (events.items[0..events.len]) |event| try std.testing.expect(event == .ignored);
+            for (events.items[0..events.len]) |event| {
+                try std.testing.expect(event == .ignored or event == .arrow);
+            }
             if (index != 0) try std.testing.expect(decoder.deadline == null);
         }
         try std.testing.expectEqualDeep(Event{ .key = 'j' }, decoder.feed('j', 99999).items[0]);
@@ -180,4 +211,31 @@ test "paste framing preserves exact payload including false and overlapping deli
     try std.testing.expect(began and ended);
     try std.testing.expectEqualStrings(payload, collected[0..used]);
     try std.testing.expectEqualDeep(Event{ .key = 'q' }, decoder.feed('q', 0).items[0]);
+}
+
+test "bare cursor keys decode as arrows in CSI and SS3 form; modified ones stay ignored" {
+    const cases = [_]struct { bytes: []const u8, arrow: ?Arrow }{
+        .{ .bytes = "\x1b[A", .arrow = .up },
+        .{ .bytes = "\x1b[B", .arrow = .down },
+        .{ .bytes = "\x1bOB", .arrow = .down },
+        .{ .bytes = "\x1bOD", .arrow = .left },
+        .{ .bytes = "\x1b[1;5A", .arrow = null },
+        .{ .bytes = "\x1b[2A", .arrow = null },
+        .{ .bytes = "\x1b[?A", .arrow = null },
+        .{ .bytes = "\x1bOq", .arrow = null },
+    };
+    for (cases) |case| {
+        var decoder: Decoder = .{};
+        var found: ?Arrow = null;
+        for (case.bytes) |byte| {
+            const events = decoder.feed(byte, 0);
+            for (events.items[0..events.len]) |event| switch (event) {
+                .arrow => |direction| found = direction,
+                .ignored => {},
+                else => return error.UnexpectedEvent,
+            };
+        }
+        try std.testing.expectEqual(case.arrow, found);
+        try std.testing.expectEqualDeep(Event{ .key = 'j' }, decoder.feed('j', 0).items[0]);
+    }
 }
