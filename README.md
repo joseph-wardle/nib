@@ -16,17 +16,52 @@ zig build run -- README.md
 Run `nib <file>` in a Linux terminal to edit an existing regular file, or
 `nib <directory>` or plain `nib` to start in the file finder.
 
-The finder searches the project's file names and paths:
+## Finding files
 
-- Ctrl-P opens it from normal mode, ready to type a search. Escape or Ctrl-C
-  moves to the list, where `j`/`k`, `gg`/`G` and Ctrl-D/Ctrl-U move, `/` or `i`
-  returns to the search, `:` enters a command, and Escape, Ctrl-C or `q`
+The finder searches the file names and paths of one project, its root:
+
+- `nib <file>` uses the Git worktree containing the file, else the file's
+  directory. A symlinked file belongs to the project it was named from.
+- `nib <directory>` uses that directory, even inside a larger worktree.
+- `nib` uses the worktree containing the current directory, else that directory.
+
+The root is shown in the finder's top row and stays fixed for the session.
+Three lists, cycled with Tab:
+
+- **Project:** Git's tracked files and untracked files it does not ignore.
+  Outside Git, or if Git fails, every file under the root, marked `Unfiltered`
+  with the reason.
+- **All:** every regular file under the root, hidden and ignored ones included,
+  skipping `.git` and never following directory symlinks. Files Git ignores are
+  dimmed; `?` marks a file whose status Git hasn't reported yet.
+- **Open:** every open file, most recently used first. `+` marks unsaved edits.
+
+A query matches when its characters appear in order anywhere in the path. It
+ignores case unless it contains an uppercase letter. Matches at the start of a
+word or path component, consecutive runs and matches in the file name rank
+higher; matched characters are underlined.
+
+Lists are read when the finder opens, when you switch list and on Ctrl-R; they
+don't follow later changes on their own. The preview shows the selected file's
+first 64 KiB, marked when truncated, and reads only regular files, never FIFOs
+or devices. An open file previews its current text, unsaved edits included.
+
+Keys:
+
+- Ctrl-P opens the finder from normal mode, ready to type a search. Escape or
+  Ctrl-C moves to the list, where `j`/`k`, `gg`/`G` and Ctrl-D/Ctrl-U move, `/`
+  or `i` returns to the search, `:` enters a command, and Escape, Ctrl-C or `q`
   returns to the file.
-- In either: Enter opens the selection; Tab cycles the Project, All and Open
-  lists; Ctrl-N, Ctrl-P or the arrow keys move; Ctrl-R refreshes the list; and
-  Ctrl-X enters a command.
-- Several files can be open at once. Switching keeps each file's edits, undo
-  history, cursor and scroll position.
+- In either: Enter opens the selection; Tab cycles the lists; Ctrl-N, Ctrl-P or
+  the arrow keys move; Ctrl-R refreshes; and Ctrl-X enters a command.
+
+Several files can be open at once. Switching keeps each file's edits, undo
+history, cursor and scroll position. Only the file you're viewing is watched
+for changes on disk; the others are checked again when you switch to them. A
+clean file that changed reloads; a file with unsaved edits keeps them and shows
+`DISK CONFLICT`.
+
+## Editing
 
 Supported Vim commands:
 
@@ -50,12 +85,13 @@ Supported Vim commands:
 Editing temporarily supports ASCII, tabs, LF, and CRLF; other bytes remain
 viewable but read-only. 
 
-For development (checks require zsh):
+For development (checks require zsh and Git):
 
 ```sh
 zig fmt build.zig build.zig.zon src tests
 zig build check
 zig build bench-buffer
+zig build bench-finder
 ```
 
 Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
