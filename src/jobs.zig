@@ -6,8 +6,9 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const discovery = @import("discovery.zig");
 const match = @import("match.zig");
+const preview = @import("preview.zig");
 
-pub const Error = discovery.Error || Io.ConcurrentError;
+pub const Error = discovery.Error || preview.Error || Io.ConcurrentError;
 
 /// Background work the UI thread hands off. A request owns what it carries,
 /// except the borrowed root descriptor, which must outlive `Jobs`.
@@ -19,6 +20,8 @@ pub const Request = union(enum) {
     classify: struct { root: Io.Dir, batch: discovery.Inventory },
     /// Holds a reference to the catalog, which the job only reads.
     filter: struct { catalog: *match.Catalog, query: []u8 },
+    /// A path relative to the borrowed root. Owned.
+    preview: struct { root: Io.Dir, path: [:0]u8 },
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         switch (self.*) {
@@ -27,6 +30,7 @@ pub const Request = union(enum) {
                 job.catalog.release(gpa);
                 gpa.free(job.query);
             },
+            .preview => |job| gpa.free(job.path),
             else => {},
         }
     }
@@ -53,6 +57,7 @@ pub const Outcome = union(enum) {
     classified: Error!discovery.Classified,
     /// Indices into the request's catalog, best first. Owned.
     matches: Error![]match.Match,
+    preview: Error!preview.Snapshot,
 
     pub fn deinit(self: *Outcome, gpa: Allocator, io: Io) void {
         switch (self.*) {
@@ -60,13 +65,14 @@ pub const Outcome = union(enum) {
             .listing => |*result| if (result.*) |*found| found.deinit(gpa) else |_| {},
             .classified => |*result| if (result.*) |*classified| classified.deinit(gpa) else |_| {},
             .matches => |result| if (result) |matches| gpa.free(matches) else |_| {},
+            .preview => |*result| if (result.*) |*snapshot| snapshot.deinit(gpa) else |_| {},
         }
     }
 };
 
 /// Each lane runs at most one job and holds at most one pending request, so
 /// threads and memory stay bounded however often the UI asks.
-pub const Lane = enum { discovery, classification, filter };
+pub const Lane = enum { discovery, classification, filter, preview };
 
 pub const Completion = struct {
     lane: Lane,
@@ -209,6 +215,7 @@ fn run(gpa: Allocator, io: Io, slot: *Slot, wake_fd: posix.fd_t) void {
             .classified = discovery.classify(gpa, io, job.root, &job.batch, cancel),
         },
         .filter => |job| .{ .matches = match.filter(gpa, job.catalog, job.query, cancel) },
+        .preview => |job| .{ .preview = preview.read(gpa, job.root, job.path, cancel) },
     };
     publish(slot, wake_fd);
 }
@@ -241,6 +248,7 @@ fn failure(request: Request, err: Error) Outcome {
         .project, .all => .{ .listing = err },
         .classify => .{ .classified = err },
         .filter => .{ .matches = err },
+        .preview => .{ .preview = err },
     };
 }
 

@@ -6,6 +6,7 @@ const discovery = @import("discovery.zig");
 const jobs = @import("jobs.zig");
 const match = @import("match.zig");
 const session = @import("session.zig");
+const Snapshot = @import("preview.zig").Snapshot;
 
 pub const Category = enum {
     /// Ordinary candidates: Git's tracked and unignored files, else a walk.
@@ -95,14 +96,31 @@ pub const List = struct {
 
 pub const Document = struct { id: session.Id, modified: bool, used: u64 };
 
+/// What the preview pane shows for the selection.
+pub const Preview = union(enum) {
+    /// Nothing is selected.
+    none,
+    /// An open document: draw its current text, unsaved edits included,
+    /// from the session. Nothing is read or copied.
+    document: session.Id,
+    /// The file is being read.
+    loading,
+    /// A bounded prefix of the file on disk. Borrowed until the finder next
+    /// changes.
+    file: Snapshot,
+    /// The file could not be previewed; opening it may still work.
+    unavailable: jobs.Error,
+};
+
 /// Paths per `git check-ignore` process.
 pub const batch_size = 4096;
 
-/// The finder's state, independent of the terminal. Discovery, classification
-/// and filtering run in `jobs` lanes; the finder submits a request whenever
-/// what it shows changes and applies each completion the caller hands back.
-/// A filter result always describes the current catalog and query, because
-/// every change to either submits a newer filter or cancels the lane.
+/// The finder's state, independent of the terminal. Discovery, classification,
+/// filtering and previews run in `jobs` lanes; the finder submits a request
+/// whenever what it shows changes and applies each completion the caller
+/// hands back. A filter result always describes the current catalog and
+/// query, and a preview the selected path, because every change to either
+/// submits a newer request or cancels the lane.
 pub const Finder = struct {
     root: ?discovery.Root = null,
     root_failure: ?jobs.Error = null,
@@ -123,6 +141,14 @@ pub const Finder = struct {
     keep: std.ArrayList(u8) = .empty,
     /// The classification batch in flight.
     batch: ?Batch = null,
+    /// The path whose file preview is shown or being read; empty when the
+    /// selection needs none.
+    previewed: std.ArrayList(u8) = .empty,
+    /// Owned.
+    snapshot: ?Snapshot = null,
+    preview_failure: ?jobs.Error = null,
+    /// A preview job for `previewed` is outstanding.
+    reading: bool = false,
 
     /// Call after `Jobs.deinit`: requests borrow the root descriptor.
     pub fn deinit(self: *Finder, gpa: Allocator, io: Io) void {
@@ -133,6 +159,8 @@ pub const Finder = struct {
         gpa.free(self.matches);
         self.query.deinit(gpa);
         self.keep.deinit(gpa);
+        if (self.snapshot) |*snapshot| snapshot.deinit(gpa);
+        self.previewed.deinit(gpa);
         self.* = undefined;
     }
 
@@ -154,8 +182,9 @@ pub const Finder = struct {
     }
 
     /// Focus enters `category`, from the editor, another category or a manual
-    /// refresh. The category is discovered again; the query is kept, and the
-    /// selected path where it can be. `open` lists every open document.
+    /// refresh. The category is discovered again and the selection's preview
+    /// read again; the query is kept, and the selected path where it can be.
+    /// `open` lists every open document, whichever category is focused.
     pub fn focus(
         self: *Finder,
         gpa: Allocator,
@@ -164,6 +193,7 @@ pub const Finder = struct {
         category: Category,
         open: []const OpenFile,
     ) Allocator.Error!void {
+        defer self.look(gpa, io, background, true);
         if (category != self.category) {
             if (self.selection()) |entry| {
                 self.keep.clearRetainingCapacity();
@@ -172,12 +202,10 @@ pub const Finder = struct {
             self.clear(gpa);
             self.category = category;
         }
-        switch (category) {
-            .open => try self.listOpen(gpa, background, open),
-            .project, .all => {
-                self.discover(gpa, io, background);
-                try self.show(gpa, io, background);
-            },
+        try self.listOpen(gpa, background, open);
+        if (category != .open) {
+            self.discover(gpa, io, background);
+            try self.show(gpa, io, background);
         }
         try self.classifyNext(gpa, io, background);
     }
@@ -191,6 +219,7 @@ pub const Finder = struct {
         text: []const u8,
     ) (Allocator.Error || error{QueryTooLong})!void {
         if (text.len > match.max_query) return error.QueryTooLong;
+        defer self.look(gpa, io, background, false);
         try self.query.ensureTotalCapacity(gpa, text.len);
         self.query.clearRetainingCapacity();
         self.query.appendSliceAssumeCapacity(text);
@@ -198,8 +227,9 @@ pub const Finder = struct {
         try self.show(gpa, io, background);
     }
 
-    /// Moves the selection, stopping at either end.
-    pub fn move(self: *Finder, delta: isize) void {
+    /// Moves the selection, stopping at either end, and previews the new one.
+    /// Discovery is never restarted.
+    pub fn move(self: *Finder, gpa: Allocator, io: Io, background: *jobs.Jobs, delta: isize) void {
         if (self.matches.len == 0) return;
         const distance = @abs(delta);
         self.selected = if (delta < 0) self.selected -| distance else @min(
@@ -207,6 +237,7 @@ pub const Finder = struct {
             self.matches.len - 1,
         );
         self.restart = false;
+        self.look(gpa, io, background, false);
     }
 
     /// The page of `rows` results that holds the selection. Every match is
@@ -220,8 +251,7 @@ pub const Finder = struct {
     pub fn row(self: *const Finder, result: match.Match) Row {
         const catalog = self.shown.?;
         const entry = catalog.entries[result.index];
-        const modified = self.category == .open and
-            self.lists.getPtrConst(.open).documents[entry.origin].modified;
+        const modified = if (self.opened(entry.label)) |document| document.modified else false;
         const ignore = catalog.ignored[result.index];
         return .{ .label = entry.label, .ignore = ignore, .modified = modified };
     }
@@ -243,7 +273,18 @@ pub const Finder = struct {
     pub fn choice(self: *const Finder) ?Choice {
         const entry = self.selection() orelse return null;
         if (self.category != .open) return .{ .path = entry.path };
-        return .{ .document = self.lists.getPtrConst(.open).documents[entry.origin].id };
+        return .{ .document = self.opened(entry.label).?.id };
+    }
+
+    /// The selection's preview. Enter still opens through `choice`, never
+    /// from a preview.
+    pub fn preview(self: *const Finder) Preview {
+        const entry = self.selection() orelse return .none;
+        if (self.opened(entry.label)) |document| return .{ .document = document.id };
+        if (self.preview_failure) |err| return .{ .unavailable = err };
+        if (self.reading) return .loading;
+        std.debug.assert(std.mem.eql(u8, entry.path, self.previewed.items));
+        return .{ .file = self.snapshot.? };
     }
 
     /// Applies a completion from `jobs`, taking ownership of it.
@@ -256,14 +297,15 @@ pub const Finder = struct {
     ) Allocator.Error!void {
         var request = completion.request;
         defer request.deinit(gpa);
+        defer self.look(gpa, io, background, false);
         switch (completion.outcome) {
             .root => |result| {
                 self.root = result catch |err| {
                     self.root_failure = err;
                     return;
                 };
-                if (self.category == .open) return;
-                self.discover(gpa, io, background);
+                if (self.category != .open) self.discover(gpa, io, background);
+                try self.relabel(gpa, background);
             },
             .listing => |result| {
                 const category: Category = if (request == .project) .project else .all;
@@ -299,7 +341,86 @@ pub const Finder = struct {
                 self.filter_failure = null;
                 self.present(gpa, job.catalog.retain(), matches);
             },
+            .preview => |result| {
+                std.debug.assert(std.mem.eql(u8, request.preview.path, self.previewed.items));
+                self.reading = false;
+                self.snapshot = result catch |err| {
+                    self.preview_failure = err;
+                    return;
+                };
+            },
         }
+    }
+
+    /// The open document listed under `label`, from any category.
+    fn opened(self: *const Finder, label: []const u8) ?Document {
+        const list = self.lists.getPtrConst(.open);
+        const catalog = list.catalog orelse return null;
+        const index = catalog.find(label) orelse return null;
+        return list.documents[catalog.entries[index].origin];
+    }
+
+    /// Keeps the preview on the selection. An open document needs no read; a
+    /// file is read in the background unless it is already shown or being
+    /// read, or `reread` asks for it again. Running out of memory shows as an
+    /// unavailable preview and is retried by the next look.
+    fn look(self: *Finder, gpa: Allocator, io: Io, background: *jobs.Jobs, reread: bool) void {
+        const wanted: ?[]const u8 = wanted: {
+            const entry = self.selection() orelse break :wanted null;
+            if (self.opened(entry.label) != null) break :wanted null;
+            break :wanted entry.path;
+        };
+        if (wanted) |path| {
+            if (!reread and std.mem.eql(u8, path, self.previewed.items)) return;
+        }
+        background.cancel(gpa, .preview);
+        if (self.snapshot) |*snapshot| snapshot.deinit(gpa);
+        self.snapshot = null;
+        self.previewed.clearRetainingCapacity();
+        self.preview_failure = null;
+        self.reading = false;
+        const path = wanted orelse return;
+        self.read(gpa, io, background, path) catch |err| {
+            self.previewed.clearRetainingCapacity();
+            self.preview_failure = err;
+        };
+    }
+
+    fn read(
+        self: *Finder,
+        gpa: Allocator,
+        io: Io,
+        background: *jobs.Jobs,
+        path: []const u8,
+    ) Allocator.Error!void {
+        // Only discovered listings select paths, and they need the root.
+        const root = self.root.?;
+        try self.previewed.appendSlice(gpa, path);
+        const owned = try gpa.dupeSentinel(u8, path, 0);
+        background.submit(gpa, io, .preview, .{ .preview = .{ .root = root.dir, .path = owned } });
+        self.reading = true;
+    }
+
+    /// Lists the open documents again, relative to a root that has just
+    /// arrived, so they are recognised in every category.
+    fn relabel(self: *Finder, gpa: Allocator, background: *jobs.Jobs) Allocator.Error!void {
+        const list = self.lists.getPtrConst(.open);
+        const catalog = list.catalog orelse return;
+        const open = try gpa.alloc(OpenFile, catalog.entries.len);
+        defer gpa.free(open);
+        for (catalog.entries, open) |entry, *file| {
+            const listed = list.documents[entry.origin];
+            file.* = .{
+                .id = listed.id,
+                .path = entry.path,
+                .modified = listed.modified,
+                .used = listed.used,
+            };
+        }
+        // `open` borrows the old catalog, which outlives the call.
+        const kept = catalog.retain();
+        defer kept.release(gpa);
+        try self.listOpen(gpa, background, open);
     }
 
     fn selection(self: *const Finder) ?match.Entry {
@@ -409,7 +530,8 @@ pub const Finder = struct {
     }
 
     /// Lists open documents: relative to the root when they lie beneath it,
-    /// otherwise by absolute path, which is never classified.
+    /// otherwise by absolute path, which is never classified. Shown only when
+    /// Open is focused; other categories look documents up by label.
     fn listOpen(
         self: *Finder,
         gpa: Allocator,
@@ -441,12 +563,14 @@ pub const Finder = struct {
             };
         };
         errdefer catalog.release(gpa);
-        // Commit only once nothing else can fail, so rows always index the
-        // documents of the catalog they belong to.
+        // Commit only once nothing else can fail, so the shown rows always
+        // belong to the listed documents.
+        const list = self.lists.getPtr(.open);
+        if (self.category != .open) return list.replace(gpa, catalog, documents);
         const matches = try self.filterInline(gpa, catalog, documents);
         background.cancel(gpa, .filter);
         self.filtering = false;
-        self.lists.getPtr(.open).replace(gpa, catalog, documents);
+        list.replace(gpa, catalog, documents);
         self.present(gpa, catalog.retain(), matches);
     }
 
@@ -588,7 +712,7 @@ fn settle(finder: *Finder, background: *jobs.Jobs) !void {
             try finder.receive(testing.allocator, testing.io, background, completion);
         }
         const busy = background.busy(.discovery) or background.busy(.classification) or
-            background.busy(.filter);
+            background.busy(.filter) or background.busy(.preview);
         if (!busy) return;
         var fds = [_]std.os.linux.pollfd{
             .{ .fd = background.wake_fd, .events = std.os.linux.POLL.IN, .revents = 0 },
@@ -723,7 +847,7 @@ test "category changes and refreshes keep the query and the selected path where 
     try finder.search(testing.allocator, testing.io, &background, "zig");
     try settle(&finder, &background);
     try expectRows(&finder, &.{ "src/main.zig", "src/util.zig" });
-    finder.move(1);
+    finder.move(testing.allocator, testing.io, &background, 1);
     try finder.focus(testing.allocator, testing.io, &background, .all, &.{});
     // Another category's results are never shown under this one.
     try expectRows(&finder, &.{});
@@ -743,7 +867,7 @@ test "category changes and refreshes keep the query and the selected path where 
     try expectRows(&finder, &.{ "src/main.zig", "src/new.zig" });
     try testing.expectEqual(@as(usize, 0), finder.selected);
     // A new query selects its best match.
-    finder.move(1);
+    finder.move(testing.allocator, testing.io, &background, 1);
     try finder.search(testing.allocator, testing.io, &background, "zi");
     try settle(&finder, &background);
     try testing.expectEqual(@as(usize, 0), finder.selected);
@@ -863,17 +987,17 @@ test "results are paginated, never truncated, and the page follows the selection
     try testing.expectEqual(@as(usize, 25), finder.matches.len);
     try testing.expectEqualStrings("/p/f24", selectedLabel(&finder));
     try testing.expectEqual(@as(usize, 10), finder.page(10).len);
-    finder.move(12);
+    finder.move(testing.allocator, testing.io, &background, 12);
     try testing.expectEqualStrings("/p/f12", selectedLabel(&finder));
     try testing.expectEqualStrings("/p/f14", finder.row(finder.page(10)[0]).label);
-    finder.move(100);
+    finder.move(testing.allocator, testing.io, &background, 100);
     try testing.expectEqual(@as(usize, 5), finder.page(10).len);
     try testing.expectEqualStrings("/p/f00", selectedLabel(&finder));
-    finder.move(-100);
+    finder.move(testing.allocator, testing.io, &background, -100);
     try testing.expectEqual(@as(usize, 0), finder.selected);
     try testing.expectEqual(@as(usize, 0), finder.page(0).len);
     // Refreshing keeps the selected document even though its rank moved.
-    finder.move(3);
+    finder.move(testing.allocator, testing.io, &background, 3);
     files[21].used = 30;
     try finder.focus(testing.allocator, testing.io, &background, .open, &files);
     try testing.expectEqualStrings("/p/f21", selectedLabel(&finder));
@@ -893,11 +1017,127 @@ test "allocation failure while listing, searching or refreshing Open leaves the 
             try finder.focus(gpa, testing.io, &background, .open, &files);
             try finder.search(gpa, testing.io, &background, "f1");
             try testing.expectEqual(@as(usize, 12), finder.matches.len);
-            finder.move(4);
+            finder.move(testing.allocator, testing.io, &background, 4);
             try finder.focus(gpa, testing.io, &background, .open, files[10..]);
             try testing.expectEqualStrings("/p/f14", selectedLabel(&finder));
         }
     }.run, .{});
+}
+
+/// The previewed file's bytes, once read.
+fn previewText(finder: *const Finder) ![]const u8 {
+    return switch (finder.preview()) {
+        .file => |snapshot| snapshot.bytes,
+        else => error.NotPreviewed,
+    };
+}
+
+test "the selection is previewed in the background, follows moves and rereads on refresh" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    try scratch.dir.writeFile(testing.io, .{ .sub_path = "repo/README", .data = "first" });
+    try scratch.dir.writeFile(testing.io, .{ .sub_path = "repo/src/util.zig", .data = "util" });
+    try scratch.put("repo/swap");
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var buffer: [256]u8 = undefined;
+    try begin(&finder, &background, &scratch, &buffer);
+    try testing.expectEqualStrings(".gitignore", selectedLabel(&finder));
+    try testing.expectEqualStrings("*.log\nbuild/\n", try previewText(&finder));
+    finder.move(testing.allocator, testing.io, &background, 2);
+    try testing.expect(finder.preview() == .loading);
+    // Moving never restarts discovery.
+    try testing.expect(!background.busy(.discovery));
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("first", try previewText(&finder));
+    // Quick moves supersede each other; only the last selection is shown.
+    finder.move(testing.allocator, testing.io, &background, 1);
+    finder.move(testing.allocator, testing.io, &background, 1);
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("src/util.zig", selectedLabel(&finder));
+    try testing.expectEqualStrings("util", try previewText(&finder));
+    // A preview is read once per selection, not per change of results, but
+    // again on refresh.
+    try scratch.dir.writeFile(testing.io, .{ .sub_path = "repo/src/util.zig", .data = "changed" });
+    try finder.search(testing.allocator, testing.io, &background, "util");
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("util", try previewText(&finder));
+    try finder.focus(testing.allocator, testing.io, &background, .project, &.{});
+    try testing.expect(finder.preview() == .loading);
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("changed", try previewText(&finder));
+    // A file replaced by a FIFO since it was listed is refused without blocking,
+    // and Enter still offers it to the validating loader.
+    try scratch.dir.deleteFile(testing.io, "repo/swap");
+    const fifo_mode = std.os.linux.S.IFIFO | 0o600;
+    const fifo = std.os.linux.mknodat(scratch.dir.handle, "repo/swap", fifo_mode, 0);
+    try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(fifo));
+    try finder.search(testing.allocator, testing.io, &background, "swap");
+    try settle(&finder, &background);
+    const refused: Preview = .{ .unavailable = error.UnsupportedFileType };
+    try testing.expectEqual(refused, finder.preview());
+    try testing.expectEqualStrings("swap", finder.choice().?.path);
+    try finder.search(testing.allocator, testing.io, &background, "nothing");
+    try settle(&finder, &background);
+    try testing.expect(finder.preview() == .none);
+}
+
+test "an open file previews its document in every category, never its disk bytes" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var buffer: [256]u8 = undefined;
+    var path: [256]u8 = undefined;
+    const open = [_]OpenFile{openFile(7, scratch.join(&path, "repo/README"), true, 1)};
+    const how: discovery.Start = .{ .directory = scratch.join(&buffer, "repo") };
+    finder.start(testing.allocator, testing.io, &background, how);
+    // Listed before the root arrives, the document is still recognised after.
+    try finder.focus(testing.allocator, testing.io, &background, .project, &open);
+    try settle(&finder, &background);
+    const document: Preview = .{ .document = id(7) };
+    try finder.search(testing.allocator, testing.io, &background, "README");
+    try settle(&finder, &background);
+    try testing.expectEqual(document, finder.preview());
+    for ([_]Category{ .project, .all, .open }) |category| {
+        try finder.focus(testing.allocator, testing.io, &background, category, &open);
+        try finder.search(testing.allocator, testing.io, &background, "README");
+        try settle(&finder, &background);
+        try testing.expectEqualStrings("README", selectedLabel(&finder));
+        try testing.expectEqual(document, finder.preview());
+        try testing.expect((try rowOf(&finder, "README")).modified);
+        try testing.expectEqual(@as(usize, 0), finder.previewed.items.len);
+    }
+    // Closed, it previews from disk again.
+    try finder.focus(testing.allocator, testing.io, &background, .project, &.{});
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("", try previewText(&finder));
+    try testing.expect(!(try rowOf(&finder, "README")).modified);
+}
+
+test "running out of memory shows the preview unavailable until the next look" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var buffer: [256]u8 = undefined;
+    try begin(&finder, &background, &scratch, &buffer);
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    finder.move(failing.allocator(), testing.io, &background, 1);
+    const exhausted: Preview = .{ .unavailable = error.OutOfMemory };
+    try testing.expectEqual(exhausted, finder.preview());
+    finder.move(testing.allocator, testing.io, &background, 0);
+    try settle(&finder, &background);
+    try testing.expectEqualStrings("", try previewText(&finder));
 }
 
 test "open paths are relative only when they stay beneath the root" {
