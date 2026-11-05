@@ -68,6 +68,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "stalledOutputSuspend", stalledOutputSuspend },
         .{ "finderSwitching", finderSwitching },
         .{ "finderSafety", finderSafety },
+        .{ "finderQuit", finderQuit },
     };
     inline for (checks) |check| {
         check[1](executable) catch |err| {
@@ -1168,8 +1169,8 @@ fn finderKeys(process: *Process, bytes: []const u8) !void {
 
 // Covers starting with no file from a subdirectory, searching, previews,
 // dirty switching with exact state, categories, dimming, Open markers,
-// :qa protection, closing back to the most recent file, last-file-to-finder,
-// and quitting with no document.
+// list keys, :qa protection, closing back to the most recent file, and
+// quitting by closing the last one.
 fn finderSwitching(executable: [:0]const u8) !void {
     var base: [128]u8 = undefined;
     const project = try Project.create(&base, "finder");
@@ -1186,6 +1187,30 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try settled(&process, "7/7 files", "");
     // The first result, .gitignore, is previewed.
     try process.until("*.log");
+    try process.ready();
+    // Escape moves from the query to the list, where letters move instead of
+    // searching; with no file open, Escape there has nowhere to go.
+    try process.send("\x1b");
+    try process.until("LIST | ");
+    try process.ready();
+    try process.send("G");
+    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.ready();
+    try process.send("k");
+    try process.ready();
+    try process.send("j");
+    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.ready();
+    try process.send("g");
+    try process.ready();
+    try process.send("g");
+    try process.until("\x1b[7m>   .gitignore");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("No file open; :q quits");
+    try process.ready();
+    try process.send("/");
+    try process.until("SEARCH | ");
     try process.ready();
     try process.send("alp");
     try settled(&process, "1/7 files", "alp");
@@ -1232,7 +1257,10 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.until("[Open]");
     try settled(&process, "2/2 files", "");
     try process.ready();
-    try process.send("\x1b[B");
+    try process.send("\x1b");
+    try process.until("LIST | ");
+    try process.ready();
+    try process.send("j");
     try process.until("Open file, unsaved edits");
     try process.ready();
     try process.send("\r");
@@ -1256,17 +1284,18 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.until("Bbeta");
     try process.until("NORMAL | 1:1 | ");
     try process.ready();
-    // Closing the last file returns to the finder, where Escape clears.
-    try process.send(":q\r");
-    try process.until("[Project]");
-    try process.ready();
-    try process.send("zz");
-    try process.until("> zz");
+    // From the list, q returns to the file; the query was kept.
+    try process.send("\x10");
+    try process.until("SEARCH | ");
     try process.ready();
     try process.send("\x1b");
-    try process.until("\r\n>     ");
+    try process.until("LIST | ");
     try process.ready();
-    try process.send("\x18qa\r");
+    try process.send("q");
+    try process.until("NORMAL | 1:1 | ");
+    try process.ready();
+    // Closing the last file quits.
+    try process.send(":q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -1347,6 +1376,7 @@ fn finderSafety(executable: [:0]const u8) !void {
     try process.signal(.CONT);
     try process.until("[Project]");
     try process.ready();
+    try finderKeys(&process, "\x1b");
     try process.send("\x1b");
     try process.until("Lalpha one");
     try process.ready();
@@ -1387,15 +1417,42 @@ fn finderSafety(executable: [:0]const u8) !void {
     try process.send(":q!\r");
     try process.until("beta");
     try process.ready();
-    // :wq on a clean file saves, closes it and, as the last, shows the finder.
+    // :wq on the last, clean file saves, closes it and quits.
+    var beta: [192]u8 = undefined;
+    const beta_path = try project.path(&beta, "beta.txt");
     try process.send(":wq\r");
-    try process.until("[Project]");
-    try process.until("Written");
-    try process.ready();
-    // With no file open, :q quits.
-    try process.send("\x18q\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
     try expectFile(alpha_path, "replaced\n");
+    try expectFile(beta_path, "beta\n");
+}
+
+// Ctrl-C leaves the query for the list, half pages move, and with no file
+// open the list's : enters a command and :q quits.
+fn finderQuit(executable: [:0]const u8) !void {
+    var base: [128]u8 = undefined;
+    const project = try Project.create(&base, "quit");
+    defer project.remove();
+    var process = try Process.start(executable, .{ .missing_argument = true, .cwd = project.repo });
+    defer process.close();
+    try settled(&process, "7/7 files", "");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("LIST | ");
+    try process.ready();
+    // Seven results fit in half the page of 24 rows.
+    try process.send("\x04");
+    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.ready();
+    try process.send("\x15");
+    try process.until("\x1b[7m>   .gitignore");
+    try process.ready();
+    try process.send(":");
+    try process.until("\x1b[7m:");
+    try process.ready();
+    try process.send("q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }

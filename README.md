@@ -18,10 +18,13 @@ Run `nib <file>` in a Linux terminal to edit an existing regular file, or
 
 The finder searches the project's file names and paths:
 
-- Ctrl-P opens it from normal mode. Type to search; Tab cycles the Project, All
-  and Open lists; Ctrl-N, Ctrl-P or the arrow keys move; Enter opens the file.
-- Ctrl-R refreshes the list, Ctrl-X enters a command such as `:qa`, and Escape
-  or Ctrl-C returns to the file (or clears the search when none is open).
+- Ctrl-P opens it from normal mode, ready to type a search. Escape or Ctrl-C
+  moves to the list, where `j`/`k`, `gg`/`G` and Ctrl-D/Ctrl-U move, `/` or `i`
+  returns to the search, `:` enters a command, and Escape, Ctrl-C or `q`
+  returns to the file.
+- In either: Enter opens the selection; Tab cycles the Project, All and Open
+  lists; Ctrl-N, Ctrl-P or the arrow keys move; Ctrl-R refreshes the list; and
+  Ctrl-X enters a command.
 - Several files can be open at once. Switching keeps each file's edits, undo
   history, cursor and scroll position.
 
@@ -33,7 +36,7 @@ Supported Vim commands:
 - Delete or change with `d`/`c` followed by a motion, or `dd`/`cc` for lines.
   Operator and motion counts multiply. Undo with `u`; redo with Ctrl-R.
 - `:w` saves. `:q` closes the file only when clean; `:q!` discards its edits.
-  Closing the last file shows the finder, where `:q` quits.
+  Closing the last file quits, as does `:q` in the finder with no file open.
 - `:wq` closes the file only after a verified, durable save.
 - `:qa` quits only when every file is clean, otherwise naming the files with
   unsaved edits; `:qa!` discards them all and quits.

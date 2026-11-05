@@ -102,6 +102,10 @@ const App = struct {
     documents: Session = .{},
     /// The finder has focus. Always set when no document is open.
     finding: bool = false,
+    /// The finder's keys move through the list rather than edit the query.
+    browsing: bool = false,
+    /// A `g` in the list awaits a second `g`.
+    pending_g: bool = false,
     size: terminal.Size = .{ .rows = 0, .columns = 0 },
     redraw: bool = false,
     exit: ?u8 = null,
@@ -244,28 +248,71 @@ const App = struct {
         }
         self.editor.notice = "";
         self.redraw = true;
+        const pending_g = self.pending_g;
+        self.pending_g = false;
+        // Keys that mean the same while searching and browsing.
         switch (event) {
             .key => |byte| switch (byte) {
-                '\r', '\n' => self.choose(),
-                '\t' => self.find(self.finder.category.next()),
-                0x0e => self.finder.move(self.gpa, self.io, self.background, 1),
-                0x10 => self.finder.move(self.gpa, self.io, self.background, -1),
+                '\r', '\n' => return self.choose(),
+                '\t' => return self.find(self.finder.category.next()),
+                0x0e => return self.move(1),
+                0x10 => return self.move(-1),
                 // Ctrl-R refreshes the category; Ctrl-X enters a command.
-                0x12 => self.find(self.finder.category),
-                0x18 => parser.mode = .command_line,
-                3 => self.dismiss(),
+                0x12 => return self.find(self.finder.category),
+                0x18 => {
+                    parser.mode = .command_line;
+                    return;
+                },
+                else => {},
+            },
+            .arrow => |direction| return switch (direction) {
+                .up => self.move(-1),
+                .down => self.move(1),
+                .left, .right => {},
+            },
+            .escape => {},
+            else => unreachable,
+        }
+        if (!self.browsing) return switch (event) {
+            // Escape and Ctrl-C leave the query for the list.
+            .escape => self.browse(),
+            .key => |byte| switch (byte) {
+                3 => self.browse(),
                 0x08, 0x7f => self.edit(null),
                 0x20...0x7e => self.edit(byte),
                 else => {},
             },
-            .escape => self.dismiss(),
-            .arrow => |direction| switch (direction) {
-                .up => self.finder.move(self.gpa, self.io, self.background, -1),
-                .down => self.finder.move(self.gpa, self.io, self.background, 1),
-                .left, .right => {},
-            },
             else => unreachable,
+        };
+        const byte = switch (event) {
+            .escape => return self.dismiss(),
+            .key => |byte| byte,
+            else => unreachable,
+        };
+        const extreme = std.math.maxInt(isize);
+        const half: isize = @intCast(@max(self.layout().results / 2, 1));
+        switch (byte) {
+            3, 'q' => self.dismiss(),
+            'j' => self.move(1),
+            'k' => self.move(-1),
+            'g' => if (pending_g) self.move(-extreme) else {
+                self.pending_g = true;
+            },
+            'G' => self.move(extreme),
+            0x04 => self.move(half),
+            0x15 => self.move(-half),
+            '/', 'i' => self.browsing = false,
+            ':' => parser.mode = .command_line,
+            else => {},
         }
+    }
+
+    fn browse(self: *App) void {
+        self.browsing = true;
+    }
+
+    fn move(self: *App, delta: isize) void {
+        self.finder.move(self.gpa, self.io, self.background, delta);
     }
 
     /// Focuses the finder on `category`, which discovers it again.
@@ -289,9 +336,12 @@ const App = struct {
         };
     }
 
-    /// Escape and Ctrl-C return to the editor, or clear the query without one.
+    /// Leaves the list for the editor; without a document there is nowhere to go.
     fn dismiss(self: *App) void {
-        if (self.documents.current() == null) return self.search("");
+        if (self.documents.current() == null) {
+            self.editor.notice = "No file open; :q quits";
+            return;
+        }
         self.finder.leave(self.gpa, self.io, self.background);
         self.finding = false;
     }
@@ -346,11 +396,14 @@ const App = struct {
         self.finding = false;
     }
 
-    /// Runs a file command from either screen. Without a document, quitting
-    /// exits and the other commands are refused.
+    /// Runs a file command from either screen. Closing the last document
+    /// exits, as does quitting without one; the other commands need one.
     fn fileAction(self: *App, action: command.File) void {
         switch (action) {
-            .find => self.find(self.finder.category),
+            .find => {
+                self.browsing = false;
+                self.find(self.finder.category);
+            },
             .quit => |discard| {
                 const entry = self.documents.current() orelse {
                     self.exit = 0;
@@ -402,14 +455,16 @@ const App = struct {
         self.editor.notice = "No file open";
     }
 
-    /// After a document closes, the finder lists what remains, and shows
-    /// itself when nothing does, on Project rather than an empty Open.
+    /// Closing the last document exits; otherwise a focused finder lists
+    /// what remains.
     fn closed(self: *App) void {
-        const remaining = self.documents.current() != null;
-        if (!self.finding and remaining) return;
+        if (self.documents.current() == null) {
+            self.exit = 0;
+            return;
+        }
+        if (!self.finding) return;
         const notice = self.editor.notice;
-        const category = self.finder.category;
-        self.find(if (!remaining and category == .open) .project else category);
+        self.find(self.finder.category);
         if (self.editor.notice.len == 0) self.editor.notice = notice;
     }
 
@@ -519,20 +574,13 @@ const App = struct {
         const finder = self.finder;
         const width: usize = self.size.columns -| 1;
         if (self.size.rows == 0 or width == 0) return;
-        const selected: []const u8 = if (finder.matches.len == 0)
-            ""
-        else
-            finder.row(finder.matches[finder.selected]).label;
-        var budget: usize = self.size.rows - 1;
-        const query_rows: usize = @min(budget, 1);
-        budget -= query_rows;
-        const path_rows: usize = @min(budget, (selected.len + width - 1) / width);
-        budget -= path_rows;
-        const header_rows: usize = @min(budget, 1);
-        budget -= header_rows;
-        const progress_rows: usize = @min(budget, 1);
-        budget -= progress_rows;
-        const result_rows = budget;
+        const selected = self.selection();
+        const rows = self.layout();
+        const header_rows = rows.header;
+        const progress_rows = rows.progress;
+        const query_rows = rows.query;
+        const result_rows = rows.results;
+        const path_rows = rows.path;
 
         if (header_rows != 0) {
             var line: Line = .init(try frame.reserve(width));
@@ -584,18 +632,54 @@ const App = struct {
             status.put(text[text.len -| (status.left() -| 1)..]);
         } else if (self.editor.notice.len != 0) {
             status.put(self.editor.notice);
+        } else if (self.browsing) {
+            status.put("LIST | j/k move | Enter open | / search | ");
+            status.put(if (self.documents.current() == null) ":q quit" else "Esc editor");
+            status.put(" | Tab category | : command");
         } else {
-            status.put("Enter open | Tab category | Ctrl-N/P move | Ctrl-R refresh | ");
-            status.put("Ctrl-X command | ");
-            status.put(if (self.documents.current() == null) "Esc clear" else "Esc editor");
+            status.put("SEARCH | Enter open | Esc list | ^N/^P move | Tab category | ");
+            status.put("^X command | ^R refresh");
         }
         try frame.append("\x1b[27m");
         if (parser.mode == .command_line) {
             try frame.cursor(self.size.rows - 1, @min(1 + parser.line_len, width - 1));
-        } else if (query_rows != 0) {
+        } else if (query_rows != 0 and !self.browsing) {
             try frame.cursor(header_rows + progress_rows, @min(2 + query.len, width - 1));
         }
     }
+
+    fn selection(self: *const App) []const u8 {
+        const finder = self.finder;
+        if (finder.matches.len == 0) return "";
+        return finder.row(finder.matches[finder.selected]).label;
+    }
+
+    /// The finder's rows, top to bottom, above the status row. The query and
+    /// the selected path come first, then the header and progress.
+    fn layout(self: *const App) Layout {
+        const width: usize = self.size.columns -| 1;
+        if (self.size.rows == 0 or width == 0) return .{};
+        var budget: usize = self.size.rows - 1;
+        var rows: Layout = .{};
+        rows.query = @min(budget, 1);
+        budget -= rows.query;
+        rows.path = @min(budget, (self.selection().len + width - 1) / width);
+        budget -= rows.path;
+        rows.header = @min(budget, 1);
+        budget -= rows.header;
+        rows.progress = @min(budget, 1);
+        budget -= rows.progress;
+        rows.results = budget;
+        return rows;
+    }
+
+    const Layout = struct {
+        header: usize = 0,
+        progress: usize = 0,
+        query: usize = 0,
+        results: usize = 0,
+        path: usize = 0,
+    };
 
     /// Match counts, discovery and classification state, and failures.
     fn progress(self: *App, row: []u8) void {
