@@ -144,7 +144,7 @@ pub fn resolveRoot(gpa: Allocator, io: Io, start: Start, cancel: *const Cancel) 
     var reason: []u8 = &.{};
     errdefer gpa.free(reason);
     const arguments = [_][]const u8{ "rev-parse", "--show-toplevel" };
-    const run = runGit(gpa, io, dir, &arguments, null, cancel);
+    const run = runGit(gpa, io, dir, &arguments, cancel);
     const output: ?Output = run catch |err| switch (err) {
         error.GitUnavailable => null,
         else => |e| return e,
@@ -180,17 +180,22 @@ pub const Listing = struct {
     unfiltered: bool,
     /// Why the listing is unfiltered or partial. Owned; may be empty.
     reason: []u8 = &.{},
-    /// All in a worktree: the untracked paths Git ignores, with nested
-    /// repositories as directories ending in `/`. Null when not asked or
-    /// unknown.
+    /// All in a worktree: the untracked paths Git ignores, with wholly
+    /// ignored directories and ignored nested repositories ending in `/`.
+    /// Null when not asked or unknown.
     ignored: ?Inventory = null,
-    /// Why Git could not say which paths it ignores. Owned; may be empty.
+    /// Walks only: directories beneath the root holding a `.git`, each
+    /// ending in `/`. Git's listing never answers for what lies inside them.
+    repositories: Inventory = .{},
+    /// Why Git could not say which paths it ignores, or which ones it could
+    /// not answer for. Owned; may be empty.
     ignore_reason: []u8 = &.{},
 
     pub fn deinit(self: *Listing, gpa: Allocator) void {
         self.paths.deinit(gpa);
         gpa.free(self.reason);
         if (self.ignored) |*ignored| ignored.deinit(gpa);
+        self.repositories.deinit(gpa);
         gpa.free(self.ignore_reason);
     }
 };
@@ -208,7 +213,7 @@ pub fn listProject(
     const arguments = [_][]const u8{
         "ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "-z", "--", ".",
     };
-    var output = runGit(gpa, io, root, &arguments, null, cancel) catch |err| switch (err) {
+    var output = runGit(gpa, io, root, &arguments, cancel) catch |err| switch (err) {
         error.GitUnavailable => return walk(gpa, root, cancel, "Git not found; listing unfiltered"),
         else => |e| return e,
     };
@@ -224,25 +229,33 @@ pub fn listProject(
 }
 
 /// Every regular file under `root`, including hidden and ignored ones. In a
-/// worktree, Git then lists the ignored ones; tracked files are never
-/// ignored. The walk comes first, so a path it found and Git missed was
-/// removed in between, not ignored.
+/// worktree, Git then lists the ignored ones, a wholly ignored directory as
+/// one `dir/` entry; tracked files are never ignored, and nested repositories
+/// and submodules are not looked into. The walk comes first, so a path it
+/// found and Git missed was removed in between, not ignored.
 pub fn listAll(gpa: Allocator, io: Io, root: Io.Dir, git: bool, cancel: *const Cancel) Error!Listing {
     var listing = try walk(gpa, root, cancel, "");
     errdefer listing.deinit(gpa);
     listing.unfiltered = false;
     if (!git) return listing;
     const arguments = [_][]const u8{
-        "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ".",
+        "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z", "--", ".",
     };
     const why: []const u8 = why: {
-        var output = runGit(gpa, io, root, &arguments, null, cancel) catch |err| switch (err) {
+        var output = runGit(gpa, io, root, &arguments, cancel) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |e| return e,
             error.GitUnavailable => break :why "Git not found",
             else => break :why "Git failed",
         };
         if (output.succeeded()) {
             listing.ignored = try .fromNulTerminated(gpa, output.stdout, true);
+            const nested = listing.repositories.count();
+            if (nested == 0) return listing;
+            const text = "Ignore status unknown in {d} nested repositor{s}";
+            listing.ignore_reason = try std.fmt.allocPrint(gpa, text, .{
+                nested,
+                if (nested == 1) "y" else "ies",
+            });
             return listing;
         }
         gpa.free(output.stdout);
@@ -285,7 +298,6 @@ fn runGit(
     io: Io,
     cwd: Io.Dir,
     arguments: []const []const u8,
-    input: ?[]const u8,
     cancel: *const Cancel,
 ) Error!Output {
     // Git inherits Nib's blocked signals and passes them on. An fsmonitor
@@ -298,7 +310,7 @@ fn runGit(
     var child = std.process.spawn(io, .{
         .argv = argv[0 .. prefix.len + arguments.len],
         .cwd = .{ .dir = cwd },
-        .stdin = if (input != null) .pipe else .ignore,
+        .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .pgid = 0,
@@ -313,7 +325,7 @@ fn runGit(
     };
     var output: Output = .{ .stdout = &.{}, .term = undefined };
     var stdout: std.ArrayList(u8) = .empty;
-    const exchanged = exchange(gpa, &child, input orelse &.{}, cancel, &stdout, &output);
+    const exchanged = exchange(gpa, &child, cancel, &stdout, &output);
     const term = reap(io, &child);
     exchanged catch |err| {
         stdout.deinit(gpa);
@@ -330,12 +342,11 @@ fn runGit(
     return output;
 }
 
-/// Writes `input`, collects output, and waits for the child to exit, returning
-/// early on cancellation. Leaves the child unreaped.
+/// Collects output and waits for the child to exit, returning early on
+/// cancellation. Leaves the child unreaped.
 fn exchange(
     gpa: Allocator,
     child: *Child,
-    input: []const u8,
     cancel: *const Cancel,
     stdout: *std.ArrayList(u8),
     output: *Output,
@@ -344,35 +355,22 @@ fn exchange(
     if (posix.errno(pidfd_result) != .SUCCESS) return error.HelperFailed;
     const pidfd: posix.fd_t = @intCast(pidfd_result);
     defer _ = linux.close(pidfd);
-    for ([_]?Io.File{ child.stdin, child.stdout, child.stderr }) |pipe| if (pipe) |end| {
+    for ([_]?Io.File{ child.stdout, child.stderr }) |pipe| if (pipe) |end| {
         const flags = linux.fcntl(end.handle, linux.F.GETFL, 0);
         if (posix.errno(flags) != .SUCCESS) return error.HelperFailed;
         const nonblocking = flags | @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
         if (posix.errno(linux.fcntl(end.handle, linux.F.SETFL, nonblocking)) != .SUCCESS)
             return error.HelperFailed;
     };
-    var remaining = input;
-    if (remaining.len == 0) closePipe(&child.stdin);
     var discard: [4096]u8 = undefined;
     while (child.stdout != null or child.stderr != null) {
         var fds = [_]linux.pollfd{
             .{ .fd = cancel.fd, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = handle(child.stdout), .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = handle(child.stderr), .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = handle(child.stdin), .events = linux.POLL.OUT, .revents = 0 },
         };
         try wait(&fds);
         if (fds[0].revents != 0) return error.Canceled;
-        if (fds[3].revents != 0) {
-            const count = linux.write(fds[3].fd, remaining.ptr, remaining.len);
-            switch (posix.errno(count)) {
-                .SUCCESS => remaining = remaining[count..],
-                .AGAIN, .INTR => {},
-                // Git stopped reading; its exit status explains why.
-                else => remaining = &.{},
-            }
-            if (remaining.len == 0) closePipe(&child.stdin);
-        }
         if (fds[1].revents != 0) {
             try stdout.ensureUnusedCapacity(gpa, 64 * 1024);
             const spare = stdout.unusedCapacitySlice();
@@ -398,7 +396,6 @@ fn exchange(
             }
         }
     }
-    closePipe(&child.stdin);
     while (true) {
         var fds = [_]linux.pollfd{
             .{ .fd = cancel.fd, .events = linux.POLL.IN, .revents = 0 },
@@ -457,6 +454,8 @@ fn walk(gpa: Allocator, root: Io.Dir, cancel: *const Cancel, why: []const u8) Er
     var directories: Builder = .{};
     defer directories.deinit(gpa);
     try directories.append(gpa, "", "");
+    var repositories: Builder = .{};
+    defer repositories.deinit(gpa);
     var unreadable: usize = 0;
     var next: usize = 0;
     var prefix: [linux.PATH_MAX]u8 = undefined;
@@ -476,6 +475,8 @@ fn walk(gpa: Allocator, root: Io.Dir, cancel: *const Cancel, why: []const u8) Er
             continue;
         };
         defer _ = linux.close(dir);
+        // `relative` may move as directories are appended; `here` cannot.
+        const here = prefix[0..relative.len];
         while (true) {
             const length = linux.getdents64(dir, &entries, entries.len);
             if (posix.errno(length) != .SUCCESS) {
@@ -491,10 +492,15 @@ fn walk(gpa: Allocator, root: Io.Dir, cancel: *const Cancel, why: []const u8) Er
                 offset += entry.reclen;
                 const name = std.mem.span(name_z);
                 if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-                if (std.mem.eql(u8, name, ".git")) continue;
+                if (std.mem.eql(u8, name, ".git")) {
+                    // A directory for a nested repository, a file for a
+                    // submodule; the root's own is not nested.
+                    if (here.len != 0) try repositories.append(gpa, here, "");
+                    continue;
+                }
                 switch (kind(dir, name_z, entry.type)) {
-                    .directory => try directories.append(gpa, prefix[0..relative.len], name),
-                    .file => try files.append(gpa, prefix[0..relative.len], name),
+                    .directory => try directories.append(gpa, here, name),
+                    .file => try files.append(gpa, here, name),
                     .other => {},
                 }
             }
@@ -511,7 +517,10 @@ fn walk(gpa: Allocator, root: Io.Dir, cancel: *const Cancel, why: []const u8) Er
         });
     } else if (why.len != 0) reason = try gpa.dupe(u8, why);
     errdefer gpa.free(reason);
+    var nested = try repositories.toInventory(gpa);
+    errdefer nested.deinit(gpa);
     return .{
+        .repositories = nested,
         .paths = try files.toInventory(gpa),
         .partial = unreadable != 0,
         .unfiltered = true,
@@ -785,8 +794,14 @@ test "a Git listing that runs out of memory frees everything it held" {
             var listing = try listProject(gpa, testing.io, root, true, flag);
             listing.deinit(gpa);
         }
+        // All walks into a nested repository, which Git's listing skips.
+        fn all(gpa: Allocator, root: Io.Dir, flag: *const Cancel) !void {
+            var listing = try listAll(gpa, testing.io, root, true, flag);
+            listing.deinit(gpa);
+        }
     };
     try testing.checkAllAllocationFailures(testing.allocator, List.project, .{ repo, &cancel });
+    try testing.checkAllAllocationFailures(testing.allocator, List.all, .{ repo, &cancel });
 }
 
 test "the walk lists hidden and ignored files, skips .git and never follows directory links" {
@@ -835,26 +850,75 @@ test "All asks Git once for its ignored paths and never lists tracked ones" {
     try repository(&scratch);
     try scratch.git(&.{ "init", "-q", "repo/build/inner" });
     try scratch.put("repo/build/inner/f");
+    try scratch.put("repo/ignored/kept");
+    try scratch.put("repo/ignored/dropped");
+    try scratch.git(&.{ "-C", "repo", "add", "-f", "ignored/kept" });
     var cancel: Cancel = try .init();
     defer cancel.deinit();
     var repo = try scratch.dir.openDir(testing.io, "repo", .{});
     defer repo.close(testing.io);
     var all = try listAll(testing.allocator, testing.io, repo, true, &cancel);
     defer all.deinit(testing.allocator);
-    try testing.expect(!all.unfiltered and all.ignore_reason.len == 0);
-    // Tracked x.log matches a pattern but is not ignored; an ignored nested
-    // repository is one directory entry.
-    try expectPaths(&.{ "build/inner/", "build/out", "ign1", "sub/new.log" }, &all.ignored.?);
+    try testing.expect(!all.unfiltered);
+    // Tracked files match a pattern but are not ignored, so their directory
+    // is listed file by file; a wholly ignored one, nested repository and
+    // all, is one entry.
+    const ignored = [_][]const u8{ "build/", "ign1", "ignored/dropped", "sub/new.log" };
+    try expectPaths(&ignored, &all.ignored.?);
+    // The walk notes every nested repository, since Git answers for none.
+    try expectPaths(&.{ "build/inner/", "nested/" }, &all.repositories);
+    const why = "Ignore status unknown in 2 nested repositories";
+    try testing.expectEqualStrings(why, all.ignore_reason);
     // A narrowed root gets paths relative to itself.
     var sub = try repo.openDir(testing.io, "sub", .{});
     defer sub.close(testing.io);
     var narrowed = try listAll(testing.allocator, testing.io, sub, true, &cancel);
     defer narrowed.deinit(testing.allocator);
     try expectPaths(&.{"new.log"}, &narrowed.ignored.?);
+    try testing.expectEqual(@as(usize, 0), narrowed.repositories.count());
+    try testing.expectEqualStrings("", narrowed.ignore_reason);
     // Without Git the status stays unknown and nothing is asked.
     var plain = try listAll(testing.allocator, testing.io, repo, false, &cancel);
     defer plain.deinit(testing.allocator);
     try testing.expect(plain.ignored == null and plain.ignore_reason.len == 0);
+}
+
+test "a submodule is a nested repository to its superproject and a root of its own" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    try scratch.git(&.{ "init", "-q", "lib" });
+    try scratch.dir.writeFile(testing.io, .{ .sub_path = "lib/.gitignore", .data = "junk\n" });
+    try scratch.put("lib/a");
+    try scratch.git(&.{ "-C", "lib", "add", "." });
+    const identity = [_][]const u8{ "-c", "user.name=t", "-c", "user.email=t@t" };
+    try scratch.git(&(identity ++ .{ "-C", "lib", "commit", "-qm", "lib" }));
+    const file_protocol = [_][]const u8{ "-c", "protocol.file.allow=always", "-C", "repo" };
+    try scratch.git(&(file_protocol ++ .{ "submodule", "add", "-q", "../lib", "lib" }));
+    try scratch.put("repo/lib/junk");
+    var cancel: Cancel = try .init();
+    defer cancel.deinit();
+    var repo = try scratch.dir.openDir(testing.io, "repo", .{});
+    defer repo.close(testing.io);
+    // The submodule's `.git` is a file; its own ignores are not the
+    // superproject's to answer.
+    var all = try listAll(testing.allocator, testing.io, repo, true, &cancel);
+    defer all.deinit(testing.allocator);
+    try expectPaths(&.{ "lib/", "nested/" }, &all.repositories);
+    for (0..all.ignored.?.count()) |index| {
+        try testing.expect(!std.mem.startsWith(u8, all.ignored.?.path(index), "lib/"));
+    }
+    // Rooted inside, the submodule is its own worktree and answers fully.
+    var buffer: [128]u8 = undefined;
+    const inside: Start = .{ .directory = scratch.join(&buffer, "repo/lib") };
+    var root = try resolveRoot(testing.allocator, testing.io, inside, &cancel);
+    defer root.deinit(testing.allocator, testing.io);
+    try testing.expect(root.git and std.mem.endsWith(u8, root.path, "/repo/lib"));
+    var own = try listAll(testing.allocator, testing.io, root.dir, true, &cancel);
+    defer own.deinit(testing.allocator);
+    try expectPaths(&.{"junk"}, &own.ignored.?);
+    try testing.expectEqual(@as(usize, 0), own.repositories.count());
+    try testing.expectEqualStrings("", own.ignore_reason);
 }
 
 test "when Git cannot list ignored paths, All says why and guesses nothing" {
@@ -910,7 +974,7 @@ test "cancellation kills a helper that ignores TERM while its output is unread" 
             const alias = "alias.spin=!trap '' TERM PIPE; " ++
                 "yes >/dev/null & echo $! > spin.pid; exec yes";
             const arguments = [_][]const u8{ "-c", alias, "spin" };
-            const output = try runGit(testing.allocator, testing.io, dir, &arguments, null, flag);
+            const output = try runGit(testing.allocator, testing.io, dir, &arguments, flag);
             testing.allocator.free(output.stdout);
         }
     };
@@ -968,7 +1032,7 @@ test "a finished helper's group is killed, so stragglers do not outlive it" {
     defer cancel.deinit();
     const alias = "alias.leave=!sleep 1000 </dev/null >/dev/null 2>&1 & echo $! > straggler.pid";
     const arguments = [_][]const u8{ "-c", alias, "leave" };
-    const run = runGit(testing.allocator, testing.io, scratch.dir, &arguments, null, &cancel);
+    const run = runGit(testing.allocator, testing.io, scratch.dir, &arguments, &cancel);
     const output = try run;
     defer testing.allocator.free(output.stdout);
     try testing.expect(output.succeeded());

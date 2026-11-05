@@ -73,16 +73,15 @@ pub const List = struct {
     fn deinit(self: *List, gpa: Allocator) void {
         self.replace(gpa, null, &.{});
         gpa.free(self.reason);
+        gpa.free(self.ignore_reason);
     }
 
     /// Takes ownership of `catalog` and `documents`.
     fn replace(self: *List, gpa: Allocator, catalog: ?*match.Catalog, documents: []Document) void {
         if (self.catalog) |old| old.release(gpa);
         gpa.free(self.documents);
-        gpa.free(self.ignore_reason);
         self.catalog = catalog;
         self.documents = documents;
-        self.ignore_reason = &.{};
     }
 };
 
@@ -329,8 +328,9 @@ pub const Finder = struct {
                 list.unfiltered = found.unfiltered;
                 gpa.free(list.reason);
                 list.reason = found.reason;
-                list.replace(gpa, found.catalog, &.{});
+                gpa.free(list.ignore_reason);
                 list.ignore_reason = found.ignore_reason;
+                list.replace(gpa, found.catalog, &.{});
                 if (category != self.category) return;
                 try self.show(gpa, io, background);
             },
@@ -739,6 +739,30 @@ test "All adds hidden and ignored files and dims only those Git ignores" {
     try finder.search(testing.allocator, testing.io, &background, "log");
     try settle(&finder, &background);
     try expectRows(&finder, &.{ "debug.log", "tracked.log" });
+}
+
+test "All shows files in a nested repository unknown and says why" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    try scratch.git(&.{ "init", "-q", "repo/vendor" });
+    try scratch.put("repo/vendor/lib.c");
+    try scratch.put("repo/vendor/trace.log");
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var buffer: [256]u8 = undefined;
+    try begin(&finder, &background, &scratch, &buffer);
+    try finder.focus(testing.allocator, testing.io, &background, .all, &.{});
+    try settle(&finder, &background);
+    // Git never looks inside, so even a name its patterns match is unknown.
+    try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, "vendor/lib.c")).ignore);
+    try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, "vendor/trace.log")).ignore);
+    try testing.expectEqual(match.Ignore.ignored, (try rowOf(&finder, "debug.log")).ignore);
+    try testing.expectEqual(match.Ignore.visible, (try rowOf(&finder, "README")).ignore);
+    const reason = finder.lists.getPtrConst(.all).ignore_reason;
+    try testing.expectEqualStrings("Ignore status unknown in 1 nested repository", reason);
 }
 
 test "when Git cannot list ignored paths, All shows every status unknown and says why" {

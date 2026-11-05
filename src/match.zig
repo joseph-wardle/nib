@@ -89,32 +89,36 @@ pub const Catalog = struct {
         gpa.destroy(self);
     }
 
-    /// Marks each entry ignored when it, or a directory above it, is in
-    /// `ignored`, and visible otherwise. Only before the catalog is shared.
+    /// Marks each entry ignored when a directory above it is in `ignored`,
+    /// else unknown when it lies in one of `repositories` (directories ending
+    /// in `/`), which Git's listing never looks into, else ignored when it is
+    /// in `ignored` and visible otherwise. Only before the catalog is shared.
     pub fn classify(
         self: *Catalog,
         gpa: Allocator,
         ignored: *const discovery.Inventory,
+        repositories: *const discovery.Inventory,
         cancel: ?*const discovery.Cancel,
     ) Error!void {
-        const listed = try gpa.alloc([]const u8, ignored.count());
+        const listed = try ordered(gpa, ignored);
         defer gpa.free(listed);
+        const nested = try ordered(gpa, repositories);
+        defer gpa.free(nested);
         var directories = false;
-        for (listed, 0..) |*path, index| {
-            path.* = ignored.path(index);
-            if (path.*[path.len - 1] == '/') directories = true;
+        for (listed) |path| {
+            if (path[path.len - 1] == '/') directories = true;
         }
-        std.mem.sortUnstable([]const u8, listed, {}, struct {
-            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
         try check(cancel);
         for (self.entries, self.ignored, 0..) |entry, *status, index| {
             if (index % check_interval == 0) try check(cancel);
-            const hit = contains(listed, entry.path) or
-                (directories and beneathAny(listed, entry.path));
-            status.* = if (hit) .ignored else .visible;
+            status.* = if (directories and beneathAny(listed, entry.path))
+                .ignored
+            else if (nested.len != 0 and beneathAny(nested, entry.path))
+                .unknown
+            else if (contains(listed, entry.path))
+                .ignored
+            else
+                .visible;
         }
     }
 
@@ -232,6 +236,18 @@ fn better(_: void, a: Match, b: Match) bool {
 
 fn byLabel(_: void, a: Entry, b: Entry) bool {
     return std.mem.lessThan(u8, a.label, b.label);
+}
+
+/// The inventory's paths in byte order, borrowed from it. Free the slice.
+fn ordered(gpa: Allocator, inventory: *const discovery.Inventory) Allocator.Error![][]const u8 {
+    const paths = try gpa.alloc([]const u8, inventory.count());
+    for (paths, 0..) |*path, index| path.* = inventory.path(index);
+    std.mem.sortUnstable([]const u8, paths, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    return paths;
 }
 
 fn contains(sorted: []const []const u8, path: []const u8) bool {
@@ -401,9 +417,10 @@ test "filtering stops when cancelled" {
     try testing.expectError(error.Canceled, filter(testing.allocator, catalog, "a", &cancel));
 }
 
-test "classification marks listed paths and everything under listed directories" {
+test "classification marks listed paths, everything under listed directories, and nested repositories unknown" {
     const catalog = try catalogOf(&.{
-        "a.log", "keep", "nested/x/y", "nested.txt", "dir/ok", "bad\xff.log",
+        "a.log",    "keep",       "nested/x/y", "nested.txt", "dir/ok",  "bad\xff.log",
+        "sub/junk", "sub/deep/a", "subway",     "nested/x/z", "sub.log",
     });
     defer catalog.release(testing.allocator);
     var ignored: discovery.Inventory = .{
@@ -411,10 +428,18 @@ test "classification marks listed paths and everything under listed directories"
         .ends = try testing.allocator.dupe(usize, &.{ 7, 16, 22 }),
     };
     defer ignored.deinit(testing.allocator);
-    try catalog.classify(testing.allocator, &ignored, null);
+    // A submodule, and a repository inside an ignored directory.
+    var repositories: discovery.Inventory = .{
+        .bytes = try testing.allocator.dupe(u8, "sub/\x00nested/x/\x00"),
+        .ends = try testing.allocator.dupe(usize, &.{ 4, 14 }),
+    };
+    defer repositories.deinit(testing.allocator);
+    try catalog.classify(testing.allocator, &ignored, &repositories, null);
     const expected = [_]struct { []const u8, Ignore }{
-        .{ "a.log", .ignored },      .{ "keep", .visible },   .{ "nested/x/y", .ignored },
-        .{ "nested.txt", .visible }, .{ "dir/ok", .visible }, .{ "bad\\xff.log", .ignored },
+        .{ "a.log", .ignored },      .{ "keep", .visible },       .{ "nested/x/y", .ignored },
+        .{ "nested.txt", .visible }, .{ "dir/ok", .visible },     .{ "bad\\xff.log", .ignored },
+        .{ "sub/junk", .unknown },   .{ "sub/deep/a", .unknown }, .{ "subway", .visible },
+        .{ "nested/x/z", .ignored }, .{ "sub.log", .visible },
     };
     for (expected) |pair| {
         try testing.expectEqual(pair[1], catalog.ignored[catalog.find(pair[0]).?]);
@@ -422,7 +447,7 @@ test "classification marks listed paths and everything under listed directories"
     var cancel: discovery.Cancel = try .init();
     defer cancel.deinit();
     cancel.request();
-    try testing.expectError(error.Canceled, catalog.classify(testing.allocator, &ignored, &cancel));
+    try testing.expectError(error.Canceled, catalog.classify(testing.allocator, &ignored, &repositories, &cancel));
 }
 
 test "catalog creation frees everything on allocation failure" {

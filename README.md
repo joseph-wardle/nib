@@ -33,7 +33,9 @@ Three lists, cycled with Tab:
   with the reason.
 - **All:** every regular file under the root, hidden and ignored ones included,
   skipping `.git` and never following directory symlinks. Files Git ignores are
-  dimmed; `?` marks a file whose status is unknown because Git couldn't say.
+  dimmed; `?` marks a file whose status is unknown because Git couldn't say,
+  including every file inside a nested repository or submodule, which Git
+  doesn't look into.
 - **Open:** every open file, most recently used first. `+` marks unsaved edits.
   Ignore status comes from All, so it shows `?` until All has been listed.
 

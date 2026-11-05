@@ -111,10 +111,10 @@ pub const Jobs = struct {
     /// Cancels running jobs and waits for each to kill and reap its helpers.
     /// Restore the terminal first: storage that never responds can stall this.
     pub fn deinit(self: *Jobs, gpa: Allocator, io: Io) void {
+        for (&self.lanes.values) |*slot| slot.cancel.request();
         for (&self.lanes.values) |*slot| {
             if (slot.pending) |*request| request.deinit(gpa);
             if (slot.running) |*request| {
-                slot.cancel.request();
                 if (slot.future) |*future| future.await(io);
                 request.deinit(gpa);
                 slot.outcome.deinit(gpa, io);
@@ -225,11 +225,14 @@ fn catalogued(
 ) Error!Found {
     var listing = try listed;
     defer if (listing.ignored) |*ignored| ignored.deinit(gpa);
+    defer listing.repositories.deinit(gpa);
     errdefer gpa.free(listing.reason);
     errdefer gpa.free(listing.ignore_reason);
     const catalog: *match.Catalog = try .create(gpa, listing.paths, cancel);
     errdefer catalog.release(gpa);
-    if (listing.ignored) |*ignored| try catalog.classify(gpa, ignored, cancel);
+    if (listing.ignored) |*ignored| {
+        try catalog.classify(gpa, ignored, &listing.repositories, cancel);
+    }
     return .{
         .catalog = catalog,
         .partial = listing.partial,
