@@ -93,8 +93,11 @@ pub const Inventory = struct {
             kept += entry.len + 1;
             try ends.append(gpa, kept - 1);
         }
+        const offsets = try ends.toOwnedSlice(gpa);
+        errdefer gpa.free(offsets);
+        // Last: once `bytes` moves, the errdefer above would free a stale slice.
         const owned = if (kept == bytes.len) bytes else try gpa.realloc(bytes, kept);
-        return .{ .bytes = owned, .ends = try ends.toOwnedSlice(gpa) };
+        return .{ .bytes = owned, .ends = offsets };
     }
 };
 
@@ -285,17 +288,25 @@ fn runGit(
     input: ?[]const u8,
     cancel: *const Cancel,
 ) Error!Output {
-    var argv: [12][]const u8 = undefined;
-    argv[0..2].* = .{ "git", "--no-optional-locks" };
-    @memcpy(argv[2..][0..arguments.len], arguments);
+    // Git inherits Nib's blocked signals and passes them on. An fsmonitor
+    // daemon it started would leave the group, escape the kill and ignore
+    // TERM, so none is started.
+    const prefix = [_][]const u8{ "git", "--no-optional-locks", "-c", "core.fsmonitor=false" };
+    var argv: [prefix.len + 8][]const u8 = undefined;
+    argv[0..prefix.len].* = prefix;
+    @memcpy(argv[prefix.len..][0..arguments.len], arguments);
     var child = std.process.spawn(io, .{
-        .argv = argv[0 .. 2 + arguments.len],
+        .argv = argv[0 .. prefix.len + arguments.len],
         .cwd = .{ .dir = cwd },
         .stdin = if (input != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .pgid = 0,
     }) catch |err| return switch (err) {
+        // Zig 0.17's spawn returns an exec failure without reaping the child
+        // or closing its pipes, and never gives out the PID, so each failure
+        // leaves a zombie and two descriptors. Reaping with P_ALL would take
+        // other workers' helpers; without Git, nothing spawns Git again.
         error.FileNotFound => error.GitUnavailable,
         error.Canceled => error.Canceled,
         else => error.HelperFailed,
@@ -312,7 +323,10 @@ fn runGit(
         stdout.deinit(gpa);
         return error.HelperFailed;
     };
-    output.stdout = try stdout.toOwnedSlice(gpa);
+    output.stdout = stdout.toOwnedSlice(gpa) catch |err| {
+        stdout.deinit(gpa);
+        return err;
+    };
     return output;
 }
 
@@ -757,6 +771,24 @@ test "project listing is Git's tracked and unignored files with raw names" {
     try expectPaths(&.{"b"}, &narrowed.paths);
 }
 
+test "a Git listing that runs out of memory frees everything it held" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    var cancel: Cancel = try .init();
+    defer cancel.deinit();
+    var repo = try scratch.dir.openDir(testing.io, "repo", .{});
+    defer repo.close(testing.io);
+    const List = struct {
+        // Project drops the nested repository's marker, so its bytes shrink.
+        fn project(gpa: Allocator, root: Io.Dir, flag: *const Cancel) !void {
+            var listing = try listProject(gpa, testing.io, root, true, flag);
+            listing.deinit(gpa);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, List.project, .{ repo, &cancel });
+}
+
 test "the walk lists hidden and ignored files, skips .git and never follows directory links" {
     var scratch = try Scratch.init();
     defer scratch.deinit();
@@ -899,6 +931,33 @@ test "cancellation kills a helper that ignores TERM while its output is unread" 
     thread.join();
     try testing.expectError(error.Canceled, result);
     try expectGone(scratch.dir, "spin.pid");
+}
+
+test "Git never starts an fsmonitor daemon that would outlive the helper's group" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    try scratch.git(&.{ "-C", "repo", "config", "core.fsmonitor", "true" });
+    var cancel: Cancel = try .init();
+    defer cancel.deinit();
+    var buffer: [128]u8 = undefined;
+    const path = scratch.join(&buffer, "repo");
+    var root = try resolveRoot(testing.allocator, testing.io, .{ .directory = path }, &cancel);
+    defer root.deinit(testing.allocator, testing.io);
+    var project = try listProject(testing.allocator, testing.io, root.dir, true, &cancel);
+    project.deinit(testing.allocator);
+    var all = try listAll(testing.allocator, testing.io, root.dir, true, &cancel);
+    all.deinit(testing.allocator);
+    const daemon = [_][]const u8{ "git", "-C", path, "fsmonitor--daemon" };
+    const status = try std.process.run(testing.allocator, testing.io, .{ .argv = &(daemon ++ .{"status"}) });
+    testing.allocator.free(status.stdout);
+    testing.allocator.free(status.stderr);
+    if (status.term.success()) {
+        const stop = try std.process.run(testing.allocator, testing.io, .{ .argv = &(daemon ++ .{"stop"}) });
+        testing.allocator.free(stop.stdout);
+        testing.allocator.free(stop.stderr);
+        return error.DaemonStarted;
+    }
 }
 
 test "a finished helper's group is killed, so stragglers do not outlive it" {

@@ -377,7 +377,15 @@ const App = struct {
     fn choose(self: *App) void {
         const choice = self.finder.choice() orelse return;
         switch (choice) {
-            .document => |id| self.documents.activate(self.gpa, self.io, id, &self.editor),
+            .document => |id| {
+                // A close whose relisting ran out of memory leaves its row.
+                if (self.documents.get(id) == null) {
+                    self.find(self.finder.category);
+                    if (self.editor.notice.len == 0) self.editor.notice = "File no longer open";
+                    return;
+                }
+                self.documents.activate(self.gpa, self.io, id, &self.editor);
+            },
             .path => |path| {
                 // Only discovered listings offer paths, and they need the root.
                 const root = self.finder.root.?.dir;
@@ -984,6 +992,39 @@ test {
     _ = @import("finder.zig");
     _ = @import("match.zig");
     _ = @import("preview.zig");
+}
+
+test "Enter on an Open row whose file has closed relists rather than activating it" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "beta\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    const a = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    const b = try app.documents.open(testing.allocator, testing.io, temp.dir, "b", &app.editor);
+    app.find(.open);
+    try testing.expectEqual(b, finder.choice().?.document);
+    // As when relisting after the close runs out of memory.
+    try app.documents.close(testing.allocator, testing.io, b, false, &app.editor);
+    app.choose();
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expect(app.finding);
+    try testing.expectEqualStrings("File no longer open", app.editor.notice);
+    try testing.expectEqual(a, finder.choice().?.document);
+    try testing.expectEqual(@as(usize, 1), finder.matches.len);
 }
 
 test "save notices distinguish failure, uncertain publication and installed durability" {
