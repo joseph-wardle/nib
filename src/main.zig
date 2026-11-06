@@ -328,7 +328,6 @@ const App = struct {
         for (self.documents.entries.items, open) |*entry, *listed| listed.* = .{
             .id = entry.id,
             .path = entry.document.source.path,
-            .modified = entry.document.buffer.modified(),
             .used = entry.used,
         };
         self.finder.focus(self.gpa, self.io, self.background, category, open) catch {
@@ -417,11 +416,12 @@ const App = struct {
                     self.exit = 0;
                     return;
                 };
+                // Activating the next document may reload it and say so.
+                self.editor.notice = "";
                 self.documents.close(self.gpa, self.io, entry.id, discard, &self.editor) catch {
                     self.editor.notice = "Unsaved changes; use :q! to discard";
                     return;
                 };
-                self.editor.notice = "";
                 self.closed();
             },
             .quit_all => |discard| {
@@ -441,9 +441,19 @@ const App = struct {
             },
             .write_quit => {
                 if (self.documents.current() == null) return self.refuse();
+                self.editor.notice = "";
                 const closing = self.documents.saveAndClose(self.gpa, self.io, &self.editor, .{});
+                // Set only by activating the next document, which may reload it.
+                const activation = self.editor.notice;
                 self.saved(closing.report, false);
-                if (closing.closed) self.closed();
+                if (!closing.closed) return;
+                if (activation.len != 0) {
+                    const text = "{s}; {c}{s}";
+                    const first = std.ascii.toLower(activation[0]);
+                    const parts = .{ self.editor.notice, first, activation[1..] };
+                    self.editor.notice = std.fmt.bufPrint(&self.notice, text, parts) catch unreachable;
+                }
+                self.closed();
             },
             .reload => {
                 const entry = self.documents.current() orelse return self.refuse();
@@ -743,7 +753,8 @@ const App = struct {
         for (0..rows) |index| {
             if (index < page.len) {
                 const chosen = first + index == finder.selected;
-                try drawResult(frame, finder, page[index], chosen, marks, list_width);
+                const result = page[index];
+                try drawResult(frame, finder, &self.documents, result, chosen, marks, list_width);
             } else @memset(try frame.reserve(list_width), ' ');
             if (split) {
                 try frame.append("|");
@@ -782,21 +793,25 @@ const App = struct {
 
 /// One result row: selection, modified and unknown-status marks, then the
 /// label with matched bytes highlighted. Ignored files are dimmed, which
-/// never hides the selection, a highlight or a mark.
+/// never hides the selection, a highlight or a mark. Unsaved edits are read
+/// from the session, so the mark is current after any file command.
 fn drawResult(
     frame: *Frame,
     finder: *const Finder,
+    documents: *Session,
     result: match.Match,
     chosen: bool,
     marks: bool,
     width: usize,
 ) terminal.Error!void {
     const shown = finder.row(result);
+    const open = if (shown.document) |id| documents.get(id) else null;
+    const modified = if (open) |entry| entry.document.buffer.modified() else false;
     var positions: [match.max_query]usize = undefined;
     const lit = finder.highlight(result, &positions);
     var prefix = "    ".*;
     if (chosen) prefix[0] = '>';
-    if (shown.modified) prefix[1] = '+';
+    if (modified) prefix[1] = '+';
     if (marks and shown.ignore == .unknown) prefix[2] = '?';
     if (chosen) try frame.append("\x1b[7m");
     const lead = @min(prefix.len, width);
@@ -1060,4 +1075,75 @@ test "status lines show only printable ASCII and stop at the row's end" {
     line.put("\xffbcdef");
     try std.testing.expectEqualStrings("a?[2J?bc", &row);
     try std.testing.expectEqual(@as(usize, 0), line.left());
+}
+
+test "closing a file keeps the notice that the next file reloaded" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "beta\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    const a = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "b", &app.editor);
+    // Inactive a changes on disk; closing b activates and reloads it.
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "changed\n" });
+    app.fileAction(.{ .quit = false });
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqualStrings("changed\n", app.documents.current().?.document.buffer.bytes());
+    try testing.expectEqualStrings("Reloaded external changes; history cleared", app.editor.notice);
+    // `:wq` reports its save and the reload together.
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "b", &app.editor);
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "again\n" });
+    app.fileAction(.write_quit);
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqualStrings("again\n", app.documents.current().?.document.buffer.bytes());
+    const both = "Written; reloaded external changes; history cleared";
+    try testing.expectEqualStrings(both, app.editor.notice);
+    try testing.expect(app.exit == null);
+}
+
+test "the finder's unsaved mark follows a save made from the finder" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 10, .columns = 40 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    for ("iZ") |byte| app.editorEvent(.{ .key = byte });
+    app.editorEvent(.escape);
+    app.find(.open);
+    var frame: Frame = .{ .screen = undefined };
+    try app.drawResults(&frame, 1, 39);
+    try testing.expectEqualStrings(">+  ", frame.bytes[4..8]);
+    app.fileAction(.{ .write = "" });
+    try testing.expectEqualStrings("Written", app.editor.notice);
+    frame.len = 0;
+    try app.drawResults(&frame, 1, 39);
+    try testing.expectEqualStrings(">   ", frame.bytes[4..8]);
 }

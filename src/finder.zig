@@ -32,7 +32,6 @@ pub const OpenFile = struct {
     id: session.Id,
     /// Absolute spelling, as `Source` records it. Borrowed for the call.
     path: []const u8,
-    modified: bool,
     /// Activation order; larger is more recent.
     used: u64,
 };
@@ -49,8 +48,9 @@ pub const Row = struct {
     /// Borrowed until the finder next changes.
     label: []const u8,
     ignore: match.Ignore,
-    /// Set only for open documents with unsaved edits.
-    modified: bool,
+    /// The open document listed under this label, whose state the session
+    /// holds; null when the file is not open.
+    document: ?session.Id,
 };
 
 /// What one category last discovered.
@@ -85,7 +85,7 @@ pub const List = struct {
     }
 };
 
-pub const Document = struct { id: session.Id, modified: bool, used: u64 };
+pub const Document = struct { id: session.Id, used: u64 };
 
 /// What the preview pane shows for the selection.
 pub const Preview = union(enum) {
@@ -256,14 +256,14 @@ pub const Finder = struct {
     pub fn row(self: *const Finder, result: match.Match) Row {
         const catalog = self.shown.?;
         const entry = catalog.entries[result.index];
-        const modified = if (self.opened(entry.label)) |document| document.modified else false;
+        const document = if (self.opened(entry.label)) |open| open.id else null;
         // Open takes each file's status from All's latest listing.
         const ignore = if (self.category == .open) ignore: {
             const all = self.lists.get(.all).catalog orelse break :ignore .unknown;
             const index = all.find(entry.label) orelse break :ignore .unknown;
             break :ignore all.ignored[index];
         } else catalog.ignored[result.index];
-        return .{ .label = entry.label, .ignore = ignore, .modified = modified };
+        return .{ .label = entry.label, .ignore = ignore, .document = document };
     }
 
     /// Byte offsets of the label that match the current query, for
@@ -419,12 +419,7 @@ pub const Finder = struct {
         defer gpa.free(open);
         for (catalog.entries, open) |entry, *file| {
             const listed = list.documents[entry.origin];
-            file.* = .{
-                .id = listed.id,
-                .path = entry.path,
-                .modified = listed.modified,
-                .used = listed.used,
-            };
+            file.* = .{ .id = listed.id, .path = entry.path, .used = listed.used };
         }
         // `open` borrows the old catalog, which outlives the call.
         const kept = catalog.retain();
@@ -560,7 +555,7 @@ pub const Finder = struct {
             try bytes.appendSlice(gpa, path);
             end.* = bytes.items.len;
             try bytes.append(gpa, 0);
-            document.* = .{ .id = file.id, .modified = file.modified, .used = file.used };
+            document.* = .{ .id = file.id, .used = file.used };
         }
         const owned = try bytes.toOwnedSlice(gpa);
         ends_owned = false;
@@ -637,8 +632,8 @@ fn id(value: u64) session.Id {
     return @fromBackingInt(@intCast(value));
 }
 
-fn openFile(number: u64, path: []const u8, modified: bool, used: u64) OpenFile {
-    return .{ .id = id(number), .path = path, .modified = modified, .used = used };
+fn openFile(number: u64, path: []const u8, used: u64) OpenFile {
+    return .{ .id = id(number), .path = path, .used = used };
 }
 
 fn expectRows(finder: *const Finder, expected: []const []const u8) !void {
@@ -842,10 +837,10 @@ test "Open lists every open document, most recent first, with markers and ignore
     try begin(&finder, &background, &scratch, &buffer);
     var paths: [3][256]u8 = undefined;
     const open = [_]OpenFile{
-        openFile(1, scratch.join(&paths[0], "repo/src/main.zig"), true, 3),
-        openFile(2, scratch.join(&paths[1], "repo/debug.log"), false, 5),
-        openFile(3, "/elsewhere/x.txt", false, 1),
-        openFile(4, scratch.join(&paths[2], "repo/src/../README"), false, 2),
+        openFile(1, scratch.join(&paths[0], "repo/src/main.zig"), 3),
+        openFile(2, scratch.join(&paths[1], "repo/debug.log"), 5),
+        openFile(3, "/elsewhere/x.txt", 1),
+        openFile(4, scratch.join(&paths[2], "repo/src/../README"), 2),
     };
     try finder.focus(testing.allocator, testing.io, &background, .open, &open);
     // Open needs no discovery, so its rows are there at once. Ignore status
@@ -861,8 +856,8 @@ test "Open lists every open document, most recent first, with markers and ignore
     // Paths outside the root, or that might leave it, are not in All.
     try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, "/elsewhere/x.txt")).ignore);
     try testing.expectEqual(match.Ignore.unknown, (try rowOf(&finder, open[3].path)).ignore);
-    try testing.expect((try rowOf(&finder, "src/main.zig")).modified);
-    try testing.expect(!(try rowOf(&finder, "debug.log")).modified);
+    try testing.expectEqual(id(1), (try rowOf(&finder, "src/main.zig")).document.?);
+    try testing.expectEqual(id(2), (try rowOf(&finder, "debug.log")).document.?);
     // Searching Open needs no job. The scratch path has no `t` or `x` after
     // any `.`, so only one document matches whatever its random name.
     try finder.search(testing.allocator, testing.io, &background, ".txt");
@@ -872,7 +867,7 @@ test "Open lists every open document, most recent first, with markers and ignore
     // A path through a directory symlink is not in All, so stays unknown.
     var linked: [256]u8 = undefined;
     const refused = [_]OpenFile{
-        openFile(5, scratch.join(&linked, "repo/link/main.zig"), false, 6),
+        openFile(5, scratch.join(&linked, "repo/link/main.zig"), 6),
     };
     try finder.search(testing.allocator, testing.io, &background, "");
     try finder.focus(testing.allocator, testing.io, &background, .open, &refused);
@@ -927,7 +922,7 @@ test "a missing root is reported and nothing is discovered" {
 fn openFiles(storage: *[25][8]u8, files: *[25]OpenFile) void {
     for (storage, files, 0..) |*path, *file, index| {
         const spelled = std.fmt.bufPrint(path, "/p/f{d:0>2}", .{index}) catch unreachable;
-        file.* = openFile(index, spelled, false, index);
+        file.* = openFile(index, spelled, index);
     }
 }
 
@@ -1051,7 +1046,7 @@ test "an open file previews its document in every category, never its disk bytes
     defer background.deinit(testing.allocator, testing.io);
     var buffer: [256]u8 = undefined;
     var path: [256]u8 = undefined;
-    const open = [_]OpenFile{openFile(7, scratch.join(&path, "repo/README"), true, 1)};
+    const open = [_]OpenFile{openFile(7, scratch.join(&path, "repo/README"), 1)};
     const how: discovery.Start = .{ .directory = scratch.join(&buffer, "repo") };
     finder.start(testing.allocator, testing.io, &background, how);
     // Listed before the root arrives, the document is still recognised after.
@@ -1067,14 +1062,14 @@ test "an open file previews its document in every category, never its disk bytes
         try settle(&finder, &background);
         try testing.expectEqualStrings("README", selectedLabel(&finder));
         try testing.expectEqual(document, finder.preview());
-        try testing.expect((try rowOf(&finder, "README")).modified);
+        try testing.expectEqual(id(7), (try rowOf(&finder, "README")).document.?);
         try testing.expectEqual(@as(usize, 0), finder.previewed.items.len);
     }
     // Closed, it previews from disk again.
     try finder.focus(testing.allocator, testing.io, &background, .project, &.{});
     try settle(&finder, &background);
     try testing.expectEqualStrings("", try previewText(&finder));
-    try testing.expect(!(try rowOf(&finder, "README")).modified);
+    try testing.expectEqual(null, (try rowOf(&finder, "README")).document);
 }
 
 test "running out of memory shows the preview unavailable until the next look" {
@@ -1155,7 +1150,7 @@ test "a category change that runs out of memory never shows the old category's s
     defer background.deinit(testing.allocator, testing.io);
     var buffer: [256]u8 = undefined;
     try begin(&finder, &background, &scratch, &buffer);
-    const open = [_]OpenFile{openFile(1, "/elsewhere/x", false, 1)};
+    const open = [_]OpenFile{openFile(1, "/elsewhere/x", 1)};
     // Open starts no job, so only this thread uses the failing allocator.
     var index: usize = 0;
     while (true) : (index += 1) {
