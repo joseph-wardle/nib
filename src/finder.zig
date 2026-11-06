@@ -190,6 +190,9 @@ pub const Finder = struct {
             }
             self.clear(gpa);
             self.category = category;
+            // The old category's search must not report if listing fails.
+            background.cancel(gpa, .filter);
+            self.filtering = false;
         }
         try self.listOpen(gpa, background, open);
         if (category != .open) {
@@ -1140,4 +1143,39 @@ test "open paths are relative only when they stay beneath the root" {
     try testing.expectEqual(@as(?[]const u8, null), beneath("/r", "/r/"));
     try testing.expectEqual(@as(?[]const u8, null), beneath("/r", "/r/a/../../etc"));
     try testing.expectEqual(@as(?[]const u8, null), beneath("/r", "/r/./a"));
+}
+
+test "a category change that runs out of memory never shows the old category's search" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    try repository(&scratch);
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    var buffer: [256]u8 = undefined;
+    try begin(&finder, &background, &scratch, &buffer);
+    const open = [_]OpenFile{openFile(1, "/elsewhere/x", false, 1)};
+    // Open starts no job, so only this thread uses the failing allocator.
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        try finder.focus(testing.allocator, testing.io, &background, .project, &open);
+        try settle(&finder, &background);
+        // Matches Project's README and the open file alike.
+        try finder.search(testing.allocator, testing.io, &background, "e");
+        try testing.expect(finder.filtering);
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = index });
+        const focused = finder.focus(failing.allocator(), testing.io, &background, .open, &open);
+        try settle(&finder, &background);
+        // Failing early keeps Project; once switched, no Project row shows.
+        if (finder.category == .open) {
+            try testing.expect(!finder.filtering);
+            for (finder.matches) |result| {
+                try testing.expectEqualStrings("/elsewhere/x", finder.row(result).label);
+            }
+        } else try testing.expectEqual(Category.project, finder.category);
+        if (focused) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(index > 1);
+    try expectRows(&finder, &.{"/elsewhere/x"});
 }
