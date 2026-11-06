@@ -27,14 +27,16 @@ pub const Events = struct {
     }
 };
 
-/// Terminal framing only. Recognized sequences never time out into key events.
-/// Paste is streamed, including hostile bytes; its consumer owns validation and
-/// atomic collection. Only an unrecognized, lone ESC has a deadline.
+/// Terminal framing only. CSI and SS3 are the only sequences recognized: Nib
+/// sends no queries, so terminals send nothing else, and Escape followed by
+/// any other byte is that key. Recognized sequences never time out into key
+/// events, but a control byte ends them and arrives as a key, so Ctrl-C always
+/// gets through. Paste is streamed, including hostile bytes; its consumer owns
+/// validation and atomic collection. Only an ESC has a deadline.
 pub const Decoder = struct {
-    state: enum { ground, escape, intermediate, ss3, csi, string, string_escape, paste } = .ground,
+    state: enum { ground, escape, ss3, csi, paste } = .ground,
     deadline: ?i64 = null,
     paste_end: usize = 0,
-    string_bell: bool = false,
     parameter: usize = 0,
     plain_parameter: bool = true,
     digits: bool = false,
@@ -52,12 +54,8 @@ pub const Decoder = struct {
     pub fn feed(self: *Decoder, byte: u8, now: i64) Events {
         var events = self.expire(now);
         switch (self.state) {
-            .ground => if (byte == 0x1b) {
-                self.state = .escape;
-                self.deadline = now + escape_ms;
-            } else events.add(.{ .key = byte }),
+            .ground => if (byte == 0x1b) self.escape(now) else events.add(.{ .key = byte }),
             .escape => {
-                const lone = self.deadline != null;
                 self.deadline = null;
                 switch (byte) {
                     '[' => {
@@ -67,48 +65,35 @@ pub const Decoder = struct {
                         self.digits = false;
                         events.add(.ignored);
                     },
-                    ']', 'P', 'X', '^', '_' => {
-                        self.state = .string;
-                        self.string_bell = byte == ']';
-                        events.add(.ignored);
-                    },
                     'O' => {
                         self.state = .ss3;
                         events.add(.ignored);
                     },
-                    0x20...0x2f => {
-                        self.state = .intermediate;
-                        events.add(.ignored);
-                    },
                     0x1b => {
-                        if (lone) {
-                            events.add(.escape);
-                            self.deadline = now + escape_ms;
-                        }
+                        events.add(.escape);
+                        self.escape(now);
                     },
                     else => {
                         self.state = .ground;
-                        if (lone) {
-                            events.add(.escape);
-                            events.add(.{ .key = byte });
-                        }
+                        events.add(.escape);
+                        events.add(.{ .key = byte });
                     },
                 }
             },
-            .intermediate => {
-                if (byte == 0x1b) self.state = .escape else if (byte >= 0x30 and byte <= 0x7e) self.state = .ground;
-            },
             .ss3 => {
-                if (byte == 0x1b) self.state = .escape else if (byte >= 0x30 and byte <= 0x7e) {
+                if (byte == 0x1b) self.escape(now) else if (control(byte)) {
+                    self.state = .ground;
+                    events.add(.{ .key = byte });
+                } else if (byte >= 0x30 and byte <= 0x7e) {
                     self.state = .ground;
                     if (arrow(byte)) |direction| events.add(.{ .arrow = direction });
                 }
             },
             .csi => {
-                if (byte == 0x1b) {
-                    // An ESC inside a recognized sequence starts another
-                    // shielded sequence, never a timed standalone key.
-                    self.state = .escape;
+                // Terminals send whole sequences, so a person typed this ESC.
+                if (byte == 0x1b) self.escape(now) else if (control(byte)) {
+                    self.state = .ground;
+                    events.add(.{ .key = byte });
                 } else if (byte >= 0x40 and byte <= 0x7e) {
                     self.state = if (byte == '~' and self.plain_parameter and self.parameter == 200) .paste else .ground;
                     self.paste_end = 0;
@@ -119,12 +104,6 @@ pub const Decoder = struct {
                     self.digits = true;
                     self.parameter = @min(1000, self.parameter * 10 + byte - '0');
                 } else self.plain_parameter = false;
-            },
-            .string => {
-                if (byte == 0x07 and self.string_bell) self.state = .ground else if (byte == 0x1b) self.state = .string_escape;
-            },
-            .string_escape => {
-                self.state = if (byte == '\\') .ground else if (byte == 0x1b) .string_escape else .string;
             },
             .paste => {
                 const end = "\x1b[201~";
@@ -144,7 +123,17 @@ pub const Decoder = struct {
         }
         return events;
     }
+
+    fn escape(self: *Decoder, now: i64) void {
+        self.state = .escape;
+        self.deadline = now + escape_ms;
+    }
 };
+
+/// Terminals never put these inside an input sequence; a person typed them.
+fn control(byte: u8) bool {
+    return (byte < 0x20 and byte != 0x1b) or byte == 0x7f;
+}
 
 fn arrow(final: u8) ?Arrow {
     return switch (final) {
@@ -174,7 +163,7 @@ test "only lone Escape expires; unambiguous rapid commands survive" {
 }
 
 test "recognized sequences retain framing across arbitrary delays" {
-    for ([_][]const u8{ "\x1b[A", "\x1bOq", "\x1b[9999999999999q", "\x1b]qhjkl\x07", "\x1bPq\x07hjkl\x1b\\", "\x1bXqhjkl\x1b\\", "\x1b^qhjkl\x1b\\", "\x1b(B", "\x1b[123\x1b]qhjkl\x07", "\x1bO\x1bPqhjkl\x1b\\" }) |sequence| {
+    for ([_][]const u8{ "\x1b[A", "\x1bOq", "\x1b[9999999999999q", "\x1b[?2004;1$y", "\x1b[1;5A" }) |sequence| {
         var decoder: Decoder = .{};
         for (sequence, 0..) |byte, index| {
             // Prefix arrives promptly; recognized payload may be arbitrarily late.
@@ -238,4 +227,35 @@ test "bare cursor keys decode as arrows in CSI and SS3 form; modified ones stay 
         try std.testing.expectEqual(case.arrow, found);
         try std.testing.expectEqualDeep(Event{ .key = 'j' }, decoder.feed('j', 0).items[0]);
     }
+}
+
+test "Escape before any byte but [ or O is that key, and control bytes end sequences" {
+    // Konsole sends Alt+key as Escape and the key; none of these may capture
+    // what follows.
+    for ("]PX^_ /(\\") |second| {
+        var decoder: Decoder = .{};
+        _ = decoder.feed(0x1b, 0);
+        const events = decoder.feed(second, 10);
+        try std.testing.expectEqual(@as(usize, 2), events.len);
+        try std.testing.expectEqualDeep(Event.escape, events.items[0]);
+        try std.testing.expectEqualDeep(Event{ .key = second }, events.items[1]);
+        for ("hj\x03:q\r", 0..) |byte, index| {
+            const later = decoder.feed(byte, @intCast(1000 + index * 1000));
+            try std.testing.expectEqual(@as(usize, 1), later.len);
+            try std.testing.expectEqualDeep(Event{ .key = byte }, later.items[0]);
+        }
+    }
+    // An unfinished CSI or SS3 never swallows a control key, and an Escape
+    // typed inside one is a lone Escape.
+    for ([_][]const u8{ "\x1b[", "\x1b[12;", "\x1bO" }) |prefix| for ("\x03\r\x7f") |key| {
+        var decoder: Decoder = .{};
+        for (prefix) |byte| _ = decoder.feed(byte, 0);
+        const events = decoder.feed(key, 5000);
+        try std.testing.expectEqual(@as(usize, 1), events.len);
+        try std.testing.expectEqualDeep(Event{ .key = key }, events.items[0]);
+        try std.testing.expectEqualDeep(Event{ .key = 'j' }, decoder.feed('j', 5001).items[0]);
+        for (prefix) |byte| _ = decoder.feed(byte, 6000);
+        try std.testing.expectEqual(@as(usize, 0), decoder.feed(0x1b, 6001).len);
+        try std.testing.expectEqualDeep(Event.escape, decoder.expire(6101).items[0]);
+    };
 }

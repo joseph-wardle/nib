@@ -104,7 +104,8 @@ pub const Source = struct {
     }
 
     /// Whether this path currently resolves to the file `version` identifies.
-    /// A path that reaches no file names nothing; other failures are returned
+    /// A path that reaches no file it can resolve (missing, a special file,
+    /// denied, looping or too long) names nothing; other failures are returned
     /// because the answer is unknown.
     pub fn names(self: *const Source, version: linux.Statx) Error!bool {
         const current = resolve(self.path) catch |err| return switch (err) {

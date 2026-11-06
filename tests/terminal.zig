@@ -523,8 +523,8 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.send("2j3l");
     try process.until("3:4 | ");
     try process.until("\x1b[0m");
-    // Fragmented CSI, SS3, OSC, DCS and pasted commands are ignored.
-    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b]qhjkl", "\x07", "\x1bPq", "\x1b\\", "\x1b[200~qhjkl\x1b[201~" }) |part| {
+    // Fragmented CSI, SS3 and pasted commands are ignored.
+    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b[200~qhjkl\x1b[201~" }) |part| {
         try process.send(part);
         try equal(@as(usize, 0), try process.read(20));
     }
@@ -762,8 +762,8 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until("2:1 | ");
     try process.ready();
     // Recognized prefixes have no lone-Escape deadline. A payload arriving
-    // later than 100 ms stays shielded, including commands that could quit.
-    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b^", ":q!\r\x1b\\" }, .{ "\x1b[", "999q" } }) |parts| {
+    // later than 100 ms stays shielded.
+    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b[", "999q" } }) |parts| {
         try process.send(parts[0]);
         try equal(@as(usize, 0), try process.read(150));
         try process.send(parts[1]);
@@ -783,7 +783,11 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.send("2d3w");
     try process.until("NORMAL [+]");
     try process.ready();
-    try process.send(":qa!\r");
+    // Ctrl-C ends an unfinished sequence, and Escape then `]` (Alt+] in
+    // Konsole) is two keys, so the quit command still gets through.
+    try process.send("\x1b[");
+    try equal(@as(usize, 0), try process.read(150));
+    try process.send("\x03\x1b]:qa!\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();

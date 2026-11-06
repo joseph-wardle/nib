@@ -318,11 +318,11 @@ test "decoder precedence and cancellation compose with insert and pending comman
     var parser: Parser = .{};
     var decoder: input.Decoder = .{};
     _ = keys(&parser, "i");
-    for ("\x1bOA\x1b^:q!\r\x1b\\") |byte| {
+    for ("\x1bOA\x1b[1;5A") |byte| {
         const events = decoder.feed(byte, 0);
         for (events.items[0..events.len]) |event| try std.testing.expect(parser.feed(event) == null);
     }
-    // Ambiguous rapid O/^ prefixes stay terminal sequences, even in insert.
+    // Ambiguous rapid O/[ prefixes stay terminal sequences, even in insert.
     try std.testing.expectEqual(Mode.insert, parser.mode);
     _ = decoder.feed(0x1b, 1000);
     const escaped = decoder.expire(1100);

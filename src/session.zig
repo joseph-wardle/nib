@@ -441,3 +441,38 @@ fn allocationWorkflow(allocator: Allocator, dir: std.Io.Dir) !void {
 fn armed(session: *Session) error{OutOfMemory}!void {
     if (session.current().?.disk.watch.degraded) return error.OutOfMemory;
 }
+
+test "an open path that no longer reaches a file never blocks opening another" {
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try put(temp.dir, "A", "alpha");
+    try put(temp.dir, "B", "beta");
+    try temp.dir.symLink(testing.io, "A", "L", .{});
+    try temp.dir.createDir(testing.io, "locked", .default_dir);
+    try temp.dir.symLink(testing.io, "../B", "locked/M", .{});
+    var editor: Editor = .{};
+    defer editor.deinit(testing.allocator);
+    var session: Session = .{};
+    defer session.deinit(testing.allocator);
+    const l = try session.open(testing.allocator, testing.io, temp.dir, "L", &editor);
+    keys(&session, &editor, "iZ\x03");
+    // L now loops: it names nothing, so A opens as its own document.
+    try temp.dir.deleteFile(testing.io, "L");
+    try temp.dir.symLink(testing.io, "L", "L", .{});
+    const a = try session.open(testing.allocator, testing.io, temp.dir, "A", &editor);
+    try testing.expect(a != l);
+    try testing.expectEqualStrings("alpha", session.get(a).?.document.buffer.bytes());
+    try testing.expectEqualStrings("Zalpha", session.get(l).?.document.buffer.bytes());
+    // Behind a directory it may not search, M names nothing either.
+    if (linux.geteuid() == 0) return;
+    const m = try session.open(testing.allocator, testing.io, temp.dir, "locked/M", &editor);
+    const locked = linux.openat(temp.dir.handle, "locked", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(locked));
+    const fd: std.posix.fd_t = @intCast(locked);
+    defer _ = linux.close(fd);
+    defer _ = linux.fchmod(fd, 0o700);
+    try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(linux.fchmod(fd, 0)));
+    const b = try session.open(testing.allocator, testing.io, temp.dir, "B", &editor);
+    try testing.expect(b != m and b != a and b != l);
+    try testing.expectEqual(@as(usize, 4), session.entries.items.len);
+}
