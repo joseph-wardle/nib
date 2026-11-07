@@ -737,7 +737,7 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until("Ctrl-P files");
     try process.ready();
     try process.send(":e!\r");
-    try process.until("Reloaded; local edits and history discarded");
+    try process.until("; local edits and history discarded");
     try process.ready();
     try process.send("\x03d");
     try process.until("OPERATOR pending");
@@ -1016,7 +1016,7 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.ready();
     try process.send(":e!\r");
     try process.until("outside");
-    try process.until("Reloaded; local edits and history discarded");
+    try process.until("; local edits and history discarded");
     try process.ready();
     try process.send("u");
     try process.until("No more history");
@@ -1027,7 +1027,7 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.until("SOURCE MISSING");
     try process.ready();
     try process.send(":e!\r");
-    try process.until("Reload failed; local state retained");
+    try process.until(" failed; local state retained");
     try process.ready();
     try process.send(":w\r");
     try process.until("save refused");
@@ -1282,11 +1282,11 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.until("Unsaved changes in 1 file: alpha.txt; :qa! discards them");
     try process.ready();
     try process.send(":q\r");
-    try process.until("Unsaved changes; use :q! to discard");
+    try process.until("Unsaved changes in alpha.txt; use :q! to discard");
     try process.ready();
     try process.send(":q!\r");
     try process.until("Bbeta");
-    try process.until("NORMAL | 1:1 | ");
+    try process.until("Discarded edits and closed alpha.txt");
     try process.ready();
     // From the list, q returns to the file; the query was kept.
     try process.send("\x10");
