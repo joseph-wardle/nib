@@ -2,7 +2,7 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
 const Range = @import("buffer.zig").Range;
-const cellWidth = @import("buffer.zig").cellWidth;
+const char = @import("char.zig");
 
 pub const Motion = enum { left, down, up, right, start, first, end, word, back, word_end, first_line, last_line };
 pub const Operator = enum { delete, change };
@@ -12,19 +12,31 @@ pub const Goal = ?usize;
 pub const Result = struct { destination: usize, shape: Shape, goal: Goal };
 pub const Selection = struct { range: Range, linewise: bool };
 
+/// Display cells from the line start to a character boundary `offset`.
 pub fn column(buffer: *const Buffer, offset: usize) usize {
+    const bytes = buffer.bytes();
+    var position = buffer.starts.items[buffer.rowAt(offset)];
     var result: usize = 0;
-    for (buffer.bytes()[buffer.starts.items[buffer.rowAt(offset)]..offset]) |byte| result += cellWidth(byte, result);
+    while (position < offset) {
+        const character = measure(bytes, position, result);
+        result += character.cells;
+        position += character.len;
+    }
     return result;
 }
 
+/// The normal-mode position for any offset: clamped to its line's last
+/// character, then moved back to the start of the character containing it.
 pub fn normal(buffer: *const Buffer, offset: usize) usize {
-    const row = @min(buffer.rowAt(@min(offset, buffer.bytes().len)), buffer.lineCount() - 1);
-    return @min(offset, last(buffer, row));
+    const clamped = @min(offset, buffer.bytes().len);
+    const row = @min(buffer.rowAt(clamped), buffer.lineCount() - 1);
+    return char.start(buffer.bytes(), @min(clamped, last(buffer, row)));
 }
 
 fn last(buffer: *const Buffer, row: usize) usize {
-    return buffer.starts.items[row] + (buffer.line(row).len -| 1);
+    const start = buffer.starts.items[row];
+    const end = start + buffer.line(row).len;
+    return if (end == start) start else char.previous(buffer.bytes(), end);
 }
 
 fn first(buffer: *const Buffer, row: usize) usize {
@@ -35,49 +47,75 @@ fn first(buffer: *const Buffer, row: usize) usize {
     return last(buffer, row);
 }
 
-/// A normal cursor on a tab occupies its final display cell, as in Vim.
-/// No virtual positions inside the tab are introduced.
-pub fn screenColumn(buffer: *const Buffer, offset: usize, insert: bool) usize {
+/// The display cells a cursor covers, from `column`.
+pub const Cells = struct { column: usize, width: usize };
+
+/// A normal cursor on a tab occupies its final display cell, as in Vim, and on
+/// a wide character both of its cells. An insert cursor, or one at a line end,
+/// is one cell. No virtual positions inside a character are introduced.
+pub fn screenCells(buffer: *const Buffer, offset: usize, insert: bool) Cells {
     const start = column(buffer, offset);
     const row = buffer.rowAt(offset);
-    if (!insert and offset < buffer.starts.items[row] + buffer.line(row).len)
-        return start + cellWidth(buffer.bytes()[offset], start) - 1;
-    return start;
+    const end = buffer.starts.items[row] + buffer.line(row).len;
+    if (insert or offset == end) return .{ .column = start, .width = 1 };
+    const code = char.decode(buffer.bytes(), offset).code;
+    const width = char.cells(code, start);
+    if (code != null and code.? == '\t') return .{ .column = start + width - 1, .width = 1 };
+    return .{ .column = start, .width = width };
 }
 
+pub fn screenColumn(buffer: *const Buffer, offset: usize, insert: bool) usize {
+    return screenCells(buffer, offset, insert).column;
+}
+
+/// The character covering display cell `goal`, so a goal inside a wide
+/// character or a tab selects it.
 fn atColumn(buffer: *const Buffer, row: usize, goal: Goal) usize {
-    if (goal == null) return last(buffer, row);
+    const target = goal orelse return last(buffer, row);
+    const bytes = buffer.bytes();
+    const end = buffer.starts.items[row] + buffer.line(row).len;
+    var position = buffer.starts.items[row];
     var col: usize = 0;
-    const start = buffer.starts.items[row];
-    for (buffer.line(row), 0..) |byte, index| {
-        const width = cellWidth(byte, col);
-        if (col + width > goal.?) return start + index;
-        col += width;
+    while (position < end) {
+        const character = measure(bytes, position, col);
+        col += character.cells;
+        if (col > target) return position;
+        position += character.len;
     }
     return last(buffer, row);
 }
 
+// The cells and length of a line's character at `position`, starting at
+// display column `col`. ASCII, most text, skips decoding.
+fn measure(bytes: []const u8, position: usize, col: usize) struct { cells: usize, len: usize } {
+    const byte = bytes[position];
+    if (byte < 0x80) return .{ .cells = char.cells(byte, col), .len = 1 };
+    const character = char.decode(bytes, position);
+    return .{ .cells = char.cells(character.code, col), .len = character.len };
+}
+
 fn next(buffer: *const Buffer, offset: usize) usize {
-    if (offset == buffer.bytes().len) return offset;
-    return offset + if (buffer.bytes()[offset] == '\r' and offset + 1 < buffer.bytes().len and buffer.bytes()[offset + 1] == '\n') @as(usize, 2) else 1;
+    return char.next(buffer.bytes(), offset);
 }
 
 fn previous(buffer: *const Buffer, offset: usize) usize {
-    if (offset == 0) return 0;
-    return offset - if (offset >= 2 and std.mem.eql(u8, buffer.bytes()[offset - 2 .. offset], "\r\n")) @as(usize, 2) else 1;
+    return char.previous(buffer.bytes(), offset);
 }
 
 const Class = enum { blank, keyword, punctuation, empty };
 fn class(buffer: *const Buffer, offset: usize) Class {
-    if (offset == buffer.bytes().len) return .blank;
-    const byte = buffer.bytes()[offset];
-    if (byte == '\n' or (byte == '\r' and offset + 1 < buffer.bytes().len and buffer.bytes()[offset + 1] == '\n')) {
-        if (offset == 0 or buffer.bytes()[offset - 1] == '\n') return .empty;
+    const bytes = buffer.bytes();
+    if (offset == bytes.len) return .blank;
+    const byte = bytes[offset];
+    if (byte == '\n' or (byte == '\r' and offset + 1 < bytes.len and bytes[offset + 1] == '\n')) {
+        if (offset == 0 or bytes[offset - 1] == '\n') return .empty;
         return .blank;
     }
-    if (byte == ' ' or byte == '\t') return .blank;
-    if (std.ascii.isAlphanumeric(byte) or byte == '_') return .keyword;
-    return .punctuation;
+    return switch (char.class(char.decode(bytes, offset).code)) {
+        .blank => .blank,
+        .punctuation => .punctuation,
+        .keyword => .keyword,
+    };
 }
 
 fn word(buffer: *const Buffer, offset: usize, motion: Motion) usize {
@@ -118,8 +156,20 @@ pub fn resolve(buffer: *const Buffer, goal: Goal, motion: Motion, count: ?usize,
     var shape: Shape = .exclusive;
     var new_goal = goal;
     switch (motion) {
-        .left => destination = origin - @min(amount, origin - start),
-        .right => destination = @min(origin +| amount, start + buffer.line(row).len - @intFromBool(operator == null and buffer.line(row).len != 0)),
+        // Steps stop at the line's edges, so huge counts cost one line.
+        .left => {
+            var remaining = amount;
+            while (remaining != 0 and destination > start) : (remaining -= 1) {
+                destination = previous(buffer, destination);
+            }
+        },
+        .right => {
+            const limit = if (operator == null) last(buffer, row) else start + buffer.line(row).len;
+            var remaining = amount;
+            while (remaining != 0 and destination < limit) : (remaining -= 1) {
+                destination = next(buffer, destination);
+            }
+        },
         .start => destination = start,
         .first => destination = first(buffer, row),
         .end => {
@@ -358,4 +408,111 @@ test "empty documents have one normal position and no characterwise edit range" 
             }
         }
     }
+}
+
+test "horizontal steps, line ends and display columns count characters, not bytes" {
+    // a, é (2 bytes), 材 (3 bytes, two cells), U+0301 (a placeholder), b.
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "a\xc3\xa9\xe6\x9d\x90\xcc\x81b\r\nz");
+    defer buffer.deinit(std.testing.allocator);
+    const boundaries = [_]usize{ 0, 1, 3, 6, 8 };
+    const columns = [_]usize{ 0, 1, 2, 4, 5 };
+    for (boundaries[0 .. boundaries.len - 1], boundaries[1..]) |from, to| {
+        buffer.cursor = from;
+        try expect(to, resolve(&buffer, 0, .right, null, null).?.destination);
+        buffer.cursor = to;
+        try expect(from, resolve(&buffer, 0, .left, null, null).?.destination);
+    }
+    for (boundaries, columns) |offset, expected| try expect(expected, column(&buffer, offset));
+    const wide = screenCells(&buffer, 3, false);
+    try std.testing.expectEqualDeep(Cells{ .column = 2, .width = 2 }, wide);
+    const insert = screenCells(&buffer, 3, true);
+    try std.testing.expectEqualDeep(Cells{ .column = 2, .width = 1 }, insert);
+    buffer.cursor = 0;
+    const many = std.math.maxInt(usize);
+    try expect(@as(usize, 8), resolve(&buffer, 0, .right, many, null).?.destination);
+    try expect(@as(usize, 9), resolve(&buffer, 0, .right, many, .delete).?.destination);
+    try expect(@as(usize, 8), resolve(&buffer, 0, .end, null, null).?.destination);
+    buffer.cursor = 8;
+    try expect(@as(usize, 3), resolve(&buffer, 0, .left, 2, null).?.destination);
+    try std.testing.expect(resolve(&buffer, 0, .right, null, null) == null);
+    // Offsets inside a sequence, a CRLF or past the end, and where they land.
+    const inside = [_][2]usize{
+        .{ 2, 1 }, .{ 4, 3 }, .{ 5, 3 }, .{ 7, 6 }, .{ 9, 8 }, .{ 10, 8 }, .{ 12, 11 },
+    };
+    for (inside) |pair| {
+        try expect(pair[1], normal(&buffer, pair[0]));
+    }
+}
+
+test "vertical goals count display cells and select the wide character they land in" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "\xe6\x9d\x90\xe6\x96\x99x\nabcde\n");
+    defer buffer.deinit(std.testing.allocator);
+    for ([_][2]usize{ .{ 9, 0 }, .{ 10, 3 }, .{ 11, 3 }, .{ 12, 6 } }) |pair| {
+        buffer.cursor = pair[0];
+        const goal = screenColumn(&buffer, pair[0], false);
+        try expect(pair[1], resolve(&buffer, goal, .up, null, null).?.destination);
+    }
+    buffer.cursor = 3;
+    const result = resolve(&buffer, 0, .right, null, null).?;
+    try expect(@as(Goal, 4), result.goal);
+    buffer.cursor = 3;
+    const down = resolve(&buffer, screenColumn(&buffer, 3, false), .down, null, null).?;
+    try expect(@as(usize, 10), down.destination);
+}
+
+test "word motions and operators step whole characters with Unicode classes" {
+    // foo — bar naïve 材料abc ✅ok: the dash and the emoji are punctuation.
+    const text = "foo\xe2\x80\x94bar na\xc3\xafve \xe6\x9d\x90\xe6\x96\x99abc \xe2\x9c\x85ok";
+    var buffer = try Buffer.fromBytes(std.testing.allocator, text);
+    defer buffer.deinit(std.testing.allocator);
+    const steps = [_]struct { motion: Motion, from: usize, to: usize }{
+        .{ .motion = .word, .from = 0, .to = 3 },
+        .{ .motion = .word, .from = 3, .to = 6 },
+        .{ .motion = .word, .from = 6, .to = 10 },
+        .{ .motion = .word, .from = 10, .to = 17 },
+        .{ .motion = .word, .from = 17, .to = 27 },
+        .{ .motion = .word, .from = 27, .to = 30 },
+        .{ .motion = .back, .from = 30, .to = 27 },
+        .{ .motion = .back, .from = 27, .to = 17 },
+        .{ .motion = .back, .from = 6, .to = 3 },
+        .{ .motion = .word_end, .from = 0, .to = 2 },
+        .{ .motion = .word_end, .from = 2, .to = 3 },
+        .{ .motion = .word_end, .from = 10, .to = 15 },
+        .{ .motion = .word_end, .from = 16, .to = 25 },
+        .{ .motion = .word_end, .from = 25, .to = 27 },
+    };
+    for (steps) |step| {
+        buffer.cursor = step.from;
+        try expect(step.to, resolve(&buffer, 0, step.motion, null, null).?.destination);
+    }
+    const Case = struct { cursor: usize, motion: Motion, operator: Operator, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .cursor = 3, .motion = .word, .operator = .delete, .expected = "\xe2\x80\x94" },
+        .{ .cursor = 10, .motion = .word, .operator = .change, .expected = "na\xc3\xafve" },
+        .{ .cursor = 10, .motion = .word_end, .operator = .delete, .expected = "na\xc3\xafve" },
+        .{ .cursor = 17, .motion = .right, .operator = .delete, .expected = "\xe6\x9d\x90" },
+        .{ .cursor = 27, .motion = .left, .operator = .delete, .expected = " " },
+        .{ .cursor = 30, .motion = .back, .operator = .delete, .expected = "\xe2\x9c\x85" },
+        .{ .cursor = 27, .motion = .end, .operator = .delete, .expected = "\xe2\x9c\x85ok" },
+    };
+    for (cases) |case| {
+        buffer.cursor = case.cursor;
+        const result = resolve(&buffer, 0, case.motion, null, case.operator).?;
+        const range = operatorRange(&buffer, result, case.operator).range;
+        try std.testing.expectEqualStrings(case.expected, buffer.bytes()[range.start..range.end]);
+    }
+}
+
+test "read-only invalid bytes step and occupy one cell each" {
+    // A lone continuation byte and a truncated sequence are single characters.
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "a\x80\xc3\xa9\xe2\x82");
+    defer buffer.deinit(std.testing.allocator);
+    var destinations: [5]usize = undefined;
+    for (&destinations) |*destination| {
+        destination.* = buffer.cursor;
+        if (resolve(&buffer, 0, .right, null, null)) |result| buffer.cursor = result.destination;
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 4, 5 }, &destinations);
+    try expect(@as(usize, 4), column(&buffer, 5));
+    try expect(@as(usize, 5), resolve(&buffer, 0, .end, null, null).?.destination);
 }

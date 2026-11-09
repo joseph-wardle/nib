@@ -71,6 +71,15 @@ pub fn width(code: u21) ?u2 {
     return range.width;
 }
 
+/// Display cells for a character of a line starting at `column`: a tab stops
+/// every eight columns, and a placeholder (null `code` or no known width) is
+/// one cell. Line terminators are not characters of a line.
+pub fn cells(code: ?u21, column: usize) usize {
+    const value = code orelse return 1;
+    if (value == '\t') return 8 - column % 8;
+    return width(value) orelse 1;
+}
+
 /// Non-ASCII characters outside the allowlist, and invalid bytes, are keyword
 /// characters, as in Vim.
 pub fn class(code: ?u21) Class {
@@ -587,4 +596,15 @@ test "word classes follow Vim's broad split" {
         .{ .code = 0x2705, .class = .punctuation },
     };
     for (cases) |case| try testing.expectEqual(case.class, class(case.code));
+}
+
+test "cells expand tabs to the next stop and give placeholders one cell" {
+    try testing.expectEqual(@as(usize, 8), cells('\t', 0));
+    try testing.expectEqual(@as(usize, 1), cells('\t', 7));
+    try testing.expectEqual(@as(usize, 8), cells('\t', 16));
+    try testing.expectEqual(@as(usize, 1), cells('a', 3));
+    try testing.expectEqual(@as(usize, 2), cells(0x6599, 3));
+    try testing.expectEqual(@as(usize, 1), cells(0x0301, 3));
+    try testing.expectEqual(@as(usize, 1), cells('\r', 3));
+    try testing.expectEqual(@as(usize, 1), cells(null, 3));
 }

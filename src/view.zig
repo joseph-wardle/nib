@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const Buffer = @import("buffer.zig").Buffer;
-const cellWidth = @import("buffer.zig").cellWidth;
-const motion = @import("motion.zig");
+// Public for the motion benchmark, which reaches Nib through this module.
+pub const Buffer = @import("buffer.zig").Buffer;
+pub const motion = @import("motion.zig");
+const char = @import("char.zig");
 
 /// Logical rows and display columns; the caller reserves terminal margins/status.
 pub const Viewport = struct {
@@ -12,10 +13,17 @@ pub const Viewport = struct {
     pub fn follow(self: *Viewport, buffer: *const Buffer, rows: usize, columns: usize, insert: bool) void {
         const count = if (insert) buffer.insertionRows() else buffer.lineCount();
         const row = @min(buffer.rowAt(buffer.cursor), count - 1);
-        const col = motion.screenColumn(buffer, buffer.cursor, insert);
+        const cells = motion.screenCells(buffer, buffer.cursor, insert);
         self.top = @min(self.top, count -| @max(rows, 1));
         if (row < self.top) self.top = row else if (row - self.top >= @max(rows, 1)) self.top = row - (@max(rows, 1) - 1);
-        if (col < self.left) self.left = col else if (col - self.left >= @max(columns, 1)) self.left = col - (@max(columns, 1) - 1);
+        // The whole cursor character is shown, or only its first cell when it
+        // is wider than the view.
+        const visible = @max(columns, 1);
+        if (cells.column < self.left) {
+            self.left = cells.column;
+        } else if (cells.column + cells.width - self.left > visible) {
+            self.left = @min(cells.column, cells.column + cells.width - visible);
+        }
     }
 
     /// null when no content cell exists, including a one-row terminal. Returned
@@ -45,7 +53,7 @@ pub fn renderText(text: []const u8, left: usize, output: []u8) void {
     if (output.len == 0) return;
     var column: usize = 0;
     for (text) |byte| {
-        const width = cellWidth(byte, column);
+        const width = char.cells(if (byte < 0x80) byte else null, column);
         const skipped = left -| column;
         const offset = column -| left;
         if (offset >= output.len) break;
@@ -164,4 +172,23 @@ test "every clipping boundary agrees with a fully expanded line" {
             }
         }
     }
+}
+
+test "following keeps a whole wide cursor character visible, or its first cell" {
+    // 材 covers cells 2 and 3.
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "ab\xe6\x9d\x90c");
+    defer buffer.deinit(std.testing.allocator);
+    buffer.cursor = 2;
+    var viewport: Viewport = .{};
+    viewport.follow(&buffer, 1, 3, false);
+    try std.testing.expectEqual(@as(usize, 1), viewport.left);
+    try std.testing.expectEqual(@as(usize, 1), viewport.cursor(&buffer, 1, 3, false).?.column);
+    viewport.follow(&buffer, 1, 1, false);
+    try std.testing.expectEqual(@as(usize, 2), viewport.left);
+    viewport.left = 3;
+    viewport.follow(&buffer, 1, 3, false);
+    try std.testing.expectEqual(@as(usize, 2), viewport.left);
+    viewport.left = 0;
+    viewport.follow(&buffer, 1, 3, true);
+    try std.testing.expectEqual(@as(usize, 0), viewport.left);
 }

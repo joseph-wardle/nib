@@ -6,11 +6,6 @@ const Allocator = std.mem.Allocator;
 pub const max_file_bytes = 8 * 1024 * 1024;
 pub const max_lines = 256 * 1024;
 
-/// Display cells used by a byte starting at a column. Tabs stop every eight.
-pub fn cellWidth(byte: u8, column: usize) usize {
-    return if (byte == '\t') 8 - column % 8 else 1;
-}
-
 pub const Range = struct { start: usize, end: usize };
 pub const Error = Allocator.Error || error{
     FileTooLarge,

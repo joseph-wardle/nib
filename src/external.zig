@@ -217,6 +217,41 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
     }
 }
 
+test "reload snaps a cursor inside shifted multi-byte text or a CRLF to a character start" {
+    const cases = [_]struct { text: []const u8, cursor: usize, goal: usize }{
+        .{ .text = "\xc3\xa9\xe2\x82\xacx\n", .cursor = 2, .goal = 1 },
+        .{ .text = "\xe6\x9d\x90\xe6\x96\x99\n", .cursor = 3, .goal = 2 },
+        .{ .text = "abc\r\n", .cursor = 2, .goal = 2 },
+    };
+    for (cases) |case| {
+        var temp = testing.tmpDir(.{});
+        defer temp.cleanup();
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "abcdefgh\n" });
+        var document = try file.Source.load(testing.allocator, testing.io, temp.dir, "source");
+        defer document.deinit(testing.allocator);
+        var editor: Editor = .{};
+        var goal: motion.Goal = 0;
+        defer editor.deinit(testing.allocator);
+        var external: External = .{};
+        defer external.deinit(testing.allocator);
+        for ("llll") |byte| {
+            _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = byte });
+        }
+        try testing.expectEqual(@as(usize, 4), document.buffer.cursor);
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
+        external.inspect(testing.allocator, &document, true);
+        try testing.expect(external.automatic(
+            testing.allocator,
+            testing.io,
+            &document,
+            &goal,
+            &editor,
+        ) != null);
+        try testing.expectEqual(case.cursor, document.buffer.cursor);
+        try testing.expectEqual(@as(?usize, case.goal), goal);
+    }
+}
+
 test "notifications reload only clean command boundaries and keep dirty history until explicit reload" {
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
