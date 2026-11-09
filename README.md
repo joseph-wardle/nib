@@ -85,15 +85,37 @@ Supported Vim commands:
 - Ctrl-Z suspends; use shell `fg` to resume. Bracketed paste inserts only in
   insert mode; unsupported or oversized paste is rejected as a whole.
 
-Editing supports UTF-8 text with tabs, LF, and CRLF. Files with invalid UTF-8
-or other control bytes remain viewable but read-only, with the reason shown.
+## Text
 
-For development (checks require zsh and Git):
+Nib edits UTF-8 text with tabs, LF and CRLF, and assumes a UTF-8 terminal.
+Motions, deletes, Backspace, typing and paste work by character. Files with
+invalid UTF-8 or other control bytes remain viewable but read-only, with the
+reason shown; their bytes are saved back unchanged.
+
+Nib draws only characters whose width it knows: Latin, Greek and Cyrillic,
+common punctuation, symbols and arrows, box drawing, CJK and common emoji.
+Widths follow Unicode's East Asian Width, with ambiguous characters narrow, as
+in Konsole's default; a terminal that draws them wide misaligns those rows.
+Anything else, including combining accents, zero-width and bidi characters,
+emoji sequences, other scripts and invalid bytes, shows as one `?` cell. A
+combining accent or emoji sequence is edited one code point at a time.
+
+Current limits:
+
+- Non-ASCII file paths show escaped in the finder and as `?` in the status line,
+  and the `:` command line accepts only ASCII, so `:w` can't name such a file.
+- Moving on a very long line is slow: on a 100 KiB line, a key costs about
+  1 ms in ASCII text and 2 to 6 ms in UTF-8 text.
+
+## Development
+
+Checks require zsh and Git:
 
 ```sh
 zig fmt build.zig build.zig.zon src tests
 zig build check
 zig build bench-buffer
+zig build bench-motion
 zig build bench-finder
 ```
 

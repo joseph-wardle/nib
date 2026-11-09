@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "cursorMotions", cursorMotions },
         .{ "modalCommands", modalCommands },
         .{ "editingWorkflow", editingWorkflow },
+        .{ "utf8Editing", utf8Editing },
         .{ "pasteLifecycle", pasteLifecycle },
         .{ "externalChanges", externalChanges },
         .{ "startupFailures", startupFailures },
@@ -896,6 +897,111 @@ fn editingWorkflow(executable: [:0]const u8) !void {
     try equal(@as(u8, 0), try readonly.wait(false));
     try readonly.restored();
     try expectFile(path, "raw\xff\r");
+}
+
+// Covers moving over multi-byte and wide characters, typing characters split
+// across reads, an interrupted character, a UTF-8 paste, undo, redo and the
+// exact bytes saved, and a hostile control encoding kept read-only.
+fn utf8Editing(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-utf8-{d}", .{pid}, 0);
+    defer _ = linux.unlink(path);
+    // Cells: é 1, 材 2–3, b 4, ✅ 5–6, c 7. The combining acute draws as `?`.
+    const line = "\u{e9}\u{6750}b\u{2705}c";
+    try putFile(path, line ++ "\ne\u{301}x\r\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.until(line ++ " ");
+    try process.until("\r\ne?x ");
+    try process.ready();
+    const motions = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "l", "1:2 | ", "\x1b[1;2H" },
+        .{ "l", "1:4 | ", "\x1b[1;4H" },
+        .{ "$", "1:7 | ", "\x1b[1;7H" },
+        .{ "h", "1:5 | ", "\x1b[1;5H" },
+        .{ "j", "2:3 | ", "\x1b[2;3H" },
+        .{ "k", "1:5 | ", "\x1b[1;5H" },
+        .{ "b", "1:1 | ", "\x1b[1;1H" },
+        .{ "w", "1:5 | ", "\x1b[1;5H" },
+        .{ "0", "1:1 | ", "\x1b[1;1H" },
+    };
+    for (motions) |case| {
+        const keys, const status, const position = case;
+        try process.send(keys);
+        try process.until(status);
+        try process.until(position);
+        try process.ready();
+    }
+    // Each byte of é and ✅ arrives in its own read. Until a character is
+    // complete there is nothing to draw.
+    try editingKeys(&process, "i");
+    const typed = [_]struct { []const u8, []const u8 }{
+        .{ "\u{e9}", "\x1b[1;2H" },
+        .{ "\u{2705}", "\x1b[1;4H" },
+    };
+    for (typed) |case| {
+        const character, const position = case;
+        for (character, 1..) |byte, count| {
+            try process.send(&.{byte});
+            if (count < character.len) try equal(@as(usize, 0), try process.read(30));
+        }
+        try process.until(position);
+        try process.ready();
+    }
+    // A character cut short by Tab inserts nothing; the Tab still inserts.
+    try process.send("\xe2");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.send("\x9c");
+    try equal(@as(usize, 0), try process.read(30));
+    try process.send("\t");
+    try process.until("Invalid or interrupted character; nothing inserted");
+    try process.ready();
+    try process.send("\x1b[200~\u{3c3}\u{2014}\x1b[201~");
+    try process.until("\u{e9}\u{2705}     \u{3c3}\u{2014}" ++ line);
+    try process.until("\x1b[1;11H");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("NORMAL [+] | 1:10 | ");
+    try process.ready();
+    // One undo removes the whole insertion; redo restores it.
+    try process.send("u");
+    try process.until("\x1b[2J" ++ line ++ " ");
+    try process.ready();
+    try process.send("\x12");
+    try process.until("\u{3c3}\u{2014}" ++ line);
+    try process.ready();
+    // `dl` on ✅ deletes all three bytes; undo restores them.
+    try editingKeys(&process, "$h");
+    try process.send("dl");
+    try process.until("\u{3c3}\u{2014}\u{e9}\u{6750}bc ");
+    try process.ready();
+    try process.send("u");
+    try process.until("\u{3c3}\u{2014}" ++ line);
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    const saved = "\u{e9}\u{2705}\t\u{3c3}\u{2014}" ++ line ++ "\ne\u{301}x\r\n";
+    try expectFile(path, saved);
+    // U+009B is the 8-bit CSI: drawn as `?`, never sent, and never editable.
+    try putFile(path, "esc\u{9b}2J\n");
+    var hostile = try Process.start(executable, .{ .path = path });
+    defer hostile.close();
+    try hostile.until("esc?2J");
+    try hostile.until("read-only: invalid UTF-8 or control bytes");
+    try hostile.ready();
+    try hostile.send("a");
+    try hostile.until("Read-only: invalid UTF-8");
+    try hostile.ready();
+    try hostile.send(":qa\r");
+    try equal(@as(u8, 0), try hostile.wait(false));
+    try hostile.restored();
+    try expectFile(path, "esc\u{9b}2J\n");
 }
 
 fn pasteLifecycle(executable: [:0]const u8) !void {
