@@ -9,7 +9,20 @@ pub const Operation = struct {
     operator: motion.Operator,
     movement: union(enum) { motion: Movement, lines: usize },
 };
-pub const File = union(enum) { quit: bool, write: []const u8, reload };
+/// Commands about files and the session rather than the text.
+pub const File = union(enum) {
+    /// `:q`, or `:q!` to discard.
+    quit: bool,
+    /// `:qa`, or `:qa!` to discard every file.
+    quit_all: bool,
+    /// `:w`, or `:w <path>` to write a copy.
+    write: []const u8,
+    /// `:wq`
+    write_quit,
+    reload,
+    /// Ctrl-P: open the finder.
+    find,
+};
 pub const Action = union(enum) {
     move: Movement,
     operate: Operation,
@@ -66,7 +79,7 @@ pub const Parser = struct {
                 self.pasting = false;
                 return if (self.mode == .insert) .paste_end else null;
             },
-            .ignored => {
+            .ignored, .arrow => {
                 if (self.mode == .normal or self.mode == .operator) self.cancel();
                 return null;
             },
@@ -165,6 +178,7 @@ pub const Parser = struct {
             },
             'u' => return .undo,
             0x12 => return .redo,
+            0x10 => return .{ .file = .find },
             ':' => self.mode = .command_line,
             else => return .invalid,
         }
@@ -186,6 +200,9 @@ pub const Parser = struct {
                 if (invalid) return .invalid;
                 if (std.mem.eql(u8, line, "q")) return .{ .file = .{ .quit = false } };
                 if (std.mem.eql(u8, line, "q!")) return .{ .file = .{ .quit = true } };
+                if (std.mem.eql(u8, line, "qa")) return .{ .file = .{ .quit_all = false } };
+                if (std.mem.eql(u8, line, "qa!")) return .{ .file = .{ .quit_all = true } };
+                if (std.mem.eql(u8, line, "wq")) return .{ .file = .write_quit };
                 if (std.mem.eql(u8, line, "w")) return .{ .file = .{ .write = "" } };
                 if (std.mem.eql(u8, line, "e!")) return .{ .file = .reload };
                 if (std.mem.startsWith(u8, line, "w ") and line.len > 2)
@@ -227,7 +244,15 @@ test "motion and operator counts compose, distinguish zero and reject overflow" 
     try std.testing.expectEqualDeep(Action{ .operate = .{ .operator = .delete, .movement = .{ .motion = .{ .motion = .word, .count = 6 } } } }, keys(&parser, "2d3w").?);
     try std.testing.expectEqualDeep(Action{ .operate = .{ .operator = .change, .movement = .{ .lines = 6 } } }, keys(&parser, "2c3c").?);
     try std.testing.expectEqualDeep(Action{ .operate = .{ .operator = .delete, .movement = .{ .motion = .{ .motion = .start, .count = 2 } } } }, keys(&parser, "2d0").?);
-    for ([_][]const u8{ "999999999999999999999999999999999999l", "9223372036854775808d2w", "dgx", "2i", "2u", "q" }) |invalid| {
+    try std.testing.expectEqualDeep(Action{ .file = .find }, keys(&parser, "\x10").?);
+    const refused = [_][]const u8{
+        "999999999999999999999999999999999999l", "9223372036854775808d2w",
+        "dgx",                                   "2i",
+        "2u",                                    "q",
+        "2\x10",                                 "d\x10",
+        "g\x10",
+    };
+    for (refused) |invalid| {
         try std.testing.expectEqualDeep(Action.invalid, keys(&parser, invalid).?);
         try std.testing.expectEqual(Mode.normal, parser.mode);
         try std.testing.expectEqualDeep(Action{ .move = .{ .motion = .back } }, keys(&parser, "b").?);
@@ -261,7 +286,14 @@ test "restricted command line borrows paths, edits, refuses overflow and ignores
     try std.testing.expectEqualDeep(Action{ .file = .reload }, keys(&parser, ":e!\r").?);
     try std.testing.expectEqualStrings("my copy.zig", keys(&parser, ":w my copy.zig\r").?.file.write);
     try std.testing.expectEqualDeep(Action{ .file = .{ .quit = false } }, keys(&parser, ":w\x7fq\r").?);
-    for ([_][]const u8{ ":qa\r", ":w \r", ":q\x00\r" }) |invalid| try std.testing.expectEqualDeep(Action.invalid, keys(&parser, invalid).?);
+    const quit_all: Action = .{ .file = .{ .quit_all = false } };
+    try std.testing.expectEqualDeep(quit_all, keys(&parser, ":qa\r").?);
+    const discard_all: Action = .{ .file = .{ .quit_all = true } };
+    try std.testing.expectEqualDeep(discard_all, keys(&parser, ":qa!\r").?);
+    try std.testing.expectEqualDeep(Action{ .file = .write_quit }, keys(&parser, ":wq\r").?);
+    for ([_][]const u8{ ":qa!!\r", ":wq!\r", ":w \r", ":q\x00\r" }) |invalid| {
+        try std.testing.expectEqualDeep(Action.invalid, keys(&parser, invalid).?);
+    }
     _ = keys(&parser, ":");
     for (0..4097) |_| _ = keys(&parser, "q");
     _ = keys(&parser, "\x7f");
@@ -286,11 +318,11 @@ test "decoder precedence and cancellation compose with insert and pending comman
     var parser: Parser = .{};
     var decoder: input.Decoder = .{};
     _ = keys(&parser, "i");
-    for ("\x1bOA\x1b^:q!\r\x1b\\") |byte| {
+    for ("\x1bOA\x1b[1;5A") |byte| {
         const events = decoder.feed(byte, 0);
         for (events.items[0..events.len]) |event| try std.testing.expect(parser.feed(event) == null);
     }
-    // Ambiguous rapid O/^ prefixes stay terminal sequences, even in insert.
+    // Ambiguous rapid O/[ prefixes stay terminal sequences, even in insert.
     try std.testing.expectEqual(Mode.insert, parser.mode);
     _ = decoder.feed(0x1b, 1000);
     const escaped = decoder.expire(1100);

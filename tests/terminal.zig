@@ -18,7 +18,17 @@ var fixture: [:0]const u8 = undefined;
 pub fn main(init: std.process.Init.Minimal) !void {
     var args = init.args.iterate();
     _ = args.next();
-    const executable = args.next() orelse return error.MissingExecutable;
+    const named = args.next() orelse return error.MissingExecutable;
+    // Children may change directory before running it.
+    var executable_buffer: [4096]u8 = undefined;
+    const executable = if (named[0] == '/') named else executable: {
+        const length = try checked(linux.getcwd(&executable_buffer, executable_buffer.len));
+        // The kernel's length counts the terminating NUL.
+        const cwd = executable_buffer[0 .. length - 1];
+        const rest = executable_buffer[cwd.len..];
+        const suffix = try std.fmt.bufPrintSentinel(rest, "/{s}", .{named}, 0);
+        break :executable executable_buffer[0 .. cwd.len + suffix.len :0];
+    };
     var directory_buffer: [128]u8 = undefined;
     const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/nib-viewer-{d}", .{linux.getpid()}, 0);
     _ = try checked(linux.mkdir(directory, 0o700));
@@ -56,6 +66,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
         .{ "stalledOutputSuspend", stalledOutputSuspend },
+        .{ "finderSwitching", finderSwitching },
+        .{ "finderSafety", finderSafety },
+        .{ "finderQuit", finderQuit },
     };
     inline for (checks) |check| {
         check[1](executable) catch |err| {
@@ -103,6 +116,8 @@ const Options = struct {
     extra_argument: bool = false,
     size: [2]u16 = .{ 24, 80 },
     nonblocking_output: bool = false,
+    /// Working directory for the child.
+    cwd: ?[:0]const u8 = null,
 };
 
 const Process = struct {
@@ -141,6 +156,7 @@ const Process = struct {
 
     fn child(master: posix.fd_t, slave: posix.fd_t, executable: [:0]const u8, options: Options) !void {
         _ = try checked(linux.close(master));
+        if (options.cwd) |directory| _ = try checked(linux.chdir(directory));
         _ = try checked(linux.setsid());
         _ = try checked(linux.ioctl(slave, linux.T.IOCSCTTY, 0));
         for (0..3) |fd| _ = try checked(linux.dup2(slave, @intCast(fd)));
@@ -346,7 +362,7 @@ fn quitAndIdle(executable: [:0]const u8) !void {
     try process.ready();
     try equal(@as(usize, 0), process.used);
     try equal(@as(usize, 0), try process.read(150));
-    try process.send(":q\r");
+    try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -386,7 +402,7 @@ fn resizeAndSuspend(executable: [:0]const u8) !void {
             try process.ready();
         }
     }
-    try process.until("Ctrl-Z suspend");
+    try process.until("Ctrl-P files");
     for (0..3) |_| {
         try process.send("\x1a");
         try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));
@@ -395,7 +411,7 @@ fn resizeAndSuspend(executable: [:0]const u8) !void {
         try process.signal(.CONT);
         try process.ready();
     }
-    try process.send(":q\r");
+    try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.restored();
 }
@@ -470,13 +486,13 @@ fn shellJobControl(executable: [:0]const u8) !void {
     }
     command[length] = '\n';
     try shell.send(command[0 .. length + 1]);
-    try shell.until("Ctrl-Z suspend");
+    try shell.until("Ctrl-P files");
     for (0..2) |_| {
         try shell.send("\x1a");
         try shell.until(prompt);
         try shell.restored();
         try shell.send("fg\n");
-        try shell.until("Ctrl-Z suspend");
+        try shell.until("Ctrl-P files");
     }
     try shell.send("\x1a");
     try shell.until(prompt);
@@ -486,8 +502,8 @@ fn shellJobControl(executable: [:0]const u8) !void {
     _ = try shell.read(100);
     try shell.excludes(enter);
     try shell.send("fg\n");
-    try shell.until("Ctrl-Z suspend");
-    try shell.send(":q\r");
+    try shell.until("Ctrl-P files");
+    try shell.send(":qa\r");
     try shell.until(prompt);
     try shell.restored();
     @memcpy(command[length..][0..3], " &\n");
@@ -507,8 +523,8 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.send("2j3l");
     try process.until("3:4 | ");
     try process.until("\x1b[0m");
-    // Fragmented CSI, SS3, OSC, DCS and pasted commands are ignored.
-    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b]qhjkl", "\x07", "\x1bPq", "\x1b\\", "\x1b[200~qhjkl\x1b[201~" }) |part| {
+    // Fragmented CSI, SS3 and pasted commands are ignored.
+    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b[200~qhjkl\x1b[201~" }) |part| {
         try process.send(part);
         try equal(@as(usize, 0), try process.read(20));
     }
@@ -539,7 +555,7 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.until("\x1b[1;1H\x1b[?25h");
     try process.ready();
     try equal(@as(usize, 0), try process.read(100));
-    try process.send(":q\r");
+    try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -590,19 +606,17 @@ fn cursorMotions(executable: [:0]const u8) !void {
     try process.send("\x03");
     try process.ready();
     try equal(@as(usize, 0), try process.read(150));
-    try process.send(":q\r");
+    try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.restored();
 }
 
 fn startupFailures(executable: [:0]const u8) !void {
     for ([_]Options{
-        .{ .missing_argument = true },
         .{ .extra_argument = true },
         .{ .path = "/a/missing/nib-test-file" },
-        .{ .path = "/tmp" },
         .{ .path = "/dev/null" },
-    }, [_][]const u8{ "usage: nib <path>", "exactly one file", "file not found", "regular file", "regular file" }) |options, message| {
+    }, [_][]const u8{ "usage: nib [path]", "file not found", "regular file" }) |options, message| {
         var process = try Process.start(executable, options);
         defer process.close();
         try process.rejected(message);
@@ -615,7 +629,7 @@ fn startupFailures(executable: [:0]const u8) !void {
     _ = try checked(linux.ftruncate(fd, 8 * 1024 * 1024 + 1));
     var process = try Process.start(executable, .{ .path = path });
     defer process.close();
-    try process.rejected("temporary 8 MiB viewer limit");
+    try process.rejected("temporary 8 MiB limit");
     _ = try checked(linux.ftruncate(fd, 0));
     var newlines: [4096]u8 = undefined;
     @memset(&newlines, '\n');
@@ -624,7 +638,7 @@ fn startupFailures(executable: [:0]const u8) !void {
     try write(fd, "\n");
     var lines = try Process.start(executable, .{ .path = path });
     defer lines.close();
-    try lines.rejected("temporary 262,144-line viewer limit");
+    try lines.rejected("temporary 262,144-line limit");
 }
 
 fn stalledOutputTermination(executable: [:0]const u8) !void {
@@ -665,7 +679,7 @@ fn stalledOutputSuspend(executable: [:0]const u8) !void {
         try process.until(leave);
         try process.until(enter);
         try process.ready();
-        try process.send(":q\r");
+        try process.send(":qa\r");
         try equal(@as(u8, 0), try process.wait(false));
         try process.until(leave);
         try process.restored();
@@ -685,7 +699,7 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
     }
     const bytes = process.output[0..process.used];
     const start = (std.mem.indexOf(u8, bytes, frame) orelse return error.MissingOutput) + frame.len;
-    const status = std.mem.indexOf(u8, bytes, "\x1b[7m:q quit") orelse return error.MissingOutput;
+    const status = std.mem.indexOf(u8, bytes, "\x1b[7mNORMAL") orelse return error.MissingOutput;
     try equal(@as(usize, 199 * 301), status - start);
     for (0..199) |number| {
         var expected: [299]u8 = @splat(' ');
@@ -703,7 +717,7 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
     // frame before continuing so the bounded capture retains one at a time.
     try process.send(":");
     try process.ready();
-    try process.send("q");
+    try process.send("qa");
     try process.ready();
     try process.send("\r");
     try process.until(leave);
@@ -720,10 +734,10 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until("Unsupported command or count");
     try process.ready();
     try process.send("\x03");
-    try process.until(":q quit");
+    try process.until("Ctrl-P files");
     try process.ready();
     try process.send(":e!\r");
-    try process.until("Reloaded; local edits and history discarded");
+    try process.until("; local edits and history discarded");
     try process.ready();
     try process.send("\x03d");
     try process.until("OPERATOR pending");
@@ -731,7 +745,7 @@ fn modalCommands(executable: [:0]const u8) !void {
     const start = try now();
     try process.send("\x1b");
     try equal(@as(usize, 0), try process.read(30));
-    try process.until(":q quit");
+    try process.until("Ctrl-P files");
     try expect(try now() - start >= 80 and try now() - start < 2000);
     try process.ready();
     // With no Escape pending the loop returns to indefinite idle waiting.
@@ -748,8 +762,8 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until("2:1 | ");
     try process.ready();
     // Recognized prefixes have no lone-Escape deadline. A payload arriving
-    // later than 100 ms stays shielded, including commands that could quit.
-    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b^", ":q!\r\x1b\\" }, .{ "\x1b[", "999q" } }) |parts| {
+    // later than 100 ms stays shielded.
+    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b[", "999q" } }) |parts| {
         try process.send(parts[0]);
         try equal(@as(usize, 0), try process.read(150));
         try process.send(parts[1]);
@@ -769,7 +783,11 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.send("2d3w");
     try process.until("NORMAL [+]");
     try process.ready();
-    try process.send(":q!\r");
+    // Ctrl-C ends an unfinished sequence, and Escape then `]` (Alt+] in
+    // Konsole) is two keys, so the quit command still gets through.
+    try process.send("\x1b[");
+    try equal(@as(usize, 0), try process.read(150));
+    try process.send("\x03\x1b]:qa!\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -840,7 +858,7 @@ fn editingWorkflow(executable: [:0]const u8) !void {
     try process.until("Unsaved changes");
     try process.ready();
     try editingKeys(&process, "\x12");
-    try process.send(":q\r");
+    try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -857,7 +875,7 @@ fn editingWorkflow(executable: [:0]const u8) !void {
     try expectFile(path, "external\n");
     // The refused save retains undo: undo the local command, redo, then discard.
     try editingKeys(&reopened, "u\x12");
-    try reopened.send(":q!\r");
+    try reopened.send(":qa!\r");
     try equal(@as(u8, 0), try reopened.wait(false));
     try reopened.until(leave);
     try reopened.restored();
@@ -874,7 +892,7 @@ fn editingWorkflow(executable: [:0]const u8) !void {
     try readonly.send(":w\r");
     try readonly.until("Written");
     try readonly.ready();
-    try readonly.send(":q\r");
+    try readonly.send(":qa\r");
     try equal(@as(u8, 0), try readonly.wait(false));
     try readonly.restored();
     try expectFile(path, "raw\xff\r");
@@ -935,7 +953,7 @@ fn pasteLifecycle(executable: [:0]const u8) !void {
     try process.until("NORMAL [+]");
     try process.ready();
     try editingKeys(&process, "u");
-    try process.send(":q\r");
+    try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
@@ -998,7 +1016,7 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.ready();
     try process.send(":e!\r");
     try process.until("outside");
-    try process.until("Reloaded; local edits and history discarded");
+    try process.until("; local edits and history discarded");
     try process.ready();
     try process.send("u");
     try process.until("No more history");
@@ -1009,7 +1027,7 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.until("SOURCE MISSING");
     try process.ready();
     try process.send(":e!\r");
-    try process.until("Reload failed; local state retained");
+    try process.until(" failed; local state retained");
     try process.ready();
     try process.send(":w\r");
     try process.until("save refused");
@@ -1045,9 +1063,400 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.send("u");
     try process.until("NORMAL [+]");
     try process.ready();
-    try process.send("\x12:q\r");
+    try process.send("\x12:qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
     try expectFile(path, "Yresumed\n");
+}
+
+/// Runs a helper program to completion with no terminal I/O.
+fn spawn(argv: []const ?[*:0]const u8) !void {
+    const pid: posix.pid_t = @intCast(try checked(linux.fork()));
+    if (pid == 0) {
+        const null_fd = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+        if (posix.errno(null_fd) == .SUCCESS) {
+            for (0..3) |fd| _ = linux.dup2(@intCast(null_fd), @intCast(fd));
+        }
+        const env = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
+        const program = argv[0].?;
+        _ = linux.execve(program, @ptrCast(argv.ptr), &env);
+        linux.exit_group(127);
+    }
+    var status: i32 = 0;
+    while (posix.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    const code: u32 = @bitCast(status);
+    if (!linux.W.IFEXITED(code) or linux.W.EXITSTATUS(code) != 0) return error.HelperFailed;
+}
+
+/// A worktree for the finder workflows, at `<base>/repo`:
+/// tracked `.gitignore`, `alpha.txt`, `beta.txt` and `sub/gamma.txt`;
+/// untracked `big.txt` (over 64 KiB), `link` to `alpha.txt` and `pipe` to a
+/// FIFO outside it; ignored `debug.log`.
+const Project = struct {
+    base: [:0]const u8,
+    storage: [128]u8 = undefined,
+    repo_storage: [160]u8 = undefined,
+    repo: [:0]const u8 = undefined,
+
+    fn create(base_storage: *[128]u8, name: []const u8) !Project {
+        const format = "/tmp/nib-{s}-{d}";
+        const pid = linux.getpid();
+        const base = try std.fmt.bufPrintSentinel(base_storage, format, .{ name, pid }, 0);
+        var project: Project = .{ .base = base };
+        project.repo = try std.fmt.bufPrintSentinel(&project.repo_storage, "{s}/repo", .{base}, 0);
+        _ = try checked(linux.mkdir(base, 0o700));
+        errdefer project.remove();
+        const repo = project.repo;
+        try spawn(&.{ "/usr/bin/git", "init", "-q", repo, null });
+        var sub_buffer: [192]u8 = undefined;
+        _ = try checked(linux.mkdir(try project.path(&sub_buffer, "sub"), 0o700));
+        const files = [_][2][]const u8{
+            .{ ".gitignore", "*.log\n" },
+            .{ "alpha.txt", "alpha one\nalpha two\n" },
+            .{ "beta.txt", "beta\n" },
+            .{ "sub/gamma.txt", "gamma\n" },
+            .{ "debug.log", "log\n" },
+        };
+        for (files) |entry| {
+            var buffer: [192]u8 = undefined;
+            try putFile(try project.path(&buffer, entry[0]), entry[1]);
+        }
+        var big: [70 * 1024]u8 = undefined;
+        @memset(&big, 'b');
+        @memcpy(big[0..9], "big file\n");
+        var big_buffer: [192]u8 = undefined;
+        try putFile(try project.path(&big_buffer, "big.txt"), &big);
+        var link_buffer: [192]u8 = undefined;
+        _ = try checked(linux.symlink("alpha.txt", try project.path(&link_buffer, "link")));
+        var fifo_buffer: [192]u8 = undefined;
+        const fifo = try std.fmt.bufPrintSentinel(&fifo_buffer, "{s}/fifo", .{base}, 0);
+        _ = try checked(linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0));
+        var pipe_buffer: [192]u8 = undefined;
+        _ = try checked(linux.symlink(fifo, try project.path(&pipe_buffer, "pipe")));
+        const tracked = [_:null]?[*:0]const u8{
+            "/usr/bin/git", "-C",        repo,       "add",           "--",
+            ".gitignore",   "alpha.txt", "beta.txt", "sub/gamma.txt",
+        };
+        try spawn(&tracked);
+        return project;
+    }
+
+    fn path(self: *const Project, buffer: []u8, relative: []const u8) ![:0]const u8 {
+        return std.fmt.bufPrintSentinel(buffer, "{s}/{s}", .{ self.repo, relative }, 0);
+    }
+
+    fn remove(self: *const Project) void {
+        spawn(&.{ "/usr/bin/rm", "-rf", self.base, null }) catch {};
+    }
+};
+
+/// Waits for a finder frame showing `counts` with nothing scanning or
+/// searching, above the query row holding exactly `query`. Background work
+/// draws extra frames, so a bare count can match a stale one.
+fn settled(process: *Process, counts: []const u8, query: []const u8) !void {
+    // Rows are 79 cells in the default 80-column terminal.
+    var marker: [79 + 4 + 64]u8 = undefined;
+    @memset(marker[0..79], ' ');
+    @memcpy(marker[0..counts.len], counts);
+    const rest = try std.fmt.bufPrint(marker[79..], "\r\n> {s} ", .{query});
+    try process.until(marker[0 .. 79 + rest.len]);
+}
+
+/// Sends one key and waits for its frame.
+fn finderKeys(process: *Process, bytes: []const u8) !void {
+    for (bytes) |byte| {
+        try process.send(&.{byte});
+        try process.ready();
+    }
+}
+
+// Covers starting with no file from a subdirectory, searching, previews,
+// dirty switching with exact state, categories, dimming, Open markers,
+// list keys, :qa protection, closing back to the most recent file, and
+// quitting by closing the last one.
+fn finderSwitching(executable: [:0]const u8) !void {
+    var base: [128]u8 = undefined;
+    const project = try Project.create(&base, "finder");
+    defer project.remove();
+    var sub: [192]u8 = undefined;
+    var process = try Process.start(executable, .{
+        .missing_argument = true,
+        .cwd = try project.path(&sub, "sub"),
+    });
+    defer process.close();
+    // `nib` alone in a subdirectory roots at the worktree.
+    var header: [192]u8 = undefined;
+    try process.until(try std.fmt.bufPrint(&header, "[Project] All  Open  | {s}", .{project.repo}));
+    try settled(&process, "7/7 files", "");
+    // The first result, .gitignore, is previewed.
+    try process.until("*.log");
+    try process.ready();
+    // Escape moves from the query to the list, where letters move instead of
+    // searching; with no file open, Escape there has nowhere to go.
+    try process.send("\x1b");
+    try process.until("LIST | ");
+    try process.ready();
+    try process.send("G");
+    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.ready();
+    try process.send("k");
+    try process.ready();
+    try process.send("j");
+    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.ready();
+    try process.send("g");
+    try process.ready();
+    try process.send("g");
+    try process.until("\x1b[7m>   .gitignore");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("No file open; :q quits");
+    try process.ready();
+    try process.send("/");
+    try process.until("SEARCH | ");
+    try process.ready();
+    try process.send("alp");
+    try settled(&process, "1/7 files", "alp");
+    try process.until("alpha one");
+    try process.ready();
+    try process.send("\r");
+    try process.until("\x1b[2Jalpha one ");
+    try process.until("NORMAL | 1:1 | ");
+    try process.ready();
+    try editingKeys(&process, "iA\x03j");
+    try process.send("$");
+    try process.until("NORMAL [+] | 2:9 | ");
+    try process.ready();
+    // The finder keeps the query; the open dirty file shows its marker and
+    // previews its unsaved text.
+    try process.send("\x10");
+    try process.until(">+  ");
+    try process.until("Open file, unsaved edits");
+    try process.until("Aalpha one");
+    try process.ready();
+    try finderKeys(&process, "\x7f\x7f\x7f");
+    try process.send("beta");
+    try settled(&process, "1/7 files", "beta");
+    try process.ready();
+    try process.send("\r");
+    try process.until("NORMAL | 1:1 | ");
+    try process.ready();
+    try editingKeys(&process, "iB\x03");
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
+    var beta: [192]u8 = undefined;
+    try expectFile(try project.path(&beta, "beta.txt"), "Bbeta\n");
+    // All adds the ignored log, dimmed as Git lists it.
+    try process.send("\x10");
+    try process.ready();
+    try finderKeys(&process, "\x7f\x7f\x7f\x7f");
+    try process.send("\t");
+    try process.until("[All]");
+    try process.until("\x1b[2mdebug.log");
+    try process.ready();
+    // Open lists both, most recent first; the other one previews its edits.
+    try process.send("\t");
+    try process.until("[Open]");
+    try settled(&process, "2/2 files", "");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("LIST | ");
+    try process.ready();
+    try process.send("j");
+    try process.until("Open file, unsaved edits");
+    try process.ready();
+    try process.send("\r");
+    // Switching back restores text, cursor and history exactly.
+    try process.until("\x1b[2JAalpha one ");
+    try process.until("NORMAL [+] | 2:9 | ");
+    try process.ready();
+    try process.send("u");
+    try process.until("NORMAL | 1:1 | ");
+    try process.ready();
+    try process.send("\x12");
+    try process.until("NORMAL [+] | 1:1 | ");
+    try process.ready();
+    try process.send(":qa\r");
+    try process.until("Unsaved changes in 1 file: alpha.txt; :qa! discards them");
+    try process.ready();
+    try process.send(":q\r");
+    try process.until("Unsaved changes in alpha.txt; use :q! to discard");
+    try process.ready();
+    try process.send(":q!\r");
+    try process.until("Bbeta");
+    try process.until("Discarded edits and closed alpha.txt");
+    try process.ready();
+    // From the list, q returns to the file; the query was kept.
+    try process.send("\x10");
+    try process.until("SEARCH | ");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("LIST | ");
+    try process.ready();
+    try process.send("q");
+    try process.until("NORMAL | 1:1 | ");
+    try process.ready();
+    // Closing the last file quits.
+    try process.send(":q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    var alpha: [192]u8 = undefined;
+    try expectFile(try project.path(&alpha, "alpha.txt"), "alpha one\nalpha two\n");
+}
+
+// Covers aliases, special-file previews and refusals, refresh, resize and
+// suspension in the finder, an inactive dirty file replaced on disk, and
+// :wq failing and succeeding.
+fn finderSafety(executable: [:0]const u8) !void {
+    var base: [128]u8 = undefined;
+    const project = try Project.create(&base, "safety");
+    defer project.remove();
+    var link: [192]u8 = undefined;
+    var process = try Process.start(executable, .{ .path = try project.path(&link, "link") });
+    defer process.close();
+    try process.until("alpha one");
+    try process.until("repo/link | ");
+    try process.ready();
+    try editingKeys(&process, "iL\x03");
+    // Opening the link's target reuses its document and first spelling.
+    try process.send("\x10");
+    try settled(&process, "7/7 files", "");
+    try process.ready();
+    try process.send("alpha");
+    try settled(&process, "1/7 files", "alpha");
+    try process.ready();
+    try process.send("\r");
+    try process.until("Lalpha one");
+    try process.until("NORMAL [+] | 1:1 | ");
+    try process.until("repo/link | ");
+    try process.ready();
+    // A FIFO behind a symlink is neither previewed nor opened, and never blocks.
+    try process.send("\x10");
+    try process.ready();
+    try finderKeys(&process, "\x7f\x7f\x7f\x7f\x7f");
+    try process.send("pipe");
+    try process.until("No preview: not a regular file");
+    try process.ready();
+    try process.send("\r");
+    try process.until("Cannot open: not a regular file");
+    try process.ready();
+    // The large file is marked truncated.
+    try finderKeys(&process, "\x7f\x7f\x7f\x7f");
+    try process.send("big");
+    try process.until("Preview: first 64 KiB");
+    try process.ready();
+    // Files created by others appear on refresh.
+    try finderKeys(&process, "\x7f\x7f\x7f");
+    var fresh: [192]u8 = undefined;
+    try putFile(try project.path(&fresh, "new.txt"), "fresh\n");
+    try process.send("new");
+    try settled(&process, "0/7 files", "new");
+    try process.ready();
+    try process.send("\x12");
+    try settled(&process, "1/8 files", "new");
+    try process.until("fresh");
+    try process.ready();
+    // Resizing redraws from what was read; a narrow terminal hides the preview
+    // but keeps the query, the selected path and the status.
+    var narrow: posix.winsize = .{ .row = 6, .col = 30, .xpixel = 0, .ypixel = 0 };
+    _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&narrow)));
+    try process.until("> new");
+    try process.until("new.txt");
+    try process.until("Enter open");
+    try process.ready();
+    var wide: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&wide)));
+    try process.until(frame);
+    try process.until("fresh");
+    try process.ready();
+    // Suspension from the finder restores the shell's terminal, then the finder.
+    try process.send("\x1a");
+    try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));
+    try process.until(leave);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until("[Project]");
+    try process.ready();
+    try finderKeys(&process, "\x1b");
+    try process.send("\x1b");
+    try process.until("Lalpha one");
+    try process.ready();
+    // A dirty inactive file keeps its edits when replaced on disk.
+    try process.send("\x10");
+    try process.ready();
+    try finderKeys(&process, "\x7f\x7f\x7f");
+    try process.send("beta");
+    try settled(&process, "1/8 files", "beta");
+    try process.ready();
+    try process.send("\r");
+    try process.until("NORMAL | 1:1 | ");
+    try process.ready();
+    var alpha: [192]u8 = undefined;
+    const alpha_path = try project.path(&alpha, "alpha.txt");
+    var staged: [192]u8 = undefined;
+    const staged_path = try project.path(&staged, "staged");
+    try putFile(staged_path, "replaced\n");
+    _ = try checked(linux.rename(staged_path, alpha_path));
+    try process.send("\x10");
+    try process.ready();
+    try finderKeys(&process, "\x7f\x7f\x7f\x7f");
+    try process.send("alpha");
+    try settled(&process, "1/8 files", "alpha");
+    try process.ready();
+    try process.send("\r");
+    try process.until("Lalpha one");
+    try process.until("DISK CONFLICT | ");
+    try process.ready();
+    // :wq refuses the conflicting save and keeps the file open and dirty.
+    try process.send(":wq\r");
+    try process.until("Source changed or missing; save refused");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("NORMAL [+]");
+    try process.ready();
+    try expectFile(alpha_path, "replaced\n");
+    try process.send(":q!\r");
+    try process.until("beta");
+    try process.ready();
+    // :wq on the last, clean file saves, closes it and quits.
+    var beta: [192]u8 = undefined;
+    const beta_path = try project.path(&beta, "beta.txt");
+    try process.send(":wq\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(alpha_path, "replaced\n");
+    try expectFile(beta_path, "beta\n");
+}
+
+// Ctrl-C leaves the query for the list, half pages move, and with no file
+// open the list's : enters a command and :q quits.
+fn finderQuit(executable: [:0]const u8) !void {
+    var base: [128]u8 = undefined;
+    const project = try Project.create(&base, "quit");
+    defer project.remove();
+    var process = try Process.start(executable, .{ .missing_argument = true, .cwd = project.repo });
+    defer process.close();
+    try settled(&process, "7/7 files", "");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("LIST | ");
+    try process.ready();
+    // Seven results fit in half the page of 24 rows.
+    try process.send("\x04");
+    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.ready();
+    try process.send("\x15");
+    try process.until("\x1b[7m>   .gitignore");
+    try process.ready();
+    try process.send(":");
+    try process.until("\x1b[7m:");
+    try process.ready();
+    try process.send("q\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }

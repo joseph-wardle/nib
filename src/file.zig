@@ -103,6 +103,23 @@ pub const Source = struct {
         try verifyBytes(fd, self.version, base);
     }
 
+    /// Whether this path currently resolves to the file `version` identifies.
+    /// A path that reaches no file it can resolve (missing, a special file,
+    /// denied, looping or too long) names nothing; other failures are returned
+    /// because the answer is unknown.
+    pub fn names(self: *const Source, version: linux.Statx) Error!bool {
+        const current = resolve(self.path) catch |err| return switch (err) {
+            error.FileNotFound,
+            error.UnsupportedFileType,
+            error.AccessDenied,
+            error.LinkLoop,
+            error.NameTooLong,
+            => false,
+            else => err,
+        };
+        return sameIdentity(current.version, version);
+    }
+
     /// Rebuild watches along the current spelling, including intermediate links.
     /// Register before validation so changes during registration remain queued.
     pub fn monitor(self: *const Source, allocator: Allocator, watch: *Watch) void {
@@ -372,7 +389,9 @@ fn resolveWatching(path: []const u8, allocator: Allocator, watch: ?*Watch) Error
     return result;
 }
 
-fn absolutePath(allocator: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) Error![]const u8 {
+/// The spelling `Source` records for `path`: absolute, with `.`, `..` and
+/// symlinks left for resolution. The caller frees it.
+pub fn absolutePath(allocator: Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) Error![]const u8 {
     if (path.len == 0) return error.FileNotFound;
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
     var root: [4096]u8 = undefined;
