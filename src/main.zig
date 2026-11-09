@@ -505,11 +505,12 @@ const App = struct {
         }
         if (self.finding) {
             self.find(self.finder.category);
-            // A relisting failure follows the close notice rather than hiding it.
+            // A relisting failure follows the close notice rather than hiding
+            // it, cut short if it would not fit.
             const failure = self.editor.notice;
             if (failure.len != 0) {
                 const first = std.ascii.toLower(failure[0]);
-                notice.print("; {c}{s}", .{ first, failure[1..] }) catch unreachable;
+                notice.print("; {c}{s}", .{ first, failure[1..] }) catch {};
             }
         }
         self.editor.notice = notice.buffered();
@@ -909,7 +910,7 @@ const Line = struct {
 };
 
 /// A path in a notice, keeping its end when longer than `limit` bytes. Two
-/// paths and the longest close, reload and relisting text fit in `App.notice`.
+/// paths and the longest close and reload text fit in `App.notice`.
 const NoticePath = struct {
     path: []const u8,
 
@@ -1293,10 +1294,44 @@ test "a long path in a notice keeps its end" {
     try testing.expectEqual(NoticePath.limit, shown.len);
     try testing.expect(std.mem.startsWith(u8, shown, "..."));
     try testing.expect(std.mem.endsWith(u8, shown, "/d/name.zig"));
-    // The longest notice, with two long names, fits the notice buffer.
+    // The longest close notice, with two long names, fits the notice buffer.
     try notice.writeAll("; ");
     try reloaded(&notice, .out_of_memory, false, .{ .path = path });
-    try notice.writeAll("; not enough memory; finder results may be incomplete");
+}
+
+test "a relisting failure that would overflow the close notice is cut short" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    app.find(.open);
+    var notice: std.Io.Writer = .fixed(&app.notice);
+    try notice.writeAll("Closed ");
+    try notice.splatByteAll('x', app.notice.len - notice.end - 8);
+    const closed = notice.buffered().len;
+    // Open starts no job, so only this thread uses the failing allocator.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    app.gpa = failing.allocator();
+    app.closed(&notice, null);
+    app.gpa = testing.allocator;
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(app.notice.len, app.editor.notice.len);
+    try testing.expect(std.mem.startsWith(u8, app.editor.notice, "Closed xxx"));
+    try testing.expectEqualStrings("; not en", app.editor.notice[closed..]);
 }
 
 test "the finder's unsaved mark follows a save made from the finder" {
