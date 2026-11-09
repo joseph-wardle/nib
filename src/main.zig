@@ -1062,6 +1062,7 @@ test {
     _ = @import("editor.zig");
     _ = @import("file.zig");
     _ = @import("buffer.zig");
+    _ = @import("char.zig");
     _ = @import("terminal.zig");
     _ = @import("view.zig");
     _ = @import("input.zig");
