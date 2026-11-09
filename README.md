@@ -85,8 +85,8 @@ Supported Vim commands:
 - Ctrl-Z suspends; use shell `fg` to resume. Bracketed paste inserts only in
   insert mode; unsupported or oversized paste is rejected as a whole.
 
-Editing temporarily supports ASCII, tabs, LF, and CRLF; other bytes remain
-viewable but read-only. 
+Editing supports UTF-8 text with tabs, LF, and CRLF. Files with invalid UTF-8
+or other control bytes remain viewable but read-only, with the reason shown.
 
 For development (checks require zsh and Git):
 

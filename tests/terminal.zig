@@ -884,10 +884,10 @@ fn editingWorkflow(executable: [:0]const u8) !void {
     try putFile(path, "raw\xff\r");
     var readonly = try Process.start(executable, .{ .path = path });
     defer readonly.close();
-    try readonly.until("read-only");
+    try readonly.until("read-only: invalid UTF-8 or control bytes");
     try readonly.ready();
     try readonly.send("i");
-    try readonly.until("Read-only: non-ASCII");
+    try readonly.until("Read-only: invalid UTF-8");
     try readonly.ready();
     try readonly.send(":w\r");
     try readonly.until("Written");

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const char = @import("char.zig");
 
 // Temporary loading/editing bounds; the roadmap records their removal criteria.
 pub const max_file_bytes = 8 * 1024 * 1024;
@@ -43,8 +44,10 @@ const Group = struct {
 
 /// Owns mutable bytes, a detached loaded/saved base, and linear edit history.
 /// All borrowed slices expire on mutation. Release with the original allocator.
-/// Cursor offsets are byte boundaries, never between CR and LF. Mode-specific
-/// cursor landing and display columns belong to navigation, not this storage.
+/// Editable text is always valid UTF-8 (see `char.editable`), and cursor
+/// offsets and edited ranges are character boundaries: never inside a UTF-8
+/// sequence or between CR and LF. Mode-specific cursor landing and display
+/// columns belong to navigation, not this storage.
 pub const Buffer = struct {
     text: std.ArrayList(u8) = .empty,
     // Unlike the viewer index, includes the insertion row after a final LF.
@@ -63,7 +66,10 @@ pub const Buffer = struct {
         if (content.len > max_file_bytes) return error.FileTooLarge;
         const count = 1 + std.mem.count(u8, content, "\n");
         if (logicalLines(content, count) > max_lines) return error.TooManyLines;
-        var self: Buffer = .{ .base = try allocator.dupe(u8, content), .editable = supported(content) };
+        var self: Buffer = .{
+            .base = try allocator.dupe(u8, content),
+            .editable = char.editable(content),
+        };
         errdefer self.deinit(allocator);
         try self.text.appendSlice(allocator, content);
         try self.starts.ensureTotalCapacity(allocator, count);
@@ -187,7 +193,7 @@ pub const Buffer = struct {
     /// leave the cursor unchanged. Every fallible operation precedes mutation.
     pub fn replace(self: *Buffer, allocator: Allocator, range: Range, inserted: []const u8, cursor_after: usize) Error!void {
         if (range.start > range.end or !boundary(self.bytes(), range.start) or !boundary(self.bytes(), range.end)) return error.InvalidRange;
-        if (!self.editable or !supported(inserted)) return error.UnsupportedText;
+        if (!self.editable or !char.editable(inserted)) return error.UnsupportedText;
         const removed = self.text.items[range.start..range.end];
         const remaining = self.text.items.len - removed.len;
         if (inserted.len > max_file_bytes - remaining) return error.FileTooLarge;
@@ -196,11 +202,15 @@ pub const Buffer = struct {
         const final_byte: ?u8 = if (range.end < self.text.items.len) self.text.items[self.text.items.len - 1] else if (inserted.len != 0) inserted[inserted.len - 1] else if (range.start != 0) self.text.items[range.start - 1] else null;
         if (rows - @intFromBool(final_byte == '\n') > max_lines) return error.TooManyLines;
         if (cursor_after > length) return error.InvalidCursor;
-        // Replacement cannot split existing CRLF and supported input cannot
-        // contain lone CR, so only its resulting cursor needs a virtual read.
-        if (cursor_after > 0 and cursor_after < length and
-            self.resultByte(range, inserted, cursor_after - 1) == '\r' and
-            self.resultByte(range, inserted, cursor_after) == '\n') return error.InvalidCursor;
+        // Boundary ranges of valid text joined with valid text stay valid, and
+        // its CR is always followed by LF, so only the resulting cursor needs a
+        // virtual read: never on a continuation byte or the LF of a CRLF.
+        if (cursor_after > 0 and cursor_after < length) {
+            const after = self.resultByte(range, inserted, cursor_after);
+            if (after & 0xc0 == 0x80) return error.InvalidCursor;
+            const before = self.resultByte(range, inserted, cursor_after - 1);
+            if (after == '\n' and before == '\r') return error.InvalidCursor;
+        }
         if (std.mem.eql(u8, removed, inserted)) return;
 
         const owned = try allocator.alloc(u8, removed.len + inserted.len);
@@ -336,20 +346,11 @@ fn logicalLines(bytes: []const u8, rows: usize) usize {
 }
 
 fn boundary(bytes: []const u8, offset: usize) bool {
-    return offset <= bytes.len and !(offset > 0 and offset < bytes.len and bytes[offset - 1] == '\r' and bytes[offset] == '\n');
+    return offset <= bytes.len and char.start(bytes, offset) == offset;
 }
 
 fn terminator(bytes: []const u8, lf: usize) []const u8 {
     return if (lf > 0 and bytes[lf - 1] == '\r') "\r\n" else "\n";
-}
-
-fn supported(bytes: []const u8) bool {
-    for (bytes, 0..) |byte, i| switch (byte) {
-        '\t', '\n', 0x20...0x7e => {},
-        '\r' => if (i + 1 == bytes.len or bytes[i + 1] != '\n') return false,
-        else => return false,
-    };
-    return true;
 }
 
 test "owned base, mixed terminators, and trailing insertion rows" {
@@ -444,7 +445,10 @@ test "saved positions survive undo and redo but not discarded branches" {
 
 test "unsupported bytes are retained read-only and unsupported replacements are atomic" {
     const allocator = std.testing.allocator;
-    for ([_][]const u8{ "a\x00b", "a\x1bb", "\xc3\xa9", "a\rb" }) |input| {
+    const unsupported = [_][]const u8{
+        "a\x00b", "a\x1bb", "a\rb", "a\x7fb", "\xff", "\xc2\x9b", "\xc3", "\xed\xa0\x80",
+    };
+    for (unsupported) |input| {
         var buffer = try Buffer.fromBytes(allocator, input);
         defer buffer.deinit(allocator);
         try std.testing.expect(!buffer.editable);
@@ -680,4 +684,87 @@ fn backwardsWorkflow(allocator: Allocator) !void {
     try std.testing.expectEqualStrings(before, buffer.bytes());
     try std.testing.expect(try buffer.redo(allocator));
     try std.testing.expectEqualStrings(before[50..], buffer.bytes());
+}
+
+test "UTF-8 text is editable, and refused replacements change nothing" {
+    const allocator = std.testing.allocator;
+    // é (2 bytes), € (3), CRLF, 材 (3), ✅ (3), 𝑥 (4).
+    const before = "\u{e9}\u{20ac}\r\n\u{6750}\u{2705}\u{1d465}";
+    var buffer = try Buffer.fromBytes(allocator, before);
+    defer buffer.deinit(allocator);
+    try std.testing.expect(buffer.editable);
+    try buffer.replace(allocator, .{ .start = 0, .end = 0 }, "x", 1);
+    const after = "x" ++ before;
+    // Start, end, inserted text and cursor, then the refusal.
+    const Refusal = struct { usize, usize, []const u8, usize, Error };
+    const refused = [_]Refusal{
+        // Ranges that split a sequence or a CRLF.
+        .{ 2, 2, "", 1, error.InvalidRange },
+        .{ 1, 4, "", 1, error.InvalidRange },
+        .{ 7, 15, "", 7, error.InvalidRange },
+        .{ 15, 17, "", 15, error.InvalidRange },
+        // Cursors inside a sequence, in inserted text or in the surrounding text.
+        .{ 1, 1, "\u{e9}", 2, error.InvalidCursor },
+        .{ 1, 3, "", 2, error.InvalidCursor },
+        .{ 0, 1, "", 15, error.InvalidCursor },
+        // Inserted text that is not editable: truncated, a lone continuation
+        // byte, overlong, a surrogate, C1 and DEL.
+        .{ 1, 1, "\xc3", 1, error.UnsupportedText },
+        .{ 1, 1, "\xa9", 1, error.UnsupportedText },
+        .{ 1, 1, "\xc0\xaf", 1, error.UnsupportedText },
+        .{ 1, 1, "\xed\xa0\x80", 1, error.UnsupportedText },
+        .{ 1, 1, "\u{9b}", 1, error.UnsupportedText },
+        .{ 1, 1, "\x7f", 1, error.UnsupportedText },
+    };
+    for (refused) |case| {
+        const start, const end, const text, const cursor, const err = case;
+        const range: Range = .{ .start = start, .end = end };
+        try std.testing.expectError(err, buffer.replace(allocator, range, text, cursor));
+        try expectState(&buffer, after, 1, 1, 1, true);
+    }
+    // Whole characters can be replaced, and replay restores the exact bytes.
+    try buffer.replace(allocator, .{ .start = 3, .end = 6 }, "\u{2014}\u{3c3}", 8);
+    const replaced = "x\u{e9}\u{2014}\u{3c3}\r\n\u{6750}\u{2705}\u{1d465}";
+    try std.testing.expectEqualStrings(replaced, buffer.bytes());
+    try buffer.replace(allocator, .{ .start = 16, .end = 20 }, "", 16);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings(after, buffer.bytes());
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqualStrings(replaced[0..16], buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 16), buffer.cursor);
+    try std.testing.expectError(error.InvalidCursor, buffer.setCursor(15));
+}
+
+test "multi-byte insertion and deletion failures retain earlier edits and history" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, multibyteWorkflow, .{});
+}
+
+fn multibyteWorkflow(allocator: Allocator) !void {
+    const before = "a\u{2014}b\r\n";
+    var buffer = try Buffer.fromBytes(allocator, before);
+    defer buffer.deinit(allocator);
+    try buffer.setCursor(4);
+    buffer.beginGroup();
+    buffer.replace(allocator, .{ .start = 4, .end = 4 }, "\u{e9}", 6) catch |err| {
+        try expectState(&buffer, before, 4, 0, 0, false);
+        return err;
+    };
+    buffer.replace(allocator, .{ .start = 6, .end = 6 }, "\u{6750}\u{2705}\n", 13) catch |err| {
+        try expectState(&buffer, "a\u{2014}\u{e9}b\r\n", 6, 1, 1, true);
+        return err;
+    };
+    // Deleting a 3-byte character before the typed text.
+    buffer.replace(allocator, .{ .start = 1, .end = 4 }, "", 1) catch |err| {
+        try expectState(&buffer, "a\u{2014}\u{e9}\u{6750}\u{2705}\nb\r\n", 13, 1, 1, true);
+        return err;
+    };
+    buffer.endGroup();
+    const after = "a\u{e9}\u{6750}\u{2705}\nb\r\n";
+    try expectState(&buffer, after, 1, 1, 1, true);
+    try std.testing.expect(try buffer.undo(allocator));
+    try expectState(&buffer, before, 4, 0, 1, false);
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqualStrings(after, buffer.bytes());
 }

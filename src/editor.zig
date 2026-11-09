@@ -5,6 +5,7 @@ const Buffer = @import("buffer.zig").Buffer;
 const EditError = @import("buffer.zig").Error;
 const max_file_bytes = @import("buffer.zig").max_file_bytes;
 const max_lines = @import("buffer.zig").max_lines;
+const char = @import("char.zig");
 const motion = @import("motion.zig");
 const input = @import("input.zig");
 const command = @import("command.zig");
@@ -45,7 +46,12 @@ pub const Editor = struct {
         event: input.Event,
     ) ?command.File {
         if (event == .escape or (event == .key and event.key == 3)) self.notice = "";
-        const action = self.parser.feed(event) orelse return null;
+        const parsed = self.parser.feed(event);
+        // A dropped character is reported after whatever the event did.
+        defer if (self.parser.discarded) {
+            self.notice = "Invalid or interrupted character; nothing inserted";
+        };
+        const action = parsed orelse return null;
         switch (action) {
             .file => |file| return file,
             .invalid => self.notice = "Unsupported command or count",
@@ -92,7 +98,7 @@ pub const Editor = struct {
                 const end = start + buffer.line(row).len;
                 switch (insertion) {
                     .before => {},
-                    .after => buffer.cursor = @min(buffer.cursor + 1, end),
+                    .after => buffer.cursor = @min(char.next(buffer.bytes(), buffer.cursor), end),
                     .above, .below => {
                         const newline = buffer.newlineAt(buffer.cursor);
                         const offset = if (insertion == .above) start else end;
@@ -140,18 +146,19 @@ pub const Editor = struct {
                 }
                 goal.* = motion.screenColumn(buffer, buffer.cursor, changing);
             },
-            .text => |byte| try insert(allocator, buffer, &.{byte}),
+            .text => |text| try insert(allocator, buffer, text),
             .tab => try insert(allocator, buffer, "\t"),
             .newline => try insert(allocator, buffer, buffer.newlineAt(buffer.cursor)),
             .backspace => {
                 if (buffer.cursor != 0) {
                     const end = buffer.cursor;
-                    const start = end - if (end >= 2 and std.mem.eql(u8, buffer.bytes()[end - 2 .. end], "\r\n")) @as(usize, 2) else 1;
+                    const start = char.previous(buffer.bytes(), end);
                     try buffer.replace(allocator, .{ .start = start, .end = end }, "", start);
                 }
             },
             .end_insert => {
                 const row = buffer.rowAt(buffer.cursor);
+                // Stepping back one byte, then snapping, lands on a character start.
                 if (buffer.cursor > buffer.starts.items[row]) buffer.cursor -= 1;
                 buffer.cursor = motion.normal(buffer, buffer.cursor);
                 buffer.endCommand();
@@ -181,7 +188,7 @@ pub const Editor = struct {
                 self.paste_cr = byte == '\r';
                 const bytes: []const u8 = switch (byte) {
                     '\r', '\n' => self.paste_newline[0..self.paste_newline_len],
-                    '\t', 0x20...0x7e => &.{byte},
+                    '\t', 0x20...0x7e, 0x80...0xff => &.{byte},
                     else => {
                         self.paste_failed = true;
                         self.notice = "Unsupported paste; nothing inserted";
@@ -200,7 +207,13 @@ pub const Editor = struct {
             },
             .paste_end => {
                 defer self.paste.clearRetainingCapacity();
-                if (!self.paste_failed) try insert(allocator, buffer, self.paste.items);
+                if (self.paste_failed) return;
+                // Checked here, so a bad paste never reads as a read-only refusal.
+                if (!char.editable(self.paste.items)) {
+                    self.notice = "Unsupported paste; nothing inserted";
+                    return;
+                }
+                try insert(allocator, buffer, self.paste.items);
             },
             else => unreachable,
         }
@@ -213,7 +226,7 @@ fn insert(allocator: Allocator, buffer: *Buffer, bytes: []const u8) EditError!vo
 
 fn editError(err: anyerror) []const u8 {
     return switch (err) {
-        error.UnsupportedText => "Read-only: non-ASCII or unsupported control bytes",
+        error.UnsupportedText => "Read-only: invalid UTF-8 or unsupported control bytes",
         error.FileTooLarge => "Edit exceeds temporary 8 MiB limit",
         error.TooManyLines => "Edit exceeds temporary 262,144-line limit",
         error.OutOfMemory => "Not enough memory; edit refused",
@@ -242,6 +255,13 @@ fn pasted(
     for (bytes) |byte| _ = editor.feed(allocator, buffer, goal, .{ .paste_byte = byte });
     _ = editor.feed(allocator, buffer, goal, .paste_end);
 }
+
+// é is 2 bytes; €, ✅ and 材 are 3, and the last two are wide; 𝑥 is 4.
+const acute = "\u{e9}";
+const euro = "\u{20ac}";
+const check = "\u{2705}";
+const wide = "\u{6750}";
+const math = "\u{1d465}";
 
 test "composed operators have fixed Vim text and cursor results and one undo group" {
     const allocator = std.testing.allocator;
@@ -396,7 +416,7 @@ fn allocationWorkflow(allocator: Allocator) !void {
     // Exercise fallible operations directly to propagate allocation failures to
     // the harness; production feed turns them into a visible notice.
     try editor.edit(allocator, &buffer, &goal, .{ .insert = .before });
-    try editor.edit(allocator, &buffer, &goal, .{ .text = 'X' });
+    try editor.edit(allocator, &buffer, &goal, .{ .text = "X" });
     editor.edit(allocator, &buffer, &goal, .{ .insert = .above }) catch |err| {
         try std.testing.expectEqualStrings("Xabc\n", buffer.bytes());
         return err;
@@ -457,4 +477,127 @@ test "paste collection overflow is bounded and inserts nothing" {
     try std.testing.expectEqualStrings("Xbase", buffer.bytes());
     keys(&editor, allocator, &buffer, &goal, "\x03u");
     try std.testing.expectEqualStrings("base", buffer.bytes());
+}
+
+test "typing, a, Backspace and insert exit work by character" {
+    const allocator = std.testing.allocator;
+    // Before, keys, after, then the cursor after the keys and after undo.
+    const Case = struct { []const u8, []const u8, []const u8, usize, usize };
+    const cases = [_]Case{
+        .{ acute ++ euro, "a" ++ check ++ "\x03", acute ++ check ++ euro, 2, 0 },
+        .{ acute ++ euro, "$a\x7f\x7fX\x03", "X", 0, 2 },
+        .{ wide ++ "\r\nx", "ji\x7f\x7fY\x03", "Yx", 0, 5 },
+        .{ "ab" ++ check, "$i" ++ acute ++ "\x03", "ab" ++ acute ++ check, 2, 2 },
+        .{ math ++ "y", "a" ++ acute ++ "\x03", math ++ acute ++ "y", 4, 0 },
+        .{ "x" ++ math, "$a\x03", "x" ++ math, 1, 1 },
+        // An interrupted character inserts nothing; the interrupting key acts.
+        .{ "z", "i" ++ check[0..2] ++ "X" ++ acute[0..1] ++ "\x03", "Xz", 0, 0 },
+    };
+    for (cases) |case| {
+        const before, const typed, const after, const cursor, const undo_cursor = case;
+        var buffer = try Buffer.fromBytes(allocator, before);
+        defer buffer.deinit(allocator);
+        var editor: Editor = .{};
+        var goal: motion.Goal = 0;
+        defer editor.deinit(allocator);
+        keys(&editor, allocator, &buffer, &goal, typed);
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(cursor, buffer.cursor);
+        try std.testing.expect(!editor.inserting());
+        keys(&editor, allocator, &buffer, &goal, "u");
+        try std.testing.expectEqualStrings(before, buffer.bytes());
+        try std.testing.expectEqual(undo_cursor, buffer.cursor);
+        keys(&editor, allocator, &buffer, &goal, "\x12");
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+    }
+}
+
+test "a dropped character or a non-ASCII command shows a notice and changes nothing" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "ok\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var goal: motion.Goal = 0;
+    defer editor.deinit(allocator);
+    const dropped = "Invalid or interrupted character; nothing inserted";
+    keys(&editor, allocator, &buffer, &goal, "i\xff");
+    try std.testing.expectEqualStrings(dropped, editor.notice);
+    keys(&editor, allocator, &buffer, &goal, "\u{9b}");
+    try std.testing.expectEqualStrings(dropped, editor.notice);
+    // Escape still leaves insert mode, and the notice survives it.
+    keys(&editor, allocator, &buffer, &goal, euro[0..2]);
+    _ = editor.feed(allocator, &buffer, &goal, .escape);
+    try std.testing.expect(!editor.inserting());
+    try std.testing.expectEqualStrings(dropped, editor.notice);
+    try std.testing.expectEqualStrings("ok\n", buffer.bytes());
+    try std.testing.expect(!buffer.modified());
+    keys(&editor, allocator, &buffer, &goal, "l" ++ check);
+    try std.testing.expectEqualStrings("Unsupported command or count", editor.notice);
+    try std.testing.expectEqual(@as(usize, 1), buffer.cursor);
+    keys(&editor, allocator, &buffer, &goal, "h");
+    try std.testing.expectEqualStrings("", editor.notice);
+}
+
+test "UTF-8 pastes insert as one step; invalid ones insert nothing with their own notice" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "a\r\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var goal: motion.Goal = 0;
+    defer editor.deinit(allocator);
+    keys(&editor, allocator, &buffer, &goal, "i");
+    pasted(&editor, allocator, &buffer, &goal, acute ++ check ++ "\n" ++ wide ++ math);
+    const after = acute ++ check ++ "\r\n" ++ wide ++ math ++ "a\r\n";
+    try std.testing.expectEqualStrings(after, buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 14), buffer.cursor);
+    // Invalid bytes, truncated and overlong forms, a surrogate, a code point
+    // above U+10FFFF, C1, DEL and ESC.
+    const invalid = [_][]const u8{
+        "\xff",          "x" ++ acute[0..1], acute[1..] ++ "x", "\xc0\xaf",
+        "\xed\xa0\x80",  "\xf4\x90\x80\x80", "x\u{9b}",         "x\x7f",
+        check ++ "\x1b",
+    };
+    for (invalid) |bad| {
+        pasted(&editor, allocator, &buffer, &goal, bad);
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqualStrings("Unsupported paste; nothing inserted", editor.notice);
+        try std.testing.expect(editor.inserting());
+    }
+    keys(&editor, allocator, &buffer, &goal, "\x03u");
+    try std.testing.expectEqualStrings("a\r\n", buffer.bytes());
+    try std.testing.expect(!buffer.modified());
+}
+
+test "allocation failures during multi-byte typing and paste keep earlier edits" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, multibyteWorkflow, .{});
+}
+
+fn multibyteWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, euro ++ "\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var goal: motion.Goal = 0;
+    defer editor.deinit(allocator);
+    try editor.edit(allocator, &buffer, &goal, .{ .insert = .after });
+    editor.edit(allocator, &buffer, &goal, .{ .text = acute }) catch |err| {
+        try std.testing.expectEqualStrings(euro ++ "\n", buffer.bytes());
+        return err;
+    };
+    try editor.edit(allocator, &buffer, &goal, .paste_begin);
+    for (check ++ "\n" ++ wide) |byte| {
+        try editor.edit(allocator, &buffer, &goal, .{ .paste_byte = byte });
+    }
+    if (editor.paste_failed) return error.OutOfMemory;
+    editor.edit(allocator, &buffer, &goal, .paste_end) catch |err| {
+        try std.testing.expectEqualStrings(euro ++ acute ++ "\n", buffer.bytes());
+        try std.testing.expectEqual(@as(usize, 5), buffer.cursor);
+        return err;
+    };
+    const typed = euro ++ acute ++ check ++ "\n" ++ wide ++ "\n";
+    try std.testing.expectEqualStrings(typed, buffer.bytes());
+    // Leaving insert mode lands on the start of the last inserted character.
+    try editor.edit(allocator, &buffer, &goal, .end_insert);
+    try std.testing.expectEqual(@as(usize, 9), buffer.cursor);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings(euro ++ "\n", buffer.bytes());
 }

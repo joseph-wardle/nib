@@ -591,11 +591,11 @@ const App = struct {
             } else if (self.editor.notice.len != 0) {
                 line.put(self.editor.notice);
             } else {
-                var status: [96]u8 = undefined;
+                var status: [128]u8 = undefined;
                 const flags = if (buffer.modified())
                     " [+]"
                 else if (!buffer.editable)
-                    " [read-only: unsupported bytes]"
+                    " [read-only: invalid UTF-8 or control bytes]"
                 else
                     "";
                 line.put(std.fmt.bufPrint(&status, "{s}{s} | {d}:{d} | ", .{
