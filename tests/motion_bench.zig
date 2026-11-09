@@ -8,9 +8,10 @@ const motion = view.motion;
 // the motion, move the cursor, follow it, place the terminal cursor and compute
 // the status column. Each sample starts from the same cursor, 90% of the way
 // along the middle line, where column scans are longest. Rendering and output
-// are not included. No timing threshold is a test.
+// are not timed with the motions; a separate sample renders every content row
+// once the view follows the cursor. Output is not written. No timing threshold
+// is a test.
 pub fn main(init: std.process.Init) !void {
-    const samples = 1000;
     const lines = [_]struct { name: []const u8, text: []const u8 }{
         .{
             .name = "ASCII",
@@ -52,8 +53,8 @@ pub fn main(init: std.process.Init) !void {
                         buffer.cursor = result.destination;
                         goal = result.goal;
                     }
-                    viewport.follow(&buffer, 50, 200, false);
-                    const cell = viewport.cursor(&buffer, 50, 200, false);
+                    viewport.follow(&buffer, rows, columns, false);
+                    const cell = viewport.cursor(&buffer, rows, columns, false);
                     const status = motion.screenColumn(&buffer, buffer.cursor, false);
                     std.mem.doNotOptimizeAway(cell);
                     std.mem.doNotOptimizeAway(status);
@@ -61,17 +62,41 @@ pub fn main(init: std.process.Init) !void {
                     const after = std.Io.Timestamp.now(init.io, .awake);
                     elapsed.* = before.durationTo(after).toNanoseconds();
                 }
-                std.mem.sort(i96, &times, {}, std.sort.asc(i96));
-                std.debug.print("  {s}: p50/p99/max {d}/{d}/{d} ns over {d} samples\n", .{
-                    @tagName(key),
-                    times[samples / 2],
-                    times[samples * 99 / 100],
-                    times[samples - 1],
-                    samples,
-                });
+                summary(@tagName(key), &times);
             }
+            // A whole content area scrolled to the cursor, as one frame draws it.
+            buffer.cursor = origin;
+            viewport = .{};
+            viewport.follow(&buffer, rows, columns, false);
+            var output: [3 * columns]u8 = undefined;
+            var times: [samples]i96 = undefined;
+            for (&times) |*elapsed| {
+                const before = std.Io.Timestamp.now(init.io, .awake);
+                for (0..rows) |content| {
+                    const used = viewport.renderRow(&buffer, content, columns, &output);
+                    std.mem.doNotOptimizeAway(output[0..used]);
+                }
+                const after = std.Io.Timestamp.now(init.io, .awake);
+                elapsed.* = before.durationTo(after).toNanoseconds();
+            }
+            summary("render 50x200", &times);
         }
     }
+}
+
+const samples = 1000;
+const rows = 50;
+const columns = 200;
+
+fn summary(name: []const u8, times: *[samples]i96) void {
+    std.mem.sort(i96, times, {}, std.sort.asc(i96));
+    std.debug.print("  {s}: p50/p99/max {d}/{d}/{d} ns over {d} samples\n", .{
+        name,
+        times[samples / 2],
+        times[samples * 99 / 100],
+        times[samples - 1],
+        samples,
+    });
 }
 
 /// About 100 KiB of `line` repeated, ending each copy with LF, or with a space

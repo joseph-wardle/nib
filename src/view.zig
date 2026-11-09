@@ -35,68 +35,197 @@ pub const Viewport = struct {
         return .{ .row = row - self.top, .column = col - self.left };
     }
 
-    /// No allocation or mutation; output is padded printable ASCII.
-    pub fn renderRow(self: Viewport, buffer: *const Buffer, row: usize, output: []u8) void {
+    /// Draws content row `row` into `columns` cells; see `renderText`. A row
+    /// past the text is blank. Returns the bytes used.
+    pub fn renderRow(
+        self: Viewport,
+        buffer: *const Buffer,
+        row: usize,
+        columns: usize,
+        output: []u8,
+    ) usize {
         if (self.top >= buffer.insertionRows() or row >= buffer.insertionRows() - self.top) {
-            @memset(output, ' ');
-            return;
+            @memset(output[0..columns], ' ');
+            return columns;
         }
-        renderText(buffer.line(self.top + row), self.left, output);
+        return renderText(buffer.line(self.top + row), self.left, columns, output);
     }
 };
 
-/// Clips by display column, including inside a tab. Also suitable for a path
-/// label: every control/non-ASCII byte becomes '?', including embedded newlines.
-/// Tabs use eight-column stops from the beginning of text, before clipping.
-pub fn renderText(text: []const u8, left: usize, output: []u8) void {
-    @memset(output, ' ');
-    if (output.len == 0) return;
+/// Draws one line of text, without its terminator, from display column `left`
+/// into exactly `columns` cells. Allowlisted characters are copied as they are,
+/// a tab is spaces to the next eight-column stop from the start of `text`, and
+/// anything else (controls, invalid bytes, unlisted characters) is one `?`
+/// cell. A wide character cut by either edge shows its visible cell as a space.
+/// `output` holds at least `3 * columns` bytes, which bounds any row because no
+/// drawn character takes more than 3 bytes per cell. Returns the bytes used.
+pub fn renderText(text: []const u8, left: usize, columns: usize, output: []u8) usize {
+    std.debug.assert(output.len >= 3 * columns);
+    const right = left +| columns;
+    var used: usize = 0;
     var column: usize = 0;
-    for (text) |byte| {
-        const width = char.cells(if (byte < 0x80) byte else null, column);
-        const skipped = left -| column;
-        const offset = column -| left;
-        if (offset >= output.len) break;
-        if (skipped < width) {
-            const count = @min(width - skipped, output.len - offset);
-            const cell: u8 = if (byte == '\t') ' ' else if (byte >= 0x20 and byte <= 0x7e) byte else '?';
-            @memset(output[offset..][0..count], cell);
+    var position: usize = 0;
+    while (position < text.len and column < right) {
+        const byte = text[position];
+        var len: usize = 1;
+        var cells: usize = 1;
+        // Spaces when null.
+        var glyph: ?[]const u8 = "?";
+        if (byte < 0x80) {
+            if (byte == '\t') {
+                cells = char.cells('\t', column);
+                glyph = null;
+            } else if (byte >= 0x20 and byte < 0x7f) glyph = text[position..][0..1];
+        } else {
+            const character = char.decode(text, position);
+            len = character.len;
+            if (character.code) |code| if (char.width(code)) |width| {
+                cells = width;
+                glyph = text[position..][0..len];
+            };
         }
-        column += width;
+        const end = column + cells;
+        if (end > left) {
+            const whole = column >= left and end <= right;
+            if (whole and glyph != null) {
+                @memcpy(output[used..][0..glyph.?.len], glyph.?);
+                used += glyph.?.len;
+            } else {
+                const visible = @min(end, right) - @max(column, left);
+                @memset(output[used..][0..visible], ' ');
+                used += visible;
+            }
+        }
+        column = end;
+        position += len;
     }
+    const drawn = @min(column, right) -| left;
+    @memset(output[used..][0 .. columns - drawn], ' ');
+    return used + columns - drawn;
 }
 
 test "rendering clips inside tabs and pads short rows" {
     var text = try Buffer.fromBytes(std.testing.allocator, "a\tb\tc\nshort\n");
     defer text.deinit(std.testing.allocator);
-    var buffer: [12]u8 = undefined;
+    var storage: [36]u8 = undefined;
     var viewport: Viewport = .{ .left = 4 };
-    viewport.renderRow(&text, 0, &buffer);
-    try std.testing.expectEqualStrings("    b       ", &buffer);
+    try expectRow("    b       ", viewport, &text, 0, 12, &storage);
     viewport.left = 7;
-    viewport.renderRow(&text, 0, buffer[0..4]);
-    try std.testing.expectEqualStrings(" b  ", buffer[0..4]);
+    try expectRow(" b  ", viewport, &text, 0, 4, &storage);
     viewport.left = 8;
-    viewport.renderRow(&text, 0, buffer[0..9]);
-    try std.testing.expectEqualStrings("b       c", buffer[0..9]);
+    try expectRow("b       c", viewport, &text, 0, 9, &storage);
     viewport.left = 16;
-    viewport.renderRow(&text, 0, buffer[0..4]);
-    try std.testing.expectEqualStrings("c   ", buffer[0..4]);
+    try expectRow("c   ", viewport, &text, 0, 4, &storage);
     viewport.left = 0;
-    viewport.renderRow(&text, 1, &buffer);
-    try std.testing.expectEqualStrings("short       ", &buffer);
-    viewport.renderRow(&text, 2, buffer[0..4]);
-    try std.testing.expectEqualStrings("    ", buffer[0..4]);
+    try expectRow("short       ", viewport, &text, 1, 12, &storage);
+    try expectRow("    ", viewport, &text, 2, 4, &storage);
 }
 
-test "all byte values and hostile filenames render as safe ASCII" {
+test "rendering draws only allowlisted characters and fills exactly the requested cells" {
     var bytes: [256]u8 = undefined;
     for (&bytes, 0..) |*byte, index| byte.* = @intCast(index);
-    var buffer: [512]u8 = undefined;
-    renderText(&bytes, 0, &buffer);
-    for (buffer) |byte| try std.testing.expect(byte >= 0x20 and byte <= 0x7e);
-    renderText("file\x1b[2J\n\r\x7f\xc3\xa9", 0, buffer[0..14]);
-    try std.testing.expectEqualStrings("file?[2J????? ", buffer[0..14]);
+    var random: [512]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x6e6962);
+    prng.random().bytes(&random);
+    const hostile = [_][]const u8{
+        &bytes,
+        &random,
+        // C1 CSI, DEL and ESC sequences.
+        "\xc2\x9b2J\x7f\x1b[2J\r",
+        // Bidi overrides and isolates, zero-width and byte-order marks.
+        "a\u{202e}b\u{2066}c\u{200b}d\u{feff}e\u{2060}",
+        // Combining marks and an emoji variation selector.
+        "e\u{301}\u{20dd}\u{3099}\u{2764}\u{fe0f}",
+        // A surrogate, overlong forms, beyond U+10FFFF and truncated sequences.
+        "\xed\xa0\x80\xc0\xaf\xe0\x80\xaf\xf4\x90\x80\x80\xe2\x80",
+        // Allowlisted characters, wide ones split at every edge below.
+        "\t\u{e9}\u{2014}\u{3c3}\u{6750}\u{6599}\u{2705}\u{1f680}\u{2502}",
+    };
+    var storage: [3 * 40]u8 = undefined;
+    for (hostile) |text| {
+        for (0..12) |left| {
+            for (0..41) |columns| {
+                const output = storage[0..renderText(text, left, columns, &storage)];
+                try std.testing.expect(std.unicode.utf8ValidateSlice(output));
+                var cells: usize = 0;
+                var position: usize = 0;
+                while (position < output.len) {
+                    const character = char.decode(output, position);
+                    cells += char.width(character.code.?).?;
+                    position += character.len;
+                }
+                try std.testing.expectEqual(columns, cells);
+            }
+        }
+    }
+    // U+009B is one character, so one placeholder.
+    try expectText("file?[2J???? ", "file\x1b[2J\n\r\x7f\xc2\x9b", 0, 13);
+    try expectText("e??\u{e9}", "e\u{301}\u{feff}\u{e9}", 0, 4);
+    try expectText("????", "\xed\xa0\x80\xc0", 0, 4);
+}
+
+test "every clipping boundary agrees with a fully expanded line" {
+    const Cell = struct { glyph: []const u8, half: enum { whole, first, second } = .whole };
+    const space: Cell = .{ .glyph = " " };
+    const wide = "\u{6750}";
+    const check = "\u{2705}";
+    const tab: [8]Cell = @splat(space);
+    const expanded = tab ++ [_]Cell{.{ .glyph = "A" }} ++ tab[1..].* ++ [_]Cell{
+        .{ .glyph = wide, .half = .first },
+        .{ .glyph = wide, .half = .second },
+        .{ .glyph = "\u{e9}" },
+        .{ .glyph = check, .half = .first },
+        .{ .glyph = check, .half = .second },
+        .{ .glyph = "?" },
+        .{ .glyph = "\u{2014}" },
+    };
+    const text = "\tA\t" ++ wide ++ "\u{e9}" ++ check ++ "\u{301}\u{2014}";
+    var expected: [3 * 30]u8 = undefined;
+    var storage: [3 * 30]u8 = undefined;
+    for (0..expanded.len + 2) |left| {
+        for (0..30) |columns| {
+            var len: usize = 0;
+            var cell = left;
+            while (cell < left + columns) : (cell += 1) {
+                const shown = if (cell < expanded.len) expanded[cell] else space;
+                const whole = switch (shown.half) {
+                    .whole => true,
+                    .first => cell + 1 < left + columns,
+                    .second => false,
+                };
+                const glyph = if (whole) shown.glyph else " ";
+                @memcpy(expected[len..][0..glyph.len], glyph);
+                len += glyph.len;
+                if (shown.half == .first and whole) cell += 1;
+            }
+            try std.testing.expectEqualStrings(
+                expected[0..len],
+                storage[0..renderText(text, left, columns, &storage)],
+            );
+        }
+    }
+}
+
+test "the cursor's column is the cell where rendering draws its character" {
+    const text = "a\t\u{6750}e\u{301}\u{2705}\xffz";
+    var buffer = try Buffer.fromBytes(std.testing.allocator, text);
+    defer buffer.deinit(std.testing.allocator);
+    const cases = [_]struct { offset: usize, column: usize, glyph: []const u8 }{
+        .{ .offset = 0, .column = 0, .glyph = "a" },
+        .{ .offset = 1, .column = 1, .glyph = "       " },
+        .{ .offset = 2, .column = 8, .glyph = "\u{6750}" },
+        .{ .offset = 5, .column = 10, .glyph = "e" },
+        .{ .offset = 6, .column = 11, .glyph = "?" },
+        .{ .offset = 8, .column = 12, .glyph = "\u{2705}" },
+        .{ .offset = 11, .column = 14, .glyph = "?" },
+        .{ .offset = 12, .column = 15, .glyph = "z" },
+    };
+    for (cases) |case| {
+        const cells = motion.screenCells(&buffer, case.offset, true);
+        try std.testing.expectEqual(case.column, cells.column);
+        const columns = motion.screenCells(&buffer, char.next(text, case.offset), true).column;
+        try expectText(case.glyph, text, case.column, columns - case.column);
+    }
 }
 
 test "following scrolls only to reveal the cursor and survives tiny geometry" {
@@ -121,9 +250,9 @@ test "following scrolls only to reveal the cursor and survives tiny geometry" {
     try std.testing.expectEqualDeep(Viewport{}, viewport);
     viewport.top = std.math.maxInt(usize);
     viewport.left = std.math.maxInt(usize);
-    var output: [3]u8 = undefined;
-    viewport.renderRow(&buffer, std.math.maxInt(usize), &output);
-    try std.testing.expectEqualStrings("   ", &output);
+    var storage: [9]u8 = undefined;
+    try expectRow("   ", viewport, &buffer, std.math.maxInt(usize), 3, &storage);
+    try expectRow("   ", .{ .left = std.math.maxInt(usize) }, &buffer, 0, 3, &storage);
     viewport.follow(&buffer, 0, 0, false);
     try std.testing.expectEqualDeep(Viewport{}, viewport);
 }
@@ -153,25 +282,9 @@ test "a long line can be clipped near its end without wrapping or modification" 
     var viewport: Viewport = .{};
     text.cursor = text.bytes().len - 1;
     viewport.follow(&text, 1, 4, false);
-    var buffer: [4]u8 = undefined;
-    viewport.renderRow(&text, 0, &buffer);
-    try std.testing.expectEqualStrings("tail", &buffer);
+    var storage: [12]u8 = undefined;
+    try expectRow("tail", viewport, &text, 0, 4, &storage);
     try std.testing.expectEqualSlices(u8, bytes, text.bytes());
-}
-
-test "every clipping boundary agrees with a fully expanded line" {
-    const expanded = "        A       BC";
-    var buffer: [24]u8 = undefined;
-    for (0..expanded.len + 2) |left| {
-        for (0..buffer.len + 1) |width| {
-            renderText("\tA\tBC", left, buffer[0..width]);
-            for (buffer[0..width], 0..) |byte, column| {
-                const index = left + column;
-                const expected: u8 = if (index < expanded.len) expanded[index] else ' ';
-                try std.testing.expectEqual(expected, byte);
-            }
-        }
-    }
 }
 
 test "following keeps a whole wide cursor character visible, or its first cell" {
@@ -191,4 +304,22 @@ test "following keeps a whole wide cursor character visible, or its first cell" 
     viewport.left = 0;
     viewport.follow(&buffer, 1, 3, true);
     try std.testing.expectEqual(@as(usize, 0), viewport.left);
+}
+
+fn expectRow(
+    expected: []const u8,
+    viewport: Viewport,
+    buffer: *const Buffer,
+    row: usize,
+    columns: usize,
+    storage: []u8,
+) !void {
+    const used = viewport.renderRow(buffer, row, columns, storage);
+    try std.testing.expectEqualStrings(expected, storage[0..used]);
+}
+
+fn expectText(expected: []const u8, text: []const u8, left: usize, columns: usize) !void {
+    var storage: [3 * 64]u8 = undefined;
+    const used = renderText(text, left, columns, &storage);
+    try std.testing.expectEqualStrings(expected, storage[0..used]);
 }
