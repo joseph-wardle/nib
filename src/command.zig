@@ -81,7 +81,7 @@ pub const Parser = struct {
     pub fn feed(self: *Parser, event: input.Event) ?Action {
         self.discarded = false;
         if (self.character_need != 0) {
-            if (event == .key and continuation(event.key)) return self.continueCharacter(event.key);
+            if (event == .key and char.continuation(event.key)) return self.continueCharacter(event.key);
             self.discarded = self.mode == .insert;
             self.character_need = 0;
         }
@@ -278,10 +278,6 @@ pub const Parser = struct {
         return null;
     }
 };
-
-fn continuation(byte: u8) bool {
-    return byte & 0xc0 == 0x80;
-}
 
 fn multiply(first: ?usize, second: ?usize) error{Overflow}!?usize {
     if (first == null and second == null) return null;

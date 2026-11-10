@@ -207,7 +207,7 @@ pub const Buffer = struct {
         // virtual read: never on a continuation byte or the LF of a CRLF.
         if (cursor_after > 0 and cursor_after < length) {
             const after = self.resultByte(range, inserted, cursor_after);
-            if (after & 0xc0 == 0x80) return error.InvalidCursor;
+            if (char.continuation(after)) return error.InvalidCursor;
             const before = self.resultByte(range, inserted, cursor_after - 1);
             if (after == '\n' and before == '\r') return error.InvalidCursor;
         }

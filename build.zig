@@ -86,8 +86,12 @@ pub fn build(b: *std.Build) void {
         .paths = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src"), b.path("tests") },
         .check = true,
     });
-    const check = b.step("check", "Build, check formatting, and run tests");
+    const check = b.step("check", "Build, compile benchmarks, check formatting, and run tests");
     check.dependOn(b.getInstallStep());
     check.dependOn(&format.step);
     check.dependOn(test_step);
+    // Benchmarks are compiled, not run: a stale benchmark fails the check.
+    for ([_]*std.Build.Step.Compile{ buffer_bench, motion_bench, finder_bench }) |bench| {
+        check.dependOn(&bench.step);
+    }
 }

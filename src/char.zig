@@ -20,6 +20,11 @@ pub fn decode(bytes: []const u8, offset: usize) Character {
     return .{ .code = code, .len = len };
 }
 
+/// Whether a byte continues a UTF-8 sequence rather than starting a character.
+pub fn continuation(byte: u8) bool {
+    return byte & 0xc0 == 0x80;
+}
+
 /// The boundary after the character at a boundary `offset`; CRLF is one
 /// character. Returns `bytes.len` at the end.
 pub fn next(bytes: []const u8, offset: usize) usize {
@@ -105,10 +110,6 @@ pub fn editable(bytes: []const u8) bool {
         else => {},
     };
     return std.unicode.utf8ValidateSlice(bytes);
-}
-
-fn continuation(byte: u8) bool {
-    return byte & 0xc0 == 0x80;
 }
 
 fn find(code: u21) ?Range {
