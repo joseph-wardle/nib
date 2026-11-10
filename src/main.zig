@@ -211,20 +211,26 @@ const App = struct {
         const buffer = &entry.document.buffer;
         const old_mode = self.editor.parser.mode;
         const old_length = self.editor.parser.line_len;
+        const old_invalid = self.editor.parser.line_invalid;
         const old_cursor = buffer.cursor;
         const old_position = buffer.position;
         const old_text_length = buffer.bytes().len;
         const old_notice = self.editor.notice;
-        if (self.editor.feed(self.gpa, buffer, &entry.goal, event)) |action| {
+        const old_highlight = self.editor.highlight;
+        const old_viewport = entry.viewport;
+        if (self.editor.feed(self.gpa, buffer, &entry.goal, &entry.viewport, event)) |action| {
             self.fileAction(action);
             self.redraw = true;
             return;
         }
         const changed = old_mode != self.editor.parser.mode or
             old_length != self.editor.parser.line_len or
+            old_invalid != self.editor.parser.line_invalid or
             old_cursor != buffer.cursor or
             old_position != buffer.position or
             old_text_length != buffer.bytes().len or
+            old_highlight != self.editor.highlight or
+            !std.meta.eql(old_viewport, entry.viewport) or
             !std.mem.eql(u8, old_notice, self.editor.notice);
         if (changed) self.redraw = true;
     }

@@ -111,6 +111,7 @@ test "reload waits for every pending modal state" {
     }
 }
 
+const view = @import("view.zig");
 const testing = std.testing;
 const linux = std.os.linux;
 const posix = std.posix;
@@ -130,6 +131,7 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         defer document.deinit(testing.allocator);
         var editor: Editor = .{};
         var goal: motion.Goal = 0;
+        var viewport: view.Viewport = .{};
         defer editor.deinit(testing.allocator);
         var external: External = .{};
         defer external.deinit(testing.allocator);
@@ -137,6 +139,7 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
             testing.allocator,
             &document.buffer,
             &goal,
+            &viewport,
             .{ .key = byte },
         );
         try testing.expectEqual(@as(usize, 0), document.buffer.cursor);
@@ -160,10 +163,10 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
                 &editor,
             ) != null);
         }
-        _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'j' });
+        _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'j' });
         try testing.expectEqual(@as(usize, 14), document.buffer.cursor);
         try testing.expectEqual(@as(u8, '7'), document.buffer.bytes()[document.buffer.cursor]);
-        _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'k' });
+        _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'k' });
         try testing.expectEqual(@as(usize, 0), document.buffer.cursor);
     }
 }
@@ -183,10 +186,11 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             defer document.deinit(testing.allocator);
             var editor: Editor = .{};
             var goal: motion.Goal = 0;
+            var viewport: view.Viewport = .{};
             defer editor.deinit(testing.allocator);
             var external: External = .{};
             defer external.deinit(testing.allocator);
-            _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = '$' });
+            _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = '$' });
             try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
             if (explicit) {
                 try testing.expect(external.reload(
@@ -209,9 +213,9 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             }
             try testing.expectEqual(case.cursor, document.buffer.cursor);
             try testing.expectEqual(@as(?usize, case.goal), goal);
-            _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'k' });
+            _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'k' });
             try testing.expectEqual(case.up, document.buffer.cursor);
-            _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'j' });
+            _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'j' });
             try testing.expectEqual(case.cursor, document.buffer.cursor);
         }
     }
@@ -231,11 +235,12 @@ test "reload snaps a cursor inside shifted multi-byte text or a CRLF to a charac
         defer document.deinit(testing.allocator);
         var editor: Editor = .{};
         var goal: motion.Goal = 0;
+        var viewport: view.Viewport = .{};
         defer editor.deinit(testing.allocator);
         var external: External = .{};
         defer external.deinit(testing.allocator);
         for ("llll") |byte| {
-            _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = byte });
+            _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = byte });
         }
         try testing.expectEqual(@as(usize, 4), document.buffer.cursor);
         try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
@@ -260,13 +265,14 @@ test "notifications reload only clean command boundaries and keep dirty history 
     defer document.deinit(testing.allocator);
     var editor: Editor = .{};
     var goal: motion.Goal = 0;
+    var viewport: view.Viewport = .{};
     defer editor.deinit(testing.allocator);
     var external: External = .{};
     defer external.deinit(testing.allocator);
     external.inspect(testing.allocator, &document, true);
     try testing.expect(!external.watch.degraded);
     document.buffer.cursor = 10;
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'd' });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'd' });
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "new" });
     try changed(&external);
     external.inspect(testing.allocator, &document, true);
@@ -279,7 +285,7 @@ test "notifications reload only clean command boundaries and keep dirty history 
         &editor,
     ) == null);
     try testing.expectEqualStrings("original\nlast", document.buffer.bytes());
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 3 });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 3 });
     try testing.expect(external.automatic(
         testing.allocator,
         testing.io,
@@ -291,8 +297,8 @@ test "notifications reload only clean command boundaries and keep dirty history 
     try testing.expectEqual(@as(usize, 2), document.buffer.cursor);
     try testing.expectEqual(@as(usize, 0), document.buffer.history.items.len);
     try testing.expect(!external.diverged);
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'i' });
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'X' });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'i' });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'X' });
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "disk" });
     try changed(&external);
     external.inspect(testing.allocator, &document, true);
@@ -303,7 +309,7 @@ test "notifications reload only clean command boundaries and keep dirty history 
         &goal,
         &editor,
     ) == null);
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 3 });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 3 });
     try testing.expect(external.automatic(
         testing.allocator,
         testing.io,
@@ -366,9 +372,9 @@ test "notifications reload only clean command boundaries and keep dirty history 
     try testing.expectEqual(@as(usize, 0), document.buffer.history.items.len);
     try testing.expectEqualStrings("", external.status());
     // An ordinary save's queued directory/inode events compare equal to its new base.
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'i' });
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 'Y' });
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, .{ .key = 3 });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'i' });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 'Y' });
+    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = 3 });
     const report = document.source.save(testing.allocator, &document.buffer, .{});
     try testing.expect(report.verified);
     try changed(&external);

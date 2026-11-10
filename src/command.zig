@@ -70,6 +70,8 @@ pub const Action = union(enum) {
     invalid,
 };
 pub const Mode = enum { normal, insert, operator, command_line, search };
+/// Longest `:` line or search query, in bytes.
+pub const max_line = 4096;
 
 /// Owns incomplete commands, never text or terminal framing. Returned file paths
 /// and typed text borrow parser storage until the next feed; callers must handle
@@ -83,7 +85,7 @@ pub const Parser = struct {
     pending_g: bool = false,
     operator: motion.Operator = .delete,
     operator_count: ?usize = null,
-    line: [4096]u8 = undefined,
+    line: [max_line]u8 = undefined,
     line_len: usize = 0,
     line_invalid: bool = false,
     /// The search prompt's direction, combined count and pending operator.
