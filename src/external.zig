@@ -105,7 +105,7 @@ test "reload waits for every pending modal state" {
     editor.parser.pasting = true;
     try std.testing.expect(!External.safe(&editor));
     editor.parser.pasting = false;
-    for ([_]@import("command.zig").Mode{ .insert, .operator, .command_line }) |mode| {
+    for ([_]@import("command.zig").Mode{ .insert, .operator, .command_line, .search }) |mode| {
         editor.parser.mode = mode;
         try std.testing.expect(!External.safe(&editor));
     }

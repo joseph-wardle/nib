@@ -124,6 +124,7 @@ pub const Editor = struct {
                         const last = row + @min(count - 1, buffer.lineCount() - row - 1);
                         break :result motion.Result{ .destination = buffer.starts.items[last], .shape = .linewise, .goal = 0 };
                     },
+                    .search => return,
                 };
                 const selection = motion.operatorRange(buffer, result, operation.operator);
                 var range = selection.range;
@@ -205,6 +206,7 @@ pub const Editor = struct {
                     self.notice = editError(err);
                 };
             },
+            .prompt, .jump => {},
             .paste_end => {
                 defer self.paste.clearRetainingCapacity();
                 if (self.paste_failed) return;

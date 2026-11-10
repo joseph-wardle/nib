@@ -3,12 +3,36 @@ const std = @import("std");
 const char = @import("char.zig");
 const input = @import("input.zig");
 const motion = @import("motion.zig");
+const search = @import("search.zig");
 
 pub const Movement = struct { motion: motion.Motion, count: ?usize = null };
+/// A search motion. A typed query borrows parser storage until the next feed.
+pub const Search = struct {
+    target: union(enum) {
+        /// A query from the prompt, searched from where the prompt opened. An
+        /// empty query repeats the last one in this direction.
+        typed: struct { query: []const u8, direction: search.Direction },
+        /// `n` (`same`) or `N` (`reverse`): the last query, relative to the
+        /// last direction.
+        repeat: enum { same, reverse },
+    },
+    count: ?usize = null,
+};
+/// The `/` and `?` prompt's progress, so the editor can preview and restore.
+pub const Prompt = union(enum) {
+    /// The prompt opened; the search starts from here.
+    open,
+    /// The query changed. Null when it is empty or invalid: show the origin.
+    preview: ?Search,
+    /// Escape, Ctrl-C or Backspace on an empty query: back to the origin.
+    close,
+    /// Enter on an invalid query: back to the origin, reported as unsupported.
+    invalid,
+};
 pub const Insertion = enum { before, after, below, above };
 pub const Operation = struct {
     operator: motion.Operator,
-    movement: union(enum) { motion: Movement, lines: usize },
+    movement: union(enum) { motion: Movement, lines: usize, search: Search },
 };
 /// Commands about files and the session rather than the text.
 pub const File = union(enum) {
@@ -26,6 +50,9 @@ pub const File = union(enum) {
 };
 pub const Action = union(enum) {
     move: Movement,
+    /// `n`, `N`, or Enter at a prompt opened in normal mode.
+    jump: Search,
+    prompt: Prompt,
     operate: Operation,
     insert: Insertion,
     /// One typed character; borrows parser storage until the next feed.
@@ -42,7 +69,7 @@ pub const Action = union(enum) {
     paste_end,
     invalid,
 };
-pub const Mode = enum { normal, insert, operator, command_line };
+pub const Mode = enum { normal, insert, operator, command_line, search };
 
 /// Owns incomplete commands, never text or terminal framing. Returned file paths
 /// and typed text borrow parser storage until the next feed; callers must handle
@@ -59,6 +86,10 @@ pub const Parser = struct {
     line: [4096]u8 = undefined,
     line_len: usize = 0,
     line_invalid: bool = false,
+    /// The search prompt's direction, combined count and pending operator.
+    prompt_direction: search.Direction = .forward,
+    prompt_count: ?usize = null,
+    prompt_operator: ?motion.Operator = null,
     pasting: bool = false,
     character: [4]u8 = undefined,
     character_len: u3 = 0,
@@ -75,6 +106,8 @@ pub const Parser = struct {
         self.operator_count = null;
         self.line_len = 0;
         self.line_invalid = false;
+        self.prompt_count = null;
+        self.prompt_operator = null;
         self.character_need = 0;
     }
 
@@ -99,18 +132,11 @@ pub const Parser = struct {
                 if (self.mode == .normal or self.mode == .operator) self.cancel();
                 return null;
             },
-            .escape => {
-                const inserting = self.mode == .insert;
-                self.cancel();
-                return if (inserting) .end_insert else null;
-            },
+            .escape => return self.escape(),
             .key => |byte| {
-                if (byte == 3) {
-                    const inserting = self.mode == .insert;
-                    self.cancel();
-                    return if (inserting) .end_insert else null;
-                }
+                if (byte == 3) return self.escape();
                 if (self.mode == .command_line) return self.commandLine(byte);
+                if (self.mode == .search) return self.prompt(byte);
                 if (self.mode == .insert) return switch (byte) {
                     '\r', '\n' => .newline,
                     0x08, 0x7f => .backspace,
@@ -180,6 +206,22 @@ pub const Parser = struct {
             return if (pending_operator) .{ .operate = .{ .operator = operator, .movement = .{ .motion = movement } } } else .{ .move = movement };
         }
         if (pending_g) return .invalid;
+        if (byte == 'n' or byte == 'N' or byte == '/' or byte == '?') {
+            const combined = multiply(operator_count, count) catch return .invalid;
+            const operating: ?motion.Operator = if (pending_operator) operator else null;
+            if (byte == '/' or byte == '?') {
+                self.mode = .search;
+                self.prompt_direction = if (byte == '/') .forward else .backward;
+                self.prompt_count = combined;
+                self.prompt_operator = operating;
+                return .{ .prompt = .open };
+            }
+            const repeat: Search = .{
+                .target = .{ .repeat = if (byte == 'n') .same else .reverse },
+                .count = combined,
+            };
+            return searched(operating, repeat);
+        }
         if (pending_operator) {
             if ((operator == .delete and byte == 'd') or (operator == .change and byte == 'c')) {
                 const combined = multiply(operator_count, count) catch return .invalid;
@@ -238,6 +280,17 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Escape and Ctrl-C cancel whatever is pending.
+    fn escape(self: *Parser) ?Action {
+        const mode = self.mode;
+        self.cancel();
+        return switch (mode) {
+            .insert => .end_insert,
+            .search => .{ .prompt = .close },
+            else => null,
+        };
+    }
+
     fn reject(self: *Parser) Action {
         self.cancel();
         return .invalid;
@@ -262,6 +315,48 @@ pub const Parser = struct {
                     return .{ .file = .{ .write = line[2..] } };
                 return .invalid;
             },
+            else => self.editLine(byte),
+        }
+        return null;
+    }
+
+    fn prompt(self: *Parser, byte: u8) Action {
+        switch (byte) {
+            '\r', '\n' => {
+                // Reset state without overwriting storage borrowed by the action.
+                const typed = self.promptSearch();
+                const invalid = self.line_invalid;
+                const operator = self.prompt_operator;
+                self.cancel();
+                if (invalid) return .{ .prompt = .invalid };
+                return searched(operator, typed);
+            },
+            0x08, 0x7f => if (self.line_len == 0) {
+                self.cancel();
+                return .{ .prompt = .close };
+            },
+            else => {},
+        }
+        self.editLine(byte);
+        if (self.line_len == 0 or self.line_invalid) return .{ .prompt = .{ .preview = null } };
+        return .{ .prompt = .{ .preview = self.promptSearch() } };
+    }
+
+    /// The prompt's query as a search; borrows `line`.
+    fn promptSearch(self: *const Parser) Search {
+        return .{
+            .target = .{ .typed = .{
+                .query = self.line[0..self.line_len],
+                .direction = self.prompt_direction,
+            } },
+            .count = self.prompt_count,
+        };
+    }
+
+    /// Editing shared by the `:` line and the search prompt. Only ASCII is
+    /// accepted; anything else, or too long a line, invalidates it.
+    fn editLine(self: *Parser, byte: u8) void {
+        switch (byte) {
             0x08, 0x7f => {
                 if (self.line_len == 0) self.cancel() else self.line_len -= 1;
             },
@@ -275,9 +370,14 @@ pub const Parser = struct {
             },
             else => self.line_invalid = true,
         }
-        return null;
     }
 };
+
+/// A search motion as a jump, or as the motion of a pending operator.
+fn searched(pending: ?motion.Operator, movement: Search) Action {
+    const operator = pending orelse return .{ .jump = movement };
+    return .{ .operate = .{ .operator = operator, .movement = .{ .search = movement } } };
+}
 
 fn multiply(first: ?usize, second: ?usize) error{Overflow}!?usize {
     if (first == null and second == null) return null;
@@ -468,4 +568,137 @@ test "normal mode rejects each non-ASCII character once and cancels pending comm
     _ = keys(&parser, "\xe2\x9c");
     try std.testing.expectEqualDeep(Action{ .move = .{ .motion = .down } }, keys(&parser, "j").?);
     try std.testing.expect(!parser.discarded);
+}
+
+const next_word: Action = .{ .move = .{ .motion = .word } };
+
+fn expectAction(expected: Action, actual: ?Action) !void {
+    try std.testing.expectEqualDeep(expected, actual.?);
+}
+
+fn jump(query: []const u8, direction: search.Direction, count: ?usize) Action {
+    return .{ .jump = typedSearch(query, direction, count) };
+}
+
+fn operate(operator: motion.Operator, movement: Search) Action {
+    return .{ .operate = .{ .operator = operator, .movement = .{ .search = movement } } };
+}
+
+fn typedSearch(query: []const u8, direction: search.Direction, count: ?usize) Search {
+    return .{ .target = .{ .typed = .{ .query = query, .direction = direction } }, .count = count };
+}
+
+test "slash and question mark open a prompt that previews each change and jumps on Enter" {
+    var parser: Parser = .{};
+    try expectAction(Action{ .prompt = .open }, keys(&parser, "/"));
+    try std.testing.expectEqual(Mode.search, parser.mode);
+    const first: Action = .{ .prompt = .{ .preview = typedSearch("f", .forward, null) } };
+    try expectAction(first, keys(&parser, "f"));
+    const second: Action = .{ .prompt = .{ .preview = typedSearch("fo", .forward, null) } };
+    try expectAction(second, keys(&parser, "o"));
+    try expectAction(jump("fo", .forward, null), keys(&parser, "\r"));
+    try std.testing.expectEqual(Mode.normal, parser.mode);
+
+    const counted: Action = .{ .prompt = .{ .preview = typedSearch("x y", .backward, 12) } };
+    try expectAction(counted, keys(&parser, "12?x y"));
+    try expectAction(jump("x y", .backward, 12), keys(&parser, "\n"));
+
+    // An empty query is accepted; the editor repeats the last search.
+    try expectAction(jump("", .backward, null), keys(&parser, "?\r"));
+    try expectAction(next_word, keys(&parser, "w"));
+}
+
+test "n and N repeat with counts, alone and as operator motions" {
+    var parser: Parser = .{};
+    const same: Search = .{ .target = .{ .repeat = .same } };
+    const reverse: Search = .{ .target = .{ .repeat = .reverse }, .count = 3 };
+    try expectAction(Action{ .jump = same }, keys(&parser, "n"));
+    try expectAction(Action{ .jump = reverse }, keys(&parser, "3N"));
+    try expectAction(operate(.delete, same), keys(&parser, "dn"));
+    try expectAction(operate(.change, reverse), keys(&parser, "c3N"));
+    const refused = [_][]const u8{
+        "gn", "g/", "99999999999999999999999n", "9223372036854775808d2/",
+    };
+    for (refused) |invalid| {
+        try std.testing.expectEqualDeep(Action.invalid, keys(&parser, invalid).?);
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+    }
+}
+
+test "operators keep their combined count through the prompt and take the search as motion" {
+    var parser: Parser = .{};
+    for ([_]struct { keys: []const u8, operator: motion.Operator, search: Search }{
+        .{ .keys = "d/x\r", .operator = .delete, .search = typedSearch("x", .forward, null) },
+        .{ .keys = "c?bar\r", .operator = .change, .search = typedSearch("bar", .backward, null) },
+        .{ .keys = "d2/x\r", .operator = .delete, .search = typedSearch("x", .forward, 2) },
+        .{ .keys = "2d3/x\r", .operator = .delete, .search = typedSearch("x", .forward, 6) },
+        .{ .keys = "3c/\r", .operator = .change, .search = typedSearch("", .forward, 3) },
+    }) |case| {
+        try expectAction(operate(case.operator, case.search), keys(&parser, case.keys));
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+    }
+    // The preview carries the combined count too.
+    const preview: Action = .{ .prompt = .{ .preview = typedSearch("y", .forward, 4) } };
+    try expectAction(preview, keys(&parser, "2d2/y"));
+}
+
+test "Escape, Ctrl-C and Backspace on an empty query close the prompt and drop the operator" {
+    for ([_][]const u8{ "\x1b", "\x03", "\x7f" }) |close| {
+        for ([_][]const u8{ "/", "2?", "d/", "2c3?" }) |opening| {
+            var parser: Parser = .{};
+            try std.testing.expectEqualDeep(Action{ .prompt = .open }, keys(&parser, opening).?);
+            const event: input.Event = if (close[0] == 0x1b) .escape else .{ .key = close[0] };
+            try expectAction(Action{ .prompt = .close }, parser.feed(event));
+            try std.testing.expectEqual(Mode.normal, parser.mode);
+            try expectAction(next_word, keys(&parser, "w"));
+        }
+    }
+    // With text typed, Escape and Ctrl-C still close; Backspace edits.
+    var parser: Parser = .{};
+    _ = keys(&parser, "d/ab");
+    try expectAction(Action{ .prompt = .close }, parser.feed(.escape));
+    _ = keys(&parser, "/ab");
+    try expectAction(Action{ .prompt = .close }, keys(&parser, "\x03"));
+    _ = keys(&parser, "/ab");
+    const shorter: Action = .{ .prompt = .{ .preview = typedSearch("a", .forward, null) } };
+    try expectAction(shorter, keys(&parser, "\x08"));
+    const empty: Action = .{ .prompt = .{ .preview = null } };
+    try expectAction(empty, keys(&parser, "\x7f"));
+    try std.testing.expectEqual(Mode.search, parser.mode);
+    try expectAction(Action{ .prompt = .close }, keys(&parser, "\x7f"));
+    try std.testing.expectEqual(Mode.normal, parser.mode);
+}
+
+test "a non-ASCII, control or overlong query previews nothing and is refused on Enter" {
+    const invalid = [_][]const u8{ "/caf\u{e9}", "?a\tb", "/a\x00", "d/\x1bx" };
+    for (invalid) |typed| {
+        var parser: Parser = .{};
+        for (typed[0 .. typed.len - 1]) |byte| _ = parser.feed(.{ .key = byte });
+        const last = parser.feed(.{ .key = typed[typed.len - 1] });
+        // A lone ESC in this table is a key byte, not the decoded Escape event.
+        try expectAction(.{ .prompt = .{ .preview = null } }, last);
+        try expectAction(Action{ .prompt = .{ .preview = null } }, keys(&parser, "z"));
+        try expectAction(Action{ .prompt = .invalid }, keys(&parser, "\r"));
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        try expectAction(next_word, keys(&parser, "w"));
+    }
+    var parser: Parser = .{};
+    _ = keys(&parser, "/");
+    for (0..parser.line.len) |_| _ = keys(&parser, "q");
+    try std.testing.expect(keys(&parser, "q").?.prompt.preview == null);
+    try expectAction(Action{ .prompt = .invalid }, keys(&parser, "\r"));
+}
+
+test "the prompt ignores paste and arrows, and the command line is unchanged by it" {
+    var parser: Parser = .{};
+    _ = keys(&parser, "/a");
+    try std.testing.expect(parser.feed(.paste_begin) == null);
+    for ("\r\x1bq") |byte| try std.testing.expect(parser.feed(.{ .paste_byte = byte }) == null);
+    try std.testing.expect(parser.feed(.paste_end) == null);
+    try std.testing.expect(parser.feed(.ignored) == null);
+    try std.testing.expect(parser.feed(.{ .arrow = .up }) == null);
+    try std.testing.expectEqual(Mode.search, parser.mode);
+    try expectAction(jump("a", .forward, null), keys(&parser, "\r"));
+    try expectAction(Action{ .file = .{ .quit = false } }, keys(&parser, ":q\r"));
+    try expectAction(Action.invalid, keys(&parser, ":/a\r"));
 }
