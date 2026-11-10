@@ -1100,6 +1100,7 @@ test {
     _ = @import("finder.zig");
     _ = @import("match.zig");
     _ = @import("preview.zig");
+    _ = @import("search.zig");
 }
 
 test "Enter on an Open row whose file has closed relists rather than activating it" {
