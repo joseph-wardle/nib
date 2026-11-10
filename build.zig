@@ -32,6 +32,25 @@ pub fn build(b: *std.Build) void {
     });
     b.step("bench-buffer", "Measure ReleaseFast buffer edits, history, and retained bytes").dependOn(&b.addRunArtifact(buffer_bench).step);
 
+    const motion_bench = b.addExecutable(.{
+        .name = "motion-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/motion_bench.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "view", .module = b.createModule(.{
+                .root_source_file = b.path("src/view.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseFast,
+            }) }},
+        }),
+    });
+    const motion_step = b.step(
+        "bench-motion",
+        "Measure ReleaseFast per-key motion, follow and cursor-column work",
+    );
+    motion_step.dependOn(&b.addRunArtifact(motion_bench).step);
+
     const finder_bench = b.addExecutable(.{
         .name = "finder-bench",
         .root_module = b.createModule(.{

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
+const char = @import("char.zig");
 const input = @import("input.zig");
 const motion = @import("motion.zig");
 
@@ -27,7 +28,8 @@ pub const Action = union(enum) {
     move: Movement,
     operate: Operation,
     insert: Insertion,
-    text: u8,
+    /// One typed character; borrows parser storage until the next feed.
+    text: []const u8,
     newline,
     backspace,
     tab,
@@ -43,7 +45,8 @@ pub const Action = union(enum) {
 pub const Mode = enum { normal, insert, operator, command_line };
 
 /// Owns incomplete commands, never text or terminal framing. Returned file paths
-/// borrow line storage until the next feed; callers must handle actions promptly.
+/// and typed text borrow parser storage until the next feed; callers must handle
+/// actions promptly. Insert mode collects a character's bytes across keys.
 /// The application decides whether an editing action is available, and cancels
 /// insertion if it refuses entry. Paste collection/mutation belongs to that app.
 pub const Parser = struct {
@@ -57,6 +60,12 @@ pub const Parser = struct {
     line_len: usize = 0,
     line_invalid: bool = false,
     pasting: bool = false,
+    character: [4]u8 = undefined,
+    character_len: u3 = 0,
+    character_need: u3 = 0,
+    /// Set by `feed` when insert mode dropped an invalid character, or one
+    /// interrupted by another key or event; the caller reports it.
+    discarded: bool = false,
 
     pub fn cancel(self: *Parser) void {
         self.mode = .normal;
@@ -66,9 +75,16 @@ pub const Parser = struct {
         self.operator_count = null;
         self.line_len = 0;
         self.line_invalid = false;
+        self.character_need = 0;
     }
 
     pub fn feed(self: *Parser, event: input.Event) ?Action {
+        self.discarded = false;
+        if (self.character_need != 0) {
+            if (event == .key and continuation(event.key)) return self.continueCharacter(event.key);
+            self.discarded = self.mode == .insert;
+            self.character_need = 0;
+        }
         switch (event) {
             .paste_begin => {
                 self.pasting = true;
@@ -99,9 +115,23 @@ pub const Parser = struct {
                     '\r', '\n' => .newline,
                     0x08, 0x7f => .backspace,
                     '\t' => .tab,
-                    0x20...0x7e => .{ .text = byte },
+                    0x20...0x7e => {
+                        self.character[0] = byte;
+                        return .{ .text = self.character[0..1] };
+                    },
+                    0x80...0xff => {
+                        if (!self.beginCharacter(byte)) self.discarded = true;
+                        return null;
+                    },
                     else => .invalid,
                 };
+                // A non-ASCII character is one unsupported command, however
+                // many bytes it has.
+                if (byte >= 0x80) {
+                    const rejected = self.reject();
+                    _ = self.beginCharacter(byte);
+                    return rejected;
+                }
                 return self.normal(byte);
             },
         }
@@ -185,6 +215,29 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Starts collecting a character at its lead byte; false for a byte that
+    /// cannot lead one.
+    fn beginCharacter(self: *Parser, byte: u8) bool {
+        const len = std.unicode.utf8ByteSequenceLength(byte) catch return false;
+        self.character[0] = byte;
+        self.character_len = 1;
+        self.character_need = len;
+        return true;
+    }
+
+    /// Outside insert mode, only skips the rest of a rejected character.
+    fn continueCharacter(self: *Parser, byte: u8) ?Action {
+        self.character[self.character_len] = byte;
+        self.character_len += 1;
+        if (self.character_len < self.character_need) return null;
+        self.character_need = 0;
+        if (self.mode != .insert) return null;
+        const text = self.character[0..self.character_len];
+        if (char.editable(text)) return .{ .text = text };
+        self.discarded = true;
+        return null;
+    }
+
     fn reject(self: *Parser) Action {
         self.cancel();
         return .invalid;
@@ -225,6 +278,10 @@ pub const Parser = struct {
         return null;
     }
 };
+
+fn continuation(byte: u8) bool {
+    return byte & 0xc0 == 0x80;
+}
 
 fn multiply(first: ?usize, second: ?usize) error{Overflow}!?usize {
     if (first == null and second == null) return null;
@@ -270,7 +327,7 @@ test "Escape and Ctrl-C cancel each incomplete command; insert actions retain no
         }
         var parser: Parser = .{};
         try std.testing.expectEqualDeep(Action{ .insert = .above }, keys(&parser, "O").?);
-        try std.testing.expectEqualDeep(Action{ .text = 'd' }, keys(&parser, "d").?);
+        try std.testing.expectEqualDeep(Action{ .text = "d" }, keys(&parser, "d").?);
         try std.testing.expectEqualDeep(Action.newline, keys(&parser, "\r").?);
         try std.testing.expectEqualDeep(Action.backspace, keys(&parser, "\x7f").?);
         try std.testing.expectEqualDeep(Action.tab, keys(&parser, "\t").?);
@@ -339,4 +396,80 @@ test "decoder precedence and cancellation compose with insert and pending comman
     const rapid_motion = decoder.feed('w', 2001);
     try std.testing.expect(parser.feed(rapid_motion.items[0]) == null);
     try std.testing.expectEqualDeep(Action{ .move = .{ .motion = .word } }, parser.feed(rapid_motion.items[1]).?);
+}
+
+test "insert mode collects a character's bytes and drops invalid or interrupted ones" {
+    var parser: Parser = .{};
+    _ = keys(&parser, "i");
+    for ([_][]const u8{ "\xc3\xa9", "\xe2\x9c\x85", "\xf0\x9d\x91\xa5" }) |character| {
+        for (character[0 .. character.len - 1]) |byte| {
+            try std.testing.expect(parser.feed(.{ .key = byte }) == null);
+            try std.testing.expect(!parser.discarded);
+        }
+        const typed = parser.feed(.{ .key = character[character.len - 1] }).?;
+        try std.testing.expectEqualStrings(character, typed.text);
+        try std.testing.expect(!parser.discarded);
+    }
+    // A lone lead or continuation byte, an overlong form, a C1 control, a
+    // surrogate and a code point above U+10FFFF are each dropped once.
+    const invalid = [_][]const u8{
+        "\xff", "\xa9", "\xc0\xaf", "\xc2\x9b", "\xed\xa0\x80", "\xf4\x90\x80\x80",
+    };
+    for (invalid) |bytes| {
+        var discarded: usize = 0;
+        for (bytes) |byte| {
+            try std.testing.expect(parser.feed(.{ .key = byte }) == null);
+            discarded += @intFromBool(parser.discarded);
+        }
+        try std.testing.expectEqual(@as(usize, 1), discarded);
+        try std.testing.expectEqual(Mode.insert, parser.mode);
+    }
+    // An interrupting key or event drops the partial character and still acts.
+    const interruptions = [_]struct { event: input.Event, action: Action }{
+        .{ .event = .{ .key = 'x' }, .action = .{ .text = "x" } },
+        .{ .event = .{ .key = '\r' }, .action = .newline },
+        .{ .event = .{ .key = 0x7f }, .action = .backspace },
+        .{ .event = .paste_begin, .action = .paste_begin },
+        .{ .event = .escape, .action = .end_insert },
+        .{ .event = .{ .key = 3 }, .action = .end_insert },
+    };
+    for (interruptions) |interruption| {
+        parser.cancel();
+        parser.pasting = false;
+        _ = keys(&parser, "a\xe2\x82");
+        try std.testing.expect(!parser.discarded);
+        try std.testing.expectEqualDeep(interruption.action, parser.feed(interruption.event).?);
+        try std.testing.expect(parser.discarded);
+        _ = parser.feed(.ignored);
+        try std.testing.expect(!parser.discarded);
+    }
+    // The interrupted bytes are not resumed by a later continuation byte.
+    _ = keys(&parser, "a\xe2\x82");
+    _ = parser.feed(.ignored);
+    try std.testing.expect(parser.discarded);
+    try std.testing.expect(parser.feed(.{ .key = 0xac }) == null);
+    try std.testing.expect(parser.discarded);
+}
+
+test "normal mode rejects each non-ASCII character once and cancels pending commands" {
+    var parser: Parser = .{};
+    const commands = [_][]const u8{ "\u{e9}", "2d\u{2705}", "g\u{1d465}", "\xa9", "\xff" };
+    for (commands) |bytes| {
+        var rejected: usize = 0;
+        for (bytes) |byte| {
+            if (parser.feed(.{ .key = byte })) |action| {
+                try std.testing.expectEqualDeep(Action.invalid, action);
+                rejected += 1;
+            }
+            try std.testing.expect(!parser.discarded);
+        }
+        try std.testing.expectEqual(@as(usize, 1), rejected);
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        const word: Action = .{ .move = .{ .motion = .word } };
+        try std.testing.expectEqualDeep(word, keys(&parser, "w").?);
+    }
+    // A key after a partial character is a command again.
+    _ = keys(&parser, "\xe2\x9c");
+    try std.testing.expectEqualDeep(Action{ .move = .{ .motion = .down } }, keys(&parser, "j").?);
+    try std.testing.expect(!parser.discarded);
 }

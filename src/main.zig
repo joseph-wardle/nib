@@ -573,7 +573,8 @@ const App = struct {
         const width = self.size.columns -| 1;
         if (rows != 0 and width != 0) {
             for (0..rows - 1) |number| {
-                entry.viewport.renderRow(buffer, number, try frame.reserve(width));
+                const output = try frame.room(3 * width);
+                frame.commit(entry.viewport.renderRow(buffer, number, width, output));
                 try frame.append("\r\n");
             }
             try frame.append("\x1b[7m");
@@ -590,11 +591,11 @@ const App = struct {
             } else if (self.editor.notice.len != 0) {
                 line.put(self.editor.notice);
             } else {
-                var status: [96]u8 = undefined;
+                var status: [128]u8 = undefined;
                 const flags = if (buffer.modified())
                     " [+]"
                 else if (!buffer.editable)
-                    " [read-only: unsupported bytes]"
+                    " [read-only: invalid UTF-8 or control bytes]"
                 else
                     "";
                 line.put(std.fmt.bufPrint(&status, "{s}{s} | {d}:{d} | ", .{
@@ -788,7 +789,8 @@ const App = struct {
             } else @memset(try frame.reserve(list_width), ' ');
             if (split) {
                 try frame.append("|");
-                pane.render(try frame.reserve(width - list_width - 1));
+                const pane_width = width - list_width - 1;
+                frame.commit(pane.render(pane_width, try frame.room(3 * pane_width)));
             }
             try frame.append("\r\n");
         }
@@ -872,17 +874,29 @@ const Pane = struct {
     viewport: view.Viewport = .{},
     row: usize = 0,
 
-    fn render(self: *Pane, output: []u8) void {
+    /// Draws the next row into `columns` cells: the title as escaped ASCII,
+    /// text as the editor draws it. `output` holds `3 * columns` bytes.
+    /// Returns the bytes used.
+    fn render(self: *Pane, columns: usize, output: []u8) usize {
         defer self.row += 1;
-        if (self.row == 0) return view.renderText(self.title, 0, output);
-        if (self.buffer) |buffer| return self.viewport.renderRow(buffer, self.row - 1, output);
-        const text = self.text orelse return @memset(output, ' ');
+        if (self.row == 0) {
+            var line: Line = .init(output[0..columns]);
+            line.put(self.title);
+            return columns;
+        }
+        if (self.buffer) |buffer| {
+            return self.viewport.renderRow(buffer, self.row - 1, columns, output);
+        }
+        const text = self.text orelse {
+            @memset(output[0..columns], ' ');
+            return columns;
+        };
         const end = std.mem.indexOfScalar(u8, text, '\n');
         var line = text[0 .. end orelse text.len];
         self.text = if (end) |newline| text[newline + 1 ..] else null;
         // CR before LF ends the line; it is not shown.
         if (end != null and line.len != 0 and line[line.len - 1] == '\r') line.len -= 1;
-        view.renderText(line, 0, output);
+        return view.renderText(line, 0, columns, output);
     }
 };
 
@@ -998,11 +1012,12 @@ fn saveNotice(result: file.Report, copy: bool) []const u8 {
 }
 
 /// Collects output so an ordinary frame reaches the terminal in one write.
-/// Larger frames flush whenever the buffer fills; the capacity holds the
-/// widest possible row, so a reserved row is never split.
+/// Larger frames flush whenever the buffer fills. The capacity holds the
+/// widest possible row at 3 bytes per cell, the most a drawn character takes,
+/// so a row is never split.
 const Frame = struct {
     screen: *terminal.Terminal,
-    bytes: [std.math.maxInt(u16) + 1]u8 = undefined,
+    bytes: [3 * (std.math.maxInt(u16) + 1)]u8 = undefined,
     len: usize = 0,
 
     fn append(self: *Frame, data: []const u8) terminal.Error!void {
@@ -1011,10 +1026,23 @@ const Frame = struct {
 
     /// The caller fills the returned bytes before the next append or reserve.
     fn reserve(self: *Frame, count: usize) terminal.Error![]u8 {
+        const output = try self.room(count);
+        self.commit(count);
+        return output[0..count];
+    }
+
+    /// At least `count` free bytes, flushing first when fewer remain. The
+    /// caller fills a prefix of them, then commits its length before the next
+    /// append, reserve or room.
+    fn room(self: *Frame, count: usize) terminal.Error![]u8 {
         std.debug.assert(count <= self.bytes.len);
         if (self.bytes.len - self.len < count) try self.flush();
-        defer self.len += count;
-        return self.bytes[self.len..][0..count];
+        return self.bytes[self.len..];
+    }
+
+    fn commit(self: *Frame, count: usize) void {
+        std.debug.assert(count <= self.bytes.len - self.len);
+        self.len += count;
     }
 
     /// Shows the cursor at a zero-based cell.
@@ -1062,6 +1090,7 @@ test {
     _ = @import("editor.zig");
     _ = @import("file.zig");
     _ = @import("buffer.zig");
+    _ = @import("char.zig");
     _ = @import("terminal.zig");
     _ = @import("view.zig");
     _ = @import("input.zig");
@@ -1117,19 +1146,45 @@ test "save notices distinguish failure, uncertain publication and installed dura
 
 test "a snapshot preview shows one line per row and hides CR only before LF" {
     var pane: Pane = .{ .title = "Preview", .text = "one\r\ntwo\rx\n\tz" };
-    var row: [6]u8 = undefined;
-    const expected = [_][]const u8{ "Previe", "one   ", "two?x ", "      ", "      " };
-    pane.render(&row);
-    try std.testing.expectEqualStrings(expected[0], &row);
-    pane.render(&row);
-    try std.testing.expectEqualStrings(expected[1], &row);
-    pane.render(&row);
-    try std.testing.expectEqualStrings(expected[2], &row);
+    var row: [18]u8 = undefined;
     // A tab expands to the next eight-column stop, beyond this narrow pane.
-    pane.render(&row);
-    try std.testing.expectEqualStrings(expected[3], &row);
-    pane.render(&row);
-    try std.testing.expectEqualStrings(expected[4], &row);
+    const expected = [_][]const u8{ "Previe", "one   ", "two?x ", "      ", "      " };
+    for (expected) |text| try std.testing.expectEqualStrings(text, row[0..pane.render(6, &row)]);
+}
+
+test "previews of UTF-8 text, from a snapshot or an open buffer, render like the editor" {
+    const text = "na\u{ef}ve \u{2014} \u{6750}\u{6599}\r\n\t\u{2705}\xff\u{301}|\n";
+    var buffer = try Buffer.fromBytes(std.testing.allocator, text);
+    defer buffer.deinit(std.testing.allocator);
+    var snapshot: Pane = .{ .title = "Preview \u{e9}", .text = text };
+    var document: Pane = .{ .title = "Open file", .buffer = &buffer };
+    var editor: [3 * 12]u8 = undefined;
+    var row: [3 * 12]u8 = undefined;
+    try std.testing.expectEqualStrings("Preview ??  ", row[0..snapshot.render(12, &row)]);
+    try std.testing.expectEqualStrings("Open file   ", row[0..document.render(12, &row)]);
+    const rows = [_][]const u8{
+        "na\u{ef}ve \u{2014} \u{6750}\u{6599}",
+        "        \u{2705}??",
+        "            ",
+    };
+    for (rows, 0..) |expected, number| {
+        const viewport: view.Viewport = .{};
+        const used = viewport.renderRow(&buffer, number, 12, &editor);
+        try std.testing.expectEqualStrings(expected, editor[0..used]);
+        try std.testing.expectEqualStrings(expected, row[0..snapshot.render(12, &row)]);
+        try std.testing.expectEqualStrings(expected, row[0..document.render(12, &row)]);
+    }
+}
+
+test "a row of 3-byte characters at the widest terminal fits the frame unsplit" {
+    const columns = std.math.maxInt(u16);
+    const text = try std.testing.allocator.alloc(u8, 3 * columns);
+    defer std.testing.allocator.free(text);
+    for (0..columns) |index| @memcpy(text[3 * index ..][0..3], "\u{2014}");
+    var frame: Frame = .{ .screen = undefined };
+    const output = try frame.room(3 * columns);
+    frame.commit(view.renderText(text, 0, columns, output));
+    try std.testing.expectEqualSlices(u8, text, frame.bytes[0..frame.len]);
 }
 
 test "status lines show only printable ASCII and stop at the row's end" {
