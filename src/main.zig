@@ -577,6 +577,8 @@ const App = struct {
         // Reserve the last column on every row to avoid autowrap, including the
         // bottom-right cell.
         const width = self.size.columns -| 1;
+        // The status-row cell after a search prompt's query, when drawn.
+        var prompt: ?usize = null;
         if (rows != 0 and width != 0) {
             for (0..rows - 1) |number| {
                 const output = try frame.room(3 * width);
@@ -587,11 +589,17 @@ const App = struct {
             var line: Line = .init(try frame.reserve(width));
             // The persistent disk/monitor status fills tiny status rows.
             line.put(entry.disk.status());
-            if (parser.mode == .command_line) {
-                line.put(":");
-                // Keep the end of a long command visible in the reserved status row.
+            if (parser.mode == .command_line or parser.mode == .search) {
+                line.put(switch (parser.mode) {
+                    .command_line => ":",
+                    else => if (parser.prompt_direction == .forward) "/" else "?",
+                });
+                // Keep the end of a long line visible in the reserved status row,
+                // with a cell after it for the prompt's cursor.
                 const text = parser.line[0..parser.line_len];
-                line.put(text[text.len -| line.left()..]);
+                const room = if (parser.mode == .search) line.left() -| 1 else line.left();
+                line.put(text[text.len -| room..]);
+                if (parser.mode == .search) prompt = line.used;
             } else if (parser.mode == .operator) {
                 line.put("OPERATOR pending | Escape/Ctrl-C cancel");
             } else if (self.editor.notice.len != 0) {
@@ -614,6 +622,13 @@ const App = struct {
                 line.put(" | Ctrl-P files | :qa quit");
             }
             try frame.append("\x1b[27m");
+            if (self.editor.highlighted()) |query| {
+                try highlight(frame, buffer, entry.viewport, query, rows - 1, width);
+            }
+        }
+        if (parser.mode == .search) {
+            if (prompt) |column| try frame.cursor(rows - 1, @min(column, width - 1));
+            return;
         }
         const insert = parser.mode == .insert;
         if (entry.viewport.cursor(buffer, rows -| 1, width, insert)) |cell| {
@@ -828,6 +843,31 @@ const App = struct {
         };
     }
 };
+
+/// Redraws the visible matches of `query` in reverse video over content rows
+/// already drawn, leaving every other cell as drawn.
+fn highlight(
+    frame: *Frame,
+    buffer: *const Buffer,
+    viewport: view.Viewport,
+    query: []const u8,
+    rows: usize,
+    width: usize,
+) terminal.Error!void {
+    const shown = buffer.insertionRows() -| viewport.top;
+    for (0..@min(rows, shown)) |row| {
+        const text = buffer.line(viewport.top + row);
+        var highlights: view.Highlights = .init(text, query, viewport.left, width);
+        while (highlights.next()) |part| {
+            var position: [32]u8 = undefined;
+            const move = "\x1b[{d};{d}H\x1b[7m";
+            const sequence = std.fmt.bufPrint(&position, move, .{ row + 1, part.cell + 1 });
+            try frame.append(sequence catch unreachable);
+            try frame.append(part.bytes);
+            try frame.append("\x1b[27m");
+        }
+    }
+}
 
 /// One result row: selection, modified and unknown-status marks, then the
 /// label with matched bytes highlighted. Ignored files are dimmed, which
@@ -1201,6 +1241,75 @@ test "status lines show only printable ASCII and stop at the row's end" {
     line.put("\xffbcdef");
     try std.testing.expectEqualStrings("a?[2J?bc", &row);
     try std.testing.expectEqual(@as(usize, 0), line.left());
+}
+
+test "the search prompt and its matches are drawn until Escape in normal mode hides them" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "ab x\nAB\tab\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 4, .columns = 11 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    // Three content rows and the status row, ten columns wide.
+    const matches = "\x1b[1;1H\x1b[7mab\x1b[27m" ++
+        "\x1b[2;1H\x1b[7mAB\x1b[27m" ++
+        "\x1b[2;9H\x1b[7mab\x1b[27m";
+    for ("/ab") |byte| app.editorEvent(.{ .key = byte });
+    var frame: Frame = .{ .screen = undefined };
+    try app.drawEditor(&frame);
+    const prompt = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.indexOf(u8, prompt, "\x1b[7m/ab       \x1b[27m") != null);
+    try testing.expect(std.mem.endsWith(u8, prompt, matches ++ "\x1b[4;4H\x1b[?25h"));
+    app.editorEvent(.{ .key = '\r' });
+    frame.len = 0;
+    try app.drawEditor(&frame);
+    const kept = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.endsWith(u8, kept, matches ++ "\x1b[2;1H\x1b[?25h"));
+    app.editorEvent(.escape);
+    frame.len = 0;
+    try app.drawEditor(&frame);
+    // Only the status row is in reverse video.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame.bytes[0..frame.len], "\x1b[7m"));
+    app.editorEvent(.{ .key = 'n' });
+    frame.len = 0;
+    try app.drawEditor(&frame);
+    const repeated = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.endsWith(u8, repeated, matches ++ "\x1b[2;9H\x1b[?25h"));
+    // A long query keeps its end visible and a cell after it for the cursor.
+    for ("?abcdefghijk") |byte| app.editorEvent(.{ .key = byte });
+    frame.len = 0;
+    try app.drawEditor(&frame);
+    const long = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.indexOf(u8, long, "\x1b[7m?defghijk \x1b[27m") != null);
+    try testing.expect(std.mem.endsWith(u8, long, "\x1b[4;10H\x1b[?25h"));
+}
+
+test "a whole row of matches at the widest terminal fits the frame unsplit" {
+    const columns = std.math.maxInt(u16);
+    const text = try std.testing.allocator.alloc(u8, columns);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'a');
+    var buffer = try Buffer.fromBytes(std.testing.allocator, text);
+    defer buffer.deinit(std.testing.allocator);
+    var frame: Frame = .{ .screen = undefined };
+    try highlight(&frame, &buffer, .{}, "a", columns, columns);
+    const drawn = frame.bytes[0..frame.len];
+    try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[1;1H\x1b[7maaa"));
+    try std.testing.expect(std.mem.endsWith(u8, drawn, "aaa\x1b[27m"));
+    try std.testing.expectEqual(columns + "\x1b[1;1H\x1b[7m\x1b[27m".len, drawn.len);
 }
 
 test "closing names the closed file and the next file when activating it reloads" {

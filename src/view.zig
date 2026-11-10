@@ -4,6 +4,7 @@ const std = @import("std");
 pub const Buffer = @import("buffer.zig").Buffer;
 pub const motion = @import("motion.zig");
 const char = @import("char.zig");
+const search = @import("search.zig");
 
 /// Logical rows and display columns; the caller reserves terminal margins/status.
 pub const Viewport = struct {
@@ -103,6 +104,46 @@ pub fn renderText(text: []const u8, left: usize, columns: usize, output: []u8) u
     @memset(output[used..][0 .. columns - drawn], ' ');
     return used + columns - drawn;
 }
+
+/// The visible parts of a search query's matches in one line, as `renderText`
+/// places that line from display column `left` in `columns` cells. A match is
+/// printable ASCII, one cell per byte, because the query is and folding is
+/// ASCII only; an ASCII byte never belongs to a longer character, so every
+/// match starts on a character boundary. Borrows `text` and `query`.
+pub const Highlights = struct {
+    spans: search.Spans,
+    left: usize,
+    right: usize,
+    column: usize = 0,
+    position: usize = 0,
+
+    /// Requires a printable ASCII query; `text` excludes the line break.
+    pub fn init(text: []const u8, query: []const u8, left: usize, columns: usize) Highlights {
+        return .{ .spans = .init(text, query), .left = left, .right = left +| columns };
+    }
+
+    /// The next visible part: its cell relative to `left`, and its bytes.
+    pub fn next(self: *Highlights) ?struct { cell: usize, bytes: []const u8 } {
+        const text = self.spans.line;
+        while (self.column < self.right) {
+            const span = self.spans.next() orelse return null;
+            while (self.position < span.start) {
+                const character = char.decode(text, self.position);
+                self.column += char.cells(character.code, self.column);
+                self.position += character.len;
+            }
+            const start = self.column;
+            self.column += span.end - span.start;
+            self.position = span.end;
+            const first = @max(start, self.left);
+            const last = @min(self.column, self.right);
+            if (first >= last) continue;
+            const bytes = text[span.start + (first - start) ..][0 .. last - first];
+            return .{ .cell = first - self.left, .bytes = bytes };
+        }
+        return null;
+    }
+};
 
 test "rendering clips inside tabs and pads short rows" {
     var text = try Buffer.fromBytes(std.testing.allocator, "a\tb\tc\nshort\n");
@@ -304,6 +345,53 @@ test "following keeps a whole wide cursor character visible, or its first cell" 
     viewport.left = 0;
     viewport.follow(&buffer, 1, 3, true);
     try std.testing.expectEqual(@as(usize, 0), viewport.left);
+}
+
+test "highlights cover each visible match where rendering draws it, clipped at both edges" {
+    // Tab 0-7, ab 8-9, 材 10-11, ab 12-13, ✅ 14-15, x 16, AB 17-18, an
+    // invalid byte 19, ab 20-21. "ab" folds case, so AB matches.
+    const text = "\tab\u{6750}ab\u{2705}xAB\xffab";
+    const matches = [_]struct { start: usize, end: usize }{
+        .{ .start = 8, .end = 10 },
+        .{ .start = 12, .end = 14 },
+        .{ .start = 17, .end = 19 },
+        .{ .start = 20, .end = 22 },
+    };
+    var storage: [3 * 24]u8 = undefined;
+    for (0..24) |left| {
+        for (0..24) |columns| {
+            var highlights: Highlights = .init(text, "ab", left, columns);
+            for (matches) |match| {
+                const first = @max(match.start, left);
+                const last = @min(match.end, left + columns);
+                if (first >= last) continue;
+                const part = highlights.next().?;
+                try std.testing.expectEqual(first - left, part.cell);
+                try std.testing.expectEqual(last - first, part.bytes.len);
+                // The highlighted bytes are what rendering draws in those cells.
+                const used = renderText(text, first, part.bytes.len, &storage);
+                try std.testing.expectEqualStrings(storage[0..used], part.bytes);
+            }
+            try std.testing.expect(highlights.next() == null);
+        }
+    }
+    var exact: Highlights = .init(text, "AB", 0, 24);
+    try std.testing.expectEqual(@as(usize, 17), exact.next().?.cell);
+    try std.testing.expect(exact.next() == null);
+}
+
+test "highlights merge overlapping matches and stop at the right edge" {
+    var merged: Highlights = .init("xaaaay", "aa", 0, 6);
+    const part = merged.next().?;
+    try std.testing.expectEqual(@as(usize, 1), part.cell);
+    try std.testing.expectEqualStrings("aaaa", part.bytes);
+    try std.testing.expect(merged.next() == null);
+    // Matches beyond the right edge are never measured or returned.
+    var clipped: Highlights = .init("ab ab ab", "ab", 0, 4);
+    try std.testing.expectEqualStrings("ab", clipped.next().?.bytes);
+    try std.testing.expectEqualStrings("a", clipped.next().?.bytes);
+    try std.testing.expect(clipped.next() == null);
+    try std.testing.expectEqual(@as(usize, 5), clipped.position);
 }
 
 fn expectRow(
