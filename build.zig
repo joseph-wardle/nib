@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     });
     const motion_step = b.step(
         "bench-motion",
-        "Measure ReleaseFast per-key motion, follow and cursor-column work",
+        "Measure ReleaseFast per-key motion, follow, cursor-column and incremental search work",
     );
     motion_step.dependOn(&b.addRunArtifact(motion_bench).step);
 

@@ -61,6 +61,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "modalCommands", modalCommands },
         .{ "editingWorkflow", editingWorkflow },
         .{ "utf8Editing", utf8Editing },
+        .{ "searchWorkflow", searchWorkflow },
         .{ "pasteLifecycle", pasteLifecycle },
         .{ "externalChanges", externalChanges },
         .{ "startupFailures", startupFailures },
@@ -815,6 +816,94 @@ fn editingKeys(process: *Process, bytes: []const u8) !void {
         try process.send(&.{byte});
         try process.ready();
     }
+}
+
+fn searchWorkflow(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-search-{d}", .{pid}, 0);
+    defer _ = linux.unlink(path);
+    // Forty lines "rowNN text", except that row 30 holds the only "ta".
+    var text: [40 * 11 + 7]u8 = undefined;
+    var used: usize = 0;
+    for (0..40) |number| {
+        const tail = if (number == 30) " target\n" else " text\n";
+        used += (try std.fmt.bufPrint(text[used..], "row{d:0>2}{s}", .{ number, tail })).len;
+    }
+    try putFile(path, text[0..used]);
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.until("row00 text");
+    try process.ready();
+    // Each key redraws; the cursor waits after the query in the status row.
+    try process.send("/");
+    try process.until("\x1b[7m/ ");
+    try process.until("\x1b[24;2H");
+    try process.ready();
+    try process.send("t");
+    try process.until("\x1b[1;7H\x1b[7mt\x1b[27m");
+    try process.until("\x1b[24;3H");
+    try process.ready();
+    // The preview scrolls the view to row 30, the one match of "ta".
+    try process.send("a");
+    try process.until("row30 target");
+    try process.until("\x1b[7mta\x1b[27m");
+    try process.until("\x1b[24;4H");
+    try process.ready();
+    // Escape returns cursor and view to the start, without highlights.
+    try process.send("\x1b");
+    try process.until("\x1b[2Jrow00 text");
+    try process.until("NORMAL | 1:1 | ");
+    try plainFrame(&process);
+    try process.send("/target\r");
+    try process.until("NORMAL | 31:7 | ");
+    try process.until("\x1b[7mtarget\x1b[27m");
+    try process.ready();
+    // Escape in normal mode only hides the highlight, and that alone redraws.
+    try process.send("\x1b");
+    try process.until("NORMAL | 31:7 | ");
+    try plainFrame(&process);
+    try process.send("n");
+    try process.until("Search wrapped to top");
+    try process.until("\x1b[7mtarget\x1b[27m");
+    try process.ready();
+    // Escape in normal mode hides the highlight and the notice.
+    try process.send("\x1b");
+    try process.until("NORMAL | 31:7 | ");
+    try plainFrame(&process);
+    try process.send("N");
+    try process.until("Search wrapped to bottom");
+    try process.until("\x1b[7mtarget\x1b[27m");
+    try process.ready();
+    try process.send("?row1\r");
+    try process.until("NORMAL | 20:1 | ");
+    try process.ready();
+    // d/ deletes up to the match as one undo step.
+    try process.send("d/text\r");
+    try process.until("\r\ntext ");
+    try process.until("NORMAL [+] | 20:1 | ");
+    try process.ready();
+    try process.send("u");
+    try process.until("\r\nrow19 text");
+    try process.until("NORMAL | 20:1 | ");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, text[0..used]);
+}
+
+/// Consumes the rest of the frame, after the status row, and checks that it
+/// draws nothing in reverse video.
+fn plainFrame(process: *Process) !void {
+    try process.until("\x1b[27m");
+    while (std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m") == null) {
+        if (try process.read(5000) == 0) return error.OutputTimeout;
+    }
+    const end = std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m").?;
+    try expect(std.mem.indexOf(u8, process.output[0..end], "\x1b[7m") == null);
+    try process.ready();
 }
 
 fn editingWorkflow(executable: [:0]const u8) !void {

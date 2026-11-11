@@ -21,7 +21,7 @@ zig build
 zig build run -- README.md
 ```
 
-`nib <file>` opens a file; `nib` or `nib <directory>` starts in the file finder. Editing follows Vim (`hjkl`, `w`, `b`, `d` and `c` with motions, `i`, `a`, `o`, `u`, `:w`, `:q`), and Ctrl-P opens the finder.
+`nib <file>` opens a file; `nib` or `nib <directory>` starts in the file finder. Editing follows Vim (`hjkl`, `w`, `b`, `d` and `c` with motions, `i`, `a`, `o`, `u`, `/` and `n` to search, `:w`, `:q`), and Ctrl-P opens the finder.
 
 ## Development
 
