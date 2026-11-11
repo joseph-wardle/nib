@@ -30,6 +30,8 @@ pub const Prompt = union(enum) {
     invalid,
 };
 pub const Insertion = enum { before, after, below, above };
+/// `p` (`after`) or `P` (`before`): `count` copies of register `register`.
+pub const Put = struct { register: u8 = '"', count: usize = 1, side: enum { after, before } };
 /// `register` names one: `"` (unnamed), `0`, `_` or `a`–`z`.
 pub const Operation = struct {
     operator: motion.Operator,
@@ -56,6 +58,7 @@ pub const Action = union(enum) {
     jump: Search,
     prompt: Prompt,
     operate: Operation,
+    put: Put,
     insert: Insertion,
     /// One typed character; borrows parser storage until the next feed.
     text: []const u8,
@@ -215,9 +218,12 @@ pub const Parser = struct {
                 self.naming = true;
                 return null;
             }
-            // Only operators take a register so far.
-            const operator_key = byte == 'y' or byte == 'd' or byte == 'c' or byte == 'Y';
-            if (self.register != null and !operator_key) return self.reject();
+            // Only operators and puts take a register.
+            const takes_register = switch (byte) {
+                'y', 'd', 'c', 'Y', 'p', 'P' => true,
+                else => false,
+            };
+            if (self.register != null and !takes_register) return self.reject();
         }
         if (byte == 'g' and !self.pending_g) {
             self.pending_g = true;
@@ -303,6 +309,16 @@ pub const Parser = struct {
             self.operator_count = combined;
             self.register = register;
             return null;
+        }
+        if (byte == 'p' or byte == 'P') {
+            // `"_` holds nothing to put.
+            if (register == '_') return .unsupported_register;
+            const combined = multiply(register_count, count) catch return .invalid;
+            return .{ .put = .{
+                .register = register,
+                .count = combined orelse 1,
+                .side = if (byte == 'p') .after else .before,
+            } };
         }
         // This subset deliberately does not repeat insertions or Ex/undo keys.
         if (count != null) return .invalid;
@@ -823,6 +839,21 @@ test "y, yy and Y yank with counts, and a register prefix carries through to the
     } };
     try expectAction(repeated, keys(&parser, "\"q3dn"));
     try std.testing.expectEqual(Mode.normal, parser.mode);
+}
+
+test "p and P put with counts and a register, and refuse the black hole" {
+    var parser: Parser = .{};
+    try expectAction(Action{ .put = .{ .side = .after } }, keys(&parser, "p"));
+    try expectAction(Action{ .put = .{ .count = 3, .side = .before } }, keys(&parser, "3P"));
+    try expectAction(Action{ .put = .{ .register = '0', .side = .after } }, keys(&parser, "\"0p"));
+    const named: Action = .{ .put = .{ .register = 'a', .count = 6, .side = .before } };
+    try expectAction(named, keys(&parser, "2\"a3P"));
+    try expectAction(Action.unsupported_register, keys(&parser, "\"_p"));
+    for ([_][]const u8{ "dp", "yP", "gp", "9223372036854775808\"a2p" }) |typed| {
+        try expectAction(Action.invalid, keys(&parser, typed));
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        try expectAction(next_word, keys(&parser, "w"));
+    }
 }
 
 test "an unknown or read-only register, or a prefix on another command, is refused" {

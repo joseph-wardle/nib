@@ -5,6 +5,7 @@ const Buffer = @import("buffer.zig").Buffer;
 const EditError = @import("buffer.zig").Error;
 const max_file_bytes = @import("buffer.zig").max_file_bytes;
 const max_lines = @import("buffer.zig").max_lines;
+const Range = @import("buffer.zig").Range;
 const char = @import("char.zig");
 const motion = @import("motion.zig");
 const input = @import("input.zig");
@@ -143,7 +144,7 @@ pub const Editor = struct {
                 self.notice = editError(err);
                 // Insert entry is tentative; a failed open/change must not
                 // enter insert mode or leave an active, empty command group.
-                if (action == .insert or action == .operate) {
+                if (action == .insert or action == .operate or action == .put) {
                     self.parser.cancel();
                     buffer.endGroup();
                 }
@@ -270,6 +271,62 @@ pub const Editor = struct {
                     buffer.endCommand();
                 }
                 goal.* = motion.screenColumn(buffer, buffer.cursor, changing);
+            },
+            .put => |put| {
+                if (!buffer.editable) return error.UnsupportedText;
+                self.notice = "";
+                const held = self.register(put.register);
+                if (held.text.len == 0) {
+                    self.notice = "Register empty";
+                    return;
+                }
+                const row = buffer.rowAt(buffer.cursor);
+                const range = buffer.lineRange(row);
+                const end = range.start + buffer.line(row).len;
+                const offset = if (held.linewise) switch (put.side) {
+                    .after => range.end,
+                    .before => range.start,
+                } else switch (put.side) {
+                    .after => @min(char.next(buffer.bytes(), buffer.cursor), end),
+                    .before => buffer.cursor,
+                };
+                // Below an unterminated last line, the line gets a terminator
+                // and the text loses its last one: the file still has no
+                // final newline.
+                const newline = buffer.newlineAt(buffer.cursor);
+                const lead = if (held.linewise and put.side == .after and range.end == end)
+                    newline.len
+                else
+                    0;
+                const breaks = std.mem.count(u8, held.text, "\n");
+                const one = held.text.len + breaks * (newline.len - 1);
+                const total = std.math.mul(usize, one, put.count) catch return error.FileTooLarge;
+                // Checked before allocating, so a large count costs nothing.
+                if (total > max_file_bytes - buffer.bytes().len) return error.FileTooLarge;
+                const built = try allocator.alloc(u8, lead + total);
+                defer allocator.free(built);
+                @memcpy(built[0..lead], newline[0..lead]);
+                expand(built[lead..][0..one], held.text, newline);
+                var copied = lead + one;
+                while (copied < built.len) : (copied += one) {
+                    @memcpy(built[copied..][0..one], built[lead..][0..one]);
+                }
+                const inserted = built[0..total];
+                buffer.beginGroup();
+                const at: Range = .{ .start = offset, .end = offset };
+                try buffer.replace(allocator, at, inserted, offset + lead);
+                // As in Vim: a linewise put lands on the first put line's first
+                // nonblank, a multi-line characterwise put at its start, and any
+                // other on the last put character.
+                if (held.linewise) {
+                    buffer.cursor = motion.resolve(buffer, 0, .first, null, null).?.destination;
+                } else if (breaks == 0) {
+                    buffer.cursor = char.start(buffer.bytes(), offset + total - 1);
+                }
+                buffer.endCommand();
+                goal.* = motion.screenColumn(buffer, buffer.cursor, false);
+                const lines = std.mem.count(u8, inserted, "\n");
+                if (lines > 2) self.report("{d} more lines", .{lines});
             },
             .text => |text| try insert(allocator, buffer, text),
             .tab => try insert(allocator, buffer, "\t"),
@@ -421,6 +478,22 @@ fn copy(allocator: Allocator, bytes: []const u8, linewise: bool) Allocator.Error
     };
     if (terminate) text[written] = '\n';
     return text;
+}
+
+/// Writes register `text` into `destination`, with each LF as `newline`.
+/// `destination` holds exactly the expanded text.
+fn expand(destination: []u8, text: []const u8, newline: []const u8) void {
+    var written: usize = 0;
+    for (text) |byte| {
+        if (byte == '\n') {
+            @memcpy(destination[written..][0..newline.len], newline);
+            written += newline.len;
+        } else {
+            destination[written] = byte;
+            written += 1;
+        }
+    }
+    std.debug.assert(written == destination.len);
 }
 
 /// Moves to the match the prompt's query would reach, or stays put.
@@ -1320,4 +1393,198 @@ fn registerWorkflow(allocator: Allocator) !void {
     try expectRegister(&editor, 'a', "one\n", true);
     try expectRegister(&editor, '"', "one\n", true);
     try expectRegister(&editor, 'b', "two\n", true);
+}
+
+test "p and P put after real yanks with Vim's text and cursor, as one undo step" {
+    const allocator = std.testing.allocator;
+    // Text, cursor, keys, then the text and cursor after the put.
+    const Case = struct { []const u8, usize, []const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "one two\n", 0, "ywP", "one one two\n", 3 },
+        .{ "one two\n", 0, "yw$p", "one twoone \n", 10 },
+        .{ "ab\n", 0, "yl3p", "aaaab\n", 3 },
+        .{ "ab\n", 0, "yl3P", "aaaab\n", 2 },
+        .{ "ab\n\n", 0, "yljp", "ab\na\n", 3 },
+        .{ euro ++ wide ++ " x\n", 3, "ylp", euro ++ wide ++ wide ++ " x\n", 6 },
+        // A multi-line characterwise put leaves the cursor at its start.
+        .{ "ab\ncd\n", 1, "y/d\rp", "abb\nc\ncd\n", 2 },
+        .{ "a\nb\n", 0, "yyjp", "a\nb\na\n", 4 },
+        .{ "a\nb\n", 0, "yyjP", "a\na\nb\n", 2 },
+        .{ "  x\ny\n", 0, "yyj3p", "  x\ny\n  x\n  x\n  x\n", 8 },
+        .{ "a\nb\n", 2, "yy2P", "a\nb\nb\nb\n", 2 },
+        // Below an unterminated last line, the file keeps no final newline.
+        .{ "a\nb", 0, "yyjp", "a\nb\na", 4 },
+        .{ "a\nb", 0, "yyj2p", "a\nb\na\na", 4 },
+        .{ "a\nb", 2, "yyP", "a\nb\nb", 2 },
+        // Every LF becomes the terminator where the text lands.
+        .{ "a\nb\r\nc\r\n", 0, "yyjp", "a\nb\r\na\r\nc\r\n", 5 },
+        .{ "a\r\nb\n", 0, "yyjp", "a\r\nb\na\n", 5 },
+        .{ "ab\r\ncd\r\n", 1, "y/d\rp", "abb\r\nc\r\ncd\r\n", 2 },
+    };
+    for (cases) |case| {
+        const text, const from, const typed, const after, const at = case;
+        var buffer = try Buffer.fromBytes(allocator, text);
+        defer buffer.deinit(allocator);
+        buffer.cursor = from;
+        var editor: Editor = .{};
+        defer editor.deinit(allocator);
+        var place: Place = .{ .goal = motion.screenColumn(&buffer, from, false) };
+        type_(&editor, &buffer, &place, typed);
+        errdefer std.debug.print("case {s}: {f}\n", .{ typed, std.zig.fmtString(text) });
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(at, buffer.cursor);
+        try std.testing.expectEqual(@as(usize, 1), buffer.position);
+        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        type_(&editor, &buffer, &place, "u");
+        try std.testing.expectEqualStrings(text, buffer.bytes());
+        try std.testing.expect(!buffer.modified());
+        type_(&editor, &buffer, &place, "\x12");
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(at, buffer.cursor);
+    }
+}
+
+test "puts into an empty buffer and across documents convert breaks for the target" {
+    const allocator = std.testing.allocator;
+    var crlf = try Buffer.fromBytes(allocator, "one\r\ntwo\r\n");
+    defer crlf.deinit(allocator);
+    var empty = try Buffer.fromBytes(allocator, "");
+    defer empty.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var crlf_place: Place = .{};
+    var empty_place: Place = .{};
+    type_(&editor, &crlf, &crlf_place, "yj");
+    // Vim's two lines: the empty one, then the put lines.
+    type_(&editor, &empty, &empty_place, "p");
+    try std.testing.expectEqualStrings("\none\ntwo", empty.bytes());
+    try std.testing.expectEqual(@as(usize, 1), empty.cursor);
+    type_(&editor, &empty, &empty_place, "u");
+    try std.testing.expectEqualStrings("", empty.bytes());
+    type_(&editor, &empty, &empty_place, "P");
+    try std.testing.expectEqualStrings("one\ntwo\n", empty.bytes());
+    try std.testing.expectEqual(@as(usize, 0), empty.cursor);
+    // And back: LF text put into the CRLF file gets CRLF.
+    type_(&editor, &empty, &empty_place, "yy");
+    type_(&editor, &crlf, &crlf_place, "Gp");
+    try std.testing.expectEqualStrings("one\r\ntwo\r\none\r\n", crlf.bytes());
+}
+
+test "register interactions: moves, \"0 after a delete, the black hole and named puts" {
+    const allocator = std.testing.allocator;
+    const Case = struct { []const u8, []const u8, []const u8 };
+    const cases = [_]Case{
+        .{ "one two\n", "dw$p", "twoone \n" },
+        .{ "a\nb\nc\n", "ddp", "b\na\nc\n" },
+        .{ "a\nb\nc\n", "yyjdd\"0p", "a\nc\na\n" },
+        .{ "a\nb\nc\n", "yyj\"_ddp", "a\nc\na\n" },
+        .{ "a\nb\nc\n", "yyj\"ayyjp", "a\nb\nc\na\n" },
+        .{ "a\nb\nc\n", "yyj\"ayyj\"ap", "a\nb\nc\nb\n" },
+        .{ "a foo b\n", "\"ay/foo\r$\"aP", "a foo a b\n" },
+        .{ "a b c d\n", "\"a3dw\"ap", "da b c \n" },
+    };
+    for (cases) |case| {
+        const text, const typed, const after = case;
+        var buffer = try Buffer.fromBytes(allocator, text);
+        defer buffer.deinit(allocator);
+        var editor: Editor = .{};
+        defer editor.deinit(allocator);
+        var place: Place = .{};
+        type_(&editor, &buffer, &place, typed);
+        errdefer std.debug.print("case {s}: {f}\n", .{ typed, std.zig.fmtString(text) });
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+    }
+}
+
+test "a put with nothing to put, in a read-only file or over the caps changes nothing" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "ab\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "p");
+    try std.testing.expectEqualStrings("Register empty", editor.notice);
+    type_(&editor, &buffer, &place, "\"qP");
+    try std.testing.expectEqualStrings("Register empty", editor.notice);
+    type_(&editor, &buffer, &place, "yy");
+    // 4 MiB copies of three bytes, and a count that overflows the size.
+    const refused = [_]struct { []const u8, []const u8 }{
+        .{ "4194304p", "Edit exceeds temporary 8 MiB limit" },
+        .{ "9223372036854775807P", "Edit exceeds temporary 8 MiB limit" },
+        .{ "262144p", "Edit exceeds temporary 262,144-line limit" },
+        .{ "\"_p", "Unsupported register" },
+    };
+    for (refused) |case| {
+        const typed, const notice = case;
+        type_(&editor, &buffer, &place, "l");
+        type_(&editor, &buffer, &place, typed);
+        try std.testing.expectEqualStrings(notice, editor.notice);
+        try std.testing.expectEqualStrings("ab\n", buffer.bytes());
+        try std.testing.expectEqual(@as(usize, 1), buffer.cursor);
+        try std.testing.expectEqual(@as(usize, 0), buffer.position);
+    }
+    var read_only = try Buffer.fromBytes(allocator, "raw\xff\nok\n");
+    defer read_only.deinit(allocator);
+    type_(&editor, &read_only, &place, "jyyp");
+    const refused_edit = "Read-only: invalid UTF-8 or unsupported control bytes";
+    try std.testing.expectEqualStrings(refused_edit, editor.notice);
+    try std.testing.expectEqualStrings("raw\xff\nok\n", read_only.bytes());
+    try std.testing.expectEqual(@as(usize, 0), read_only.position);
+    try expectRegister(&editor, '"', "ok\n", true);
+}
+
+test "putting more than two lines reports a count and a new count always redraws" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "x\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "yy2p");
+    try std.testing.expectEqualStrings("", editor.notice);
+    for ([_][]const u8{ "3p", "4p", "5P" }) |typed| {
+        const shown = editor.notice;
+        const before = try allocator.dupe(u8, shown);
+        defer allocator.free(before);
+        type_(&editor, &buffer, &place, typed);
+        try std.testing.expectEqualStrings(before, shown);
+        try std.testing.expectEqual(typed[0] - '0', editor.notice[0] - '0');
+        try std.testing.expect(std.mem.endsWith(u8, editor.notice, " more lines"));
+    }
+}
+
+test "allocation failures in puts keep the text, cursor and history" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, putWorkflow, .{});
+}
+
+fn putWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, "one\r\ntwo");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var goal: motion.Goal = 0;
+    const yank: command.Action = .{ .operate = .{
+        .operator = .yank,
+        .movement = .{ .lines = 1 },
+    } };
+    try editor.edit(allocator, &buffer, &goal, yank);
+    const steps = [_]struct { put: command.Put, after: []const u8 }{
+        .{ .put = .{ .count = 2, .side = .before }, .after = "one\r\none\r\none\r\ntwo" },
+        .{ .put = .{ .side = .after }, .after = "one\r\none\r\none\r\none\r\ntwo" },
+    };
+    for (steps) |step| {
+        const before = try allocator.dupe(u8, buffer.bytes());
+        defer allocator.free(before);
+        const cursor = buffer.cursor;
+        const position = buffer.position;
+        editor.edit(allocator, &buffer, &goal, .{ .put = step.put }) catch |err| {
+            try std.testing.expectEqualStrings(before, buffer.bytes());
+            try std.testing.expectEqual(cursor, buffer.cursor);
+            try std.testing.expectEqual(position, buffer.position);
+            try expectRegister(&editor, '"', "one\n", true);
+            return err;
+        };
+        try std.testing.expectEqualStrings(step.after, buffer.bytes());
+    }
 }
