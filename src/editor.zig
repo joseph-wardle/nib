@@ -235,8 +235,14 @@ pub const Editor = struct {
                 // Only a read-only buffer can hold text no register may.
                 if (yanking and !buffer.editable and !char.editable(copied))
                     return error.UnsupportedYank;
+                // As in Vim, a characterwise delete of nothing writes no register.
+                const removes_nothing = operation.operator == .delete and !linewise and
+                    copied.len == 0;
                 // Prepared before the edit; stored only after it succeeds.
-                const text = if (name == '_') null else try copy(allocator, copied, linewise);
+                const text = if (name == '_' or removes_nothing)
+                    null
+                else
+                    try copy(allocator, copied, linewise);
                 errdefer if (text) |owned| allocator.free(owned);
                 // An unnamed yank also fills "0, which deletes leave alone.
                 const yanked = if (yanking and text != null and name == '"')
@@ -1286,6 +1292,31 @@ test "deletes and changes fill the register they name, and only unnamed yanks fi
         try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
     }
     try std.testing.expectEqualStrings("Unsupported register", editor.notice);
+}
+
+test "a delete of nothing keeps the registers, while an empty yank or change empties them" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "abc\n\nxyz\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "yyj");
+    editor.clipboard = false;
+    type_(&editor, &buffer, &place, "d$");
+    try std.testing.expectEqualStrings("abc\n\nxyz\n", buffer.bytes());
+    try expectRegister(&editor, '"', "abc\n", true);
+    try std.testing.expect(!editor.clipboard);
+    // Neovim empties the register for these, and the clipboard follows it.
+    for ([_][]const u8{ "y$", "Y", "c$" }) |typed| {
+        type_(&editor, &buffer, &place, "ggyyj");
+        editor.clipboard = false;
+        type_(&editor, &buffer, &place, typed);
+        try expectRegister(&editor, '"', "", false);
+        try std.testing.expect(editor.clipboard);
+        escape(&editor, &buffer, &place);
+    }
+    try std.testing.expectEqualStrings("abc\n\nxyz\n", buffer.bytes());
 }
 
 test "a last line deleted with its preceding break is still one line in the register" {
