@@ -30,8 +30,12 @@ pub const Prompt = union(enum) {
     invalid,
 };
 pub const Insertion = enum { before, after, below, above };
+/// `p` (`after`) or `P` (`before`): `count` copies of register `register`.
+pub const Put = struct { register: u8 = '"', count: usize = 1, side: enum { after, before } };
+/// `register` names one: `"` (unnamed), `0`, `_` or `a`–`z`.
 pub const Operation = struct {
     operator: motion.Operator,
+    register: u8 = '"',
     movement: union(enum) { motion: Movement, lines: usize, search: Search },
 };
 /// Commands about files and the session rather than the text.
@@ -54,6 +58,7 @@ pub const Action = union(enum) {
     jump: Search,
     prompt: Prompt,
     operate: Operation,
+    put: Put,
     insert: Insertion,
     /// One typed character; borrows parser storage until the next feed.
     text: []const u8,
@@ -68,6 +73,8 @@ pub const Action = union(enum) {
     paste_byte: u8,
     paste_end,
     invalid,
+    /// A `"x` prefix naming a register the command can't use.
+    unsupported_register,
 };
 pub const Mode = enum { normal, insert, operator, command_line, search };
 /// Longest `:` line or search query, in bytes.
@@ -92,6 +99,13 @@ pub const Parser = struct {
     prompt_direction: search.Direction = .forward,
     prompt_count: ?usize = null,
     prompt_operator: ?motion.Operator = null,
+    prompt_register: u8 = '"',
+    /// `"` was typed; the register's name comes next.
+    naming: bool = false,
+    /// The `"x` prefix and the count typed before it. In operator-pending
+    /// mode, the operator's register.
+    register: ?u8 = null,
+    register_count: ?usize = null,
     pasting: bool = false,
     character: [4]u8 = undefined,
     character_len: u3 = 0,
@@ -110,6 +124,10 @@ pub const Parser = struct {
         self.line_invalid = false;
         self.prompt_count = null;
         self.prompt_operator = null;
+        self.prompt_register = '"';
+        self.naming = false;
+        self.register = null;
+        self.register_count = null;
         self.character_need = 0;
     }
 
@@ -168,6 +186,21 @@ pub const Parser = struct {
     }
 
     fn normal(self: *Parser, byte: u8) ?Action {
+        if (self.naming) {
+            self.naming = false;
+            switch (byte) {
+                '"', '0', '_', 'a'...'z' => {
+                    self.register = byte;
+                    self.register_count = self.count;
+                    self.count = null;
+                    return null;
+                },
+                else => {
+                    self.cancel();
+                    return .unsupported_register;
+                },
+            }
+        }
         if (!self.pending_g and byte >= '0' and byte <= '9' and (byte != '0' or self.count != null)) {
             const value = std.math.mul(usize, self.count orelse 0, 10) catch {
                 self.overflow = true;
@@ -180,6 +213,18 @@ pub const Parser = struct {
             return null;
         }
         if (self.overflow) return self.reject();
+        if (self.mode == .normal and !self.pending_g) {
+            if (byte == '"' and self.register == null) {
+                self.naming = true;
+                return null;
+            }
+            // Only operators and puts take a register.
+            const takes_register = switch (byte) {
+                'y', 'd', 'c', 'Y', 'p', 'P' => true,
+                else => false,
+            };
+            if (self.register != null and !takes_register) return self.reject();
+        }
         if (byte == 'g' and !self.pending_g) {
             self.pending_g = true;
             return null;
@@ -189,6 +234,8 @@ pub const Parser = struct {
         const pending_operator = self.mode == .operator;
         const operator = self.operator;
         const pending_g = self.pending_g;
+        const register = self.register orelse '"';
+        const register_count = self.register_count;
         self.cancel();
         const selected: ?motion.Motion = if (pending_g) (if (byte == 'g') .first_line else null) else switch (byte) {
             'h' => .left,
@@ -207,7 +254,12 @@ pub const Parser = struct {
         if (selected) |selected_motion| {
             const combined = multiply(operator_count, count) catch return .invalid;
             const movement: Movement = .{ .motion = selected_motion, .count = combined };
-            return if (pending_operator) .{ .operate = .{ .operator = operator, .movement = .{ .motion = movement } } } else .{ .move = movement };
+            if (!pending_operator) return .{ .move = movement };
+            return .{ .operate = .{
+                .operator = operator,
+                .register = register,
+                .movement = .{ .motion = movement },
+            } };
         }
         if (pending_g) return .invalid;
         if (byte == 'n' or byte == 'N' or byte == '/' or byte == '?') {
@@ -218,26 +270,55 @@ pub const Parser = struct {
                 self.prompt_direction = if (byte == '/') .forward else .backward;
                 self.prompt_count = combined;
                 self.prompt_operator = operating;
+                self.prompt_register = register;
                 return .{ .prompt = .open };
             }
             const repeat: Search = .{
                 .target = .{ .repeat = if (byte == 'n') .same else .reverse },
                 .count = combined,
             };
-            return searched(operating, repeat);
+            return searched(operating, register, repeat);
         }
         if (pending_operator) {
-            if ((operator == .delete and byte == 'd') or (operator == .change and byte == 'c')) {
+            if (byte == letter(operator)) {
                 const combined = multiply(operator_count, count) catch return .invalid;
-                return .{ .operate = .{ .operator = operator, .movement = .{ .lines = combined orelse 1 } } };
+                return .{ .operate = .{
+                    .operator = operator,
+                    .register = register,
+                    .movement = .{ .lines = combined orelse 1 },
+                } };
             }
             return .invalid;
         }
-        if (byte == 'd' or byte == 'c') {
+        if (byte == 'd' or byte == 'c' or byte == 'y' or byte == 'Y') {
+            // `"0` holds the last yank and nothing else.
+            if (register == '0') return .unsupported_register;
+            const combined = multiply(register_count, count) catch return .invalid;
+            // `Y` is `y$`, as in Neovim.
+            if (byte == 'Y') return .{ .operate = .{
+                .operator = .yank,
+                .register = register,
+                .movement = .{ .motion = .{ .motion = .end, .count = combined } },
+            } };
             self.mode = .operator;
-            self.operator = if (byte == 'd') .delete else .change;
-            self.operator_count = count;
+            self.operator = switch (byte) {
+                'd' => .delete,
+                'c' => .change,
+                else => .yank,
+            };
+            self.operator_count = combined;
+            self.register = register;
             return null;
+        }
+        if (byte == 'p' or byte == 'P') {
+            // `"_` holds nothing to put.
+            if (register == '_') return .unsupported_register;
+            const combined = multiply(register_count, count) catch return .invalid;
+            return .{ .put = .{
+                .register = register,
+                .count = combined orelse 1,
+                .side = if (byte == 'p') .after else .before,
+            } };
         }
         // This subset deliberately does not repeat insertions or Ex/undo keys.
         if (count != null) return .invalid;
@@ -331,9 +412,10 @@ pub const Parser = struct {
                 const typed = self.promptSearch();
                 const invalid = self.line_invalid;
                 const operator = self.prompt_operator;
+                const register = self.prompt_register;
                 self.cancel();
                 if (invalid) return .{ .prompt = .invalid };
-                return searched(operator, typed);
+                return searched(operator, register, typed);
             },
             0x08, 0x7f => if (self.line_len == 0) {
                 self.cancel();
@@ -378,9 +460,22 @@ pub const Parser = struct {
 };
 
 /// A search motion as a jump, or as the motion of a pending operator.
-fn searched(pending: ?motion.Operator, movement: Search) Action {
+fn searched(pending: ?motion.Operator, register: u8, movement: Search) Action {
     const operator = pending orelse return .{ .jump = movement };
-    return .{ .operate = .{ .operator = operator, .movement = .{ .search = movement } } };
+    return .{ .operate = .{
+        .operator = operator,
+        .register = register,
+        .movement = .{ .search = movement },
+    } };
+}
+
+/// The key that names an operator, and doubled applies it to lines.
+fn letter(operator: motion.Operator) u8 {
+    return switch (operator) {
+        .delete => 'd',
+        .change => 'c',
+        .yank => 'y',
+    };
 }
 
 fn multiply(first: ?usize, second: ?usize) error{Overflow}!?usize {
@@ -705,4 +800,85 @@ test "the prompt ignores paste and arrows, and the command line is unchanged by 
     try expectAction(jump("a", .forward, null), keys(&parser, "\r"));
     try expectAction(Action{ .file = .{ .quit = false } }, keys(&parser, ":q\r"));
     try expectAction(Action.invalid, keys(&parser, ":/a\r"));
+}
+
+fn yank(register: u8, movement: @FieldType(Operation, "movement")) Action {
+    return .{ .operate = .{ .operator = .yank, .register = register, .movement = movement } };
+}
+
+test "y, yy and Y yank with counts, and a register prefix carries through to the operator" {
+    var parser: Parser = .{};
+    const word: Movement = .{ .motion = .word };
+    try expectAction(yank('"', .{ .motion = word }), keys(&parser, "yw"));
+    try expectAction(yank('"', .{ .lines = 1 }), keys(&parser, "yy"));
+    try expectAction(yank('"', .{ .lines = 6 }), keys(&parser, "2y3y"));
+    try expectAction(yank('"', .{ .motion = .{ .motion = .end } }), keys(&parser, "Y"));
+    const to_end: Movement = .{ .motion = .end, .count = 2 };
+    try expectAction(yank('b', .{ .motion = to_end }), keys(&parser, "\"b2Y"));
+    // Counts before and after the prefix multiply, as Vim's do.
+    try expectAction(yank('a', .{ .lines = 6 }), keys(&parser, "2\"a3yy"));
+    try expectAction(yank('a', .{ .lines = 24 }), keys(&parser, "2\"a3y4y"));
+    try expectAction(yank('z', .{ .motion = .{ .motion = .first_line } }), keys(&parser, "\"zygg"));
+    const deleted: Action = .{ .operate = .{
+        .operator = .delete,
+        .register = '_',
+        .movement = .{ .lines = 1 },
+    } };
+    try expectAction(deleted, keys(&parser, "\"_dd"));
+    const changed: Action = .{ .operate = .{
+        .operator = .change,
+        .movement = .{ .motion = word },
+    } };
+    try expectAction(changed, keys(&parser, "\"\"cw"));
+    const searched_yank = yank('a', .{ .search = typedSearch("x", .forward, null) });
+    try expectAction(searched_yank, keys(&parser, "\"ay/x\r"));
+    const repeated: Action = .{ .operate = .{
+        .operator = .delete,
+        .register = 'q',
+        .movement = .{ .search = .{ .target = .{ .repeat = .same }, .count = 3 } },
+    } };
+    try expectAction(repeated, keys(&parser, "\"q3dn"));
+    try std.testing.expectEqual(Mode.normal, parser.mode);
+}
+
+test "p and P put with counts and a register, and refuse the black hole" {
+    var parser: Parser = .{};
+    try expectAction(Action{ .put = .{ .side = .after } }, keys(&parser, "p"));
+    try expectAction(Action{ .put = .{ .count = 3, .side = .before } }, keys(&parser, "3P"));
+    try expectAction(Action{ .put = .{ .register = '0', .side = .after } }, keys(&parser, "\"0p"));
+    const named: Action = .{ .put = .{ .register = 'a', .count = 6, .side = .before } };
+    try expectAction(named, keys(&parser, "2\"a3P"));
+    try expectAction(Action.unsupported_register, keys(&parser, "\"_p"));
+    for ([_][]const u8{ "dp", "yP", "gp", "9223372036854775808\"a2p" }) |typed| {
+        try expectAction(Action.invalid, keys(&parser, typed));
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        try expectAction(next_word, keys(&parser, "w"));
+    }
+}
+
+test "an unknown or read-only register, or a prefix on another command, is refused" {
+    var parser: Parser = .{};
+    for ([_][]const u8{ "\"A", "\"+", "\"*", "\"1", "\"-", "\"0y", "2\"0d", "\"0Y" }) |typed| {
+        try expectAction(Action.unsupported_register, keys(&parser, typed));
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        try expectAction(next_word, keys(&parser, "w"));
+    }
+    // Each ends at the refused key.
+    const refused = [_][]const u8{
+        "\"ai", "\"aj",  "\"au",  "\"a:", "\"ag",                     "\"a\"",
+        "d\"",  "\"an",  "\"a/",  "yd",   "dy",                       "\"a\x10",
+        "\"a0", "\"a2x", "\"a2u", "y\"",  "4611686018427387904\"a4y",
+    };
+    for (refused) |typed| {
+        try expectAction(Action.invalid, keys(&parser, typed));
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        try std.testing.expectEqual(@as(?u8, null), parser.register);
+        try expectAction(next_word, keys(&parser, "w"));
+    }
+    // Escape and Ctrl-C drop a prefix, named or not.
+    for ([_][]const u8{ "\"", "\"a", "2\"a3", "\"ay" }) |pending| {
+        _ = keys(&parser, pending);
+        try std.testing.expect(parser.feed(.escape) == null);
+        try expectAction(next_word, keys(&parser, "w"));
+    }
 }

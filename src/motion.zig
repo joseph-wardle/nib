@@ -5,12 +5,14 @@ const Range = @import("buffer.zig").Range;
 const char = @import("char.zig");
 
 pub const Motion = enum { left, down, up, right, start, first, end, word, back, word_end, first_line, last_line };
-pub const Operator = enum { delete, change };
+pub const Operator = enum { delete, change, yank };
 pub const Shape = enum { exclusive, inclusive, linewise };
 // null means end-of-line affinity, rather than a large artificial column.
 pub const Goal = ?usize;
 pub const Result = struct { destination: usize, shape: Shape, goal: Goal };
-pub const Selection = struct { range: Range, linewise: bool };
+/// `copied` is what a register receives. It differs from `range` only when a
+/// linewise delete at EOF also takes the preceding terminator.
+pub const Selection = struct { range: Range, copied: Range, linewise: bool };
 
 /// Display cells from the line start to a character boundary `offset`.
 pub fn column(buffer: *const Buffer, offset: usize) usize {
@@ -250,11 +252,18 @@ pub fn operatorRange(buffer: *const Buffer, result: Result, operator: Operator) 
     if (shape == .linewise) {
         low = buffer.starts.items[low_row];
         high = buffer.lineRange(high_row).end;
-        if (operator == .delete and high == buffer.bytes().len and high_row == buffer.lineCount() - 1 and low != 0 and (high == 0 or buffer.bytes()[high - 1] != '\n')) low = previous(buffer, low);
-    } else if (shape == .inclusive and high < buffer.starts.items[high_row] + buffer.line(high_row).len) {
+        const copied: Range = .{ .start = low, .end = high };
+        const unterminated = high == 0 or buffer.bytes()[high - 1] != '\n';
+        const final = high == buffer.bytes().len and high_row == buffer.lineCount() - 1;
+        if (operator == .delete and final and low != 0 and unterminated)
+            low = previous(buffer, low);
+        return .{ .range = .{ .start = low, .end = high }, .copied = copied, .linewise = true };
+    }
+    if (shape == .inclusive and high < buffer.starts.items[high_row] + buffer.line(high_row).len) {
         high = next(buffer, high);
     }
-    return .{ .range = .{ .start = low, .end = high }, .linewise = shape == .linewise };
+    const range: Range = .{ .start = low, .end = high };
+    return .{ .range = range, .copied = range, .linewise = false };
 }
 
 const expect = std.testing.expectEqual;

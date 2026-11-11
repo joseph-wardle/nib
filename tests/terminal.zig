@@ -63,6 +63,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "utf8Editing", utf8Editing },
         .{ "searchWorkflow", searchWorkflow },
         .{ "pasteLifecycle", pasteLifecycle },
+        .{ "clipboardWorkflow", clipboardWorkflow },
+        .{ "clipboardSuspend", clipboardSuspend },
         .{ "externalChanges", externalChanges },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
@@ -1153,6 +1155,147 @@ fn pasteLifecycle(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try expectFile(path, "XA\r\nB\r\nC\r\nD\tbase\r\n");
+}
+
+const clipboard = "\x1b]52;c;";
+
+/// Waits for a frame showing `marker` and checks that nothing before it, or
+/// in it, wrote the clipboard.
+fn withoutClipboard(process: *Process, marker: []const u8) !void {
+    const deadline = try now() + 5000;
+    while (true) {
+        const bytes = process.output[0..process.used];
+        if (std.mem.indexOf(u8, bytes, marker)) |at| {
+            if (std.mem.indexOf(u8, bytes[at..], "\x1b[0m") != null) break;
+        }
+        if (process.eof or try now() >= deadline) return error.OutputTimeout;
+        _ = try process.read(50);
+    }
+    try process.excludes(clipboard);
+    try process.until(marker);
+    try process.ready();
+}
+
+/// Expects the next output to be exactly `bytes`, consuming it.
+fn exactly(process: *Process, bytes: []const u8) !void {
+    var rest = bytes;
+    while (rest.len != 0) {
+        if (process.used == 0 and try process.read(5000) == 0) return error.OutputTimeout;
+        const count = @min(rest.len, process.used);
+        try std.testing.expectEqualStrings(rest[0..count], process.output[0..count]);
+        std.mem.copyForwards(u8, &process.output, process.output[count..process.used]);
+        process.used -= count;
+        rest = rest[count..];
+    }
+}
+
+fn clipboardWorkflow(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-clipboard-{d}", .{pid}, 0);
+    defer _ = linux.unlink(path);
+    try putFile(path, "one\ntwo\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    // A yank changes nothing on screen, yet its frame leads with exactly one
+    // clipboard write of the register's base64 ("one\n"), and nothing follows.
+    try process.send("yy");
+    try process.until(clipboard ++ "b25lCg==\x07\x1b[?25l\x1b[H\x1b[2J");
+    try withoutClipboard(&process, "NORMAL | 1:1 | ");
+    try equal(@as(usize, 0), try process.read(50));
+    // The black hole and named registers never reach the clipboard.
+    try process.send("\"_yyj");
+    try withoutClipboard(&process, "NORMAL | 2:1 | ");
+    try process.send("\"ayyk");
+    try withoutClipboard(&process, "NORMAL | 1:1 | ");
+    // Paste outside insert mode is still ignored, and copies nothing.
+    try process.send("\x1b[200~three\x1b[201~");
+    try equal(@as(usize, 0), try process.read(150));
+    // A delete writes the clipboard too ("one\n").
+    try process.send("dd");
+    try process.until(clipboard ++ "b25lCg==\x07");
+    try withoutClipboard(&process, "NORMAL [+] | 1:1 | ");
+    // A typed Ctrl-Z after a yank stops before any of its frame is written;
+    // resuming sends the clipboard write ("two\n") in full.
+    try process.send("yy\x1a");
+    try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));
+    try process.until(leave);
+    try process.excludes(clipboard);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until(enter ++ clipboard ++ "dHdvCg==\x07");
+    try withoutClipboard(&process, "NORMAL [+] | 1:1 | ");
+    try process.send(":qa!\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+
+    // A yank over 1 MiB stays in the register, with a notice and no write:
+    // 1025 lines of 1 KiB.
+    {
+        const flags: linux.O = .{ .ACCMODE = .WRONLY, .TRUNC = true };
+        const fd: posix.fd_t = @intCast(try checked(linux.open(path, flags, 0)));
+        defer _ = linux.close(fd);
+        var row: [1024]u8 = @splat('x');
+        row[row.len - 1] = '\n';
+        for (0..1025) |_| try write(fd, &row);
+    }
+    var large = try Process.start(executable, .{ .path = path });
+    defer large.close();
+    try large.ready();
+    try large.send("yG");
+    try withoutClipboard(&large, "Not copied to the clipboard: over 1 MiB");
+    try large.send(":qa\r");
+    try equal(@as(u8, 0), try large.wait(false));
+    try large.until(leave);
+    try large.restored();
+}
+
+/// An external SIGTSTP while the clipboard write is stalled mid-sequence:
+/// cleanup's leading ST closes the open OSC, and resuming sends it again whole.
+fn clipboardSuspend(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const name = "/tmp/nib-clipboard-stall-{d}";
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, name, .{pid}, 0);
+    defer _ = linux.unlink(path);
+    // One line of 120,000 x's: 160 KiB of base64, far more than the PTY queues.
+    const groups = 40_000;
+    {
+        const flags: linux.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
+        const fd: posix.fd_t = @intCast(try checked(linux.open(path, flags, 0o600)));
+        defer _ = linux.close(fd);
+        const row: [3000]u8 = @splat('x');
+        for (0..groups * 3 / row.len) |_| try write(fd, &row);
+        try write(fd, "\n");
+    }
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    try process.send("yy");
+    try process.stalled();
+    try process.saturate();
+    try process.signal(.TSTP);
+    try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));
+    try process.restored();
+    // The stalled frame stopped inside the sequence, before its BEL.
+    _ = try process.read(0);
+    try expect(std.mem.indexOf(u8, process.output[0..process.used], clipboard) != null);
+    try expect(std.mem.indexOfScalar(u8, process.output[0..process.used], 0x07) == null);
+    while (try process.read(0) != 0) process.used = 0;
+    process.used = 0;
+    try process.signal(.CONT);
+    try process.until(leave);
+    try process.until(enter);
+    try exactly(&process, clipboard);
+    for (0..groups) |_| try exactly(&process, "eHh4");
+    try exactly(&process, "Cg==\x07\x1b[?25l\x1b[H\x1b[2J");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }
 
 fn externalChanges(executable: [:0]const u8) !void {

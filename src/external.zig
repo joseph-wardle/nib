@@ -36,7 +36,8 @@ pub const External = struct {
 
     pub fn safe(editor: *const Editor) bool {
         const parser = &editor.parser;
-        return parser.mode == .normal and parser.count == null and !parser.pending_g and !parser.pasting;
+        return parser.mode == .normal and parser.count == null and !parser.pending_g and
+            !parser.naming and parser.register == null and !parser.pasting;
     }
 
     /// Reloads a clean document that changed on disk, once the editor is at a
@@ -100,6 +101,12 @@ test "reload waits for every pending modal state" {
     try std.testing.expect(!External.safe(&editor));
     editor.parser.cancel();
     editor.parser.pending_g = true;
+    try std.testing.expect(!External.safe(&editor));
+    editor.parser.cancel();
+    editor.parser.naming = true;
+    try std.testing.expect(!External.safe(&editor));
+    editor.parser.cancel();
+    editor.parser.register = 'a';
     try std.testing.expect(!External.safe(&editor));
     editor.parser.cancel();
     editor.parser.pasting = true;
