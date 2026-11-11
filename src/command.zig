@@ -116,7 +116,9 @@ pub const Parser = struct {
     pub fn feed(self: *Parser, event: input.Event) ?Action {
         self.discarded = false;
         if (self.character_need != 0) {
-            if (event == .key and char.continuation(event.key)) return self.continueCharacter(event.key);
+            if (event == .key and char.continuation(event.key)) {
+                return self.continueCharacter(event.key);
+            }
             self.discarded = self.mode == .insert;
             self.character_need = 0;
         }

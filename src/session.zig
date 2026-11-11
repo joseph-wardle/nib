@@ -188,8 +188,9 @@ fn put(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
 
 fn keys(session: *Session, editor: *Editor, bytes: []const u8) void {
     const entry = session.current().?;
+    const buffer = &entry.document.buffer;
     for (bytes) |byte| {
-        _ = editor.feed(testing.allocator, &entry.document.buffer, &entry.goal, &entry.viewport, .{ .key = byte });
+        _ = editor.feed(testing.allocator, buffer, &entry.goal, &entry.viewport, .{ .key = byte });
     }
 }
 

@@ -240,7 +240,8 @@ test "reload snaps a cursor inside shifted multi-byte text or a CRLF to a charac
         var external: External = .{};
         defer external.deinit(testing.allocator);
         for ("llll") |byte| {
-            _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, .{ .key = byte });
+            const buffer = &document.buffer;
+            _ = editor.feed(testing.allocator, buffer, &goal, &viewport, .{ .key = byte });
         }
         try testing.expectEqual(@as(usize, 4), document.buffer.cursor);
         try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
