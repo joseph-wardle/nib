@@ -12,7 +12,14 @@ const command = @import("command.zig");
 const search = @import("search.zig");
 const view = @import("view.zig");
 
-/// Modal editing state shared by every document, including the last search.
+/// Text an operator took. Breaks are always LF, whatever the source used; a
+/// linewise register's last line is terminated. Owned by the editor.
+pub const Register = struct { text: []u8 = &.{}, linewise: bool = false };
+
+pub const Error = EditError || error{UnsupportedYank};
+
+/// Modal editing state shared by every document, including the last search
+/// and the registers.
 /// The caller owns the buffer, its vertical goal column and its viewport, and
 /// handles file actions immediately (their paths borrow parser storage). No
 /// terminal or I/O ownership.
@@ -35,12 +42,26 @@ pub const Editor = struct {
     /// the prompt, starts again from here.
     origin: ?Origin = null,
     not_found: [not_found_prefix.len + command.max_line]u8 = undefined,
+    /// The unnamed register, `"0` and `"a`–`"z`, indexed by `slot`.
+    registers: [2 + 26]Register = @splat(.{}),
+    /// Two buffers for composed counts, used in turn, so the notice shown
+    /// before a key is never rewritten in place: redraw detection compares
+    /// the notice's text.
+    counted: [2][32]u8 = undefined,
+    counted_next: u1 = 0,
 
     const Origin = struct { cursor: usize, goal: motion.Goal, viewport: view.Viewport };
     const not_found_prefix = "Not found: ";
 
     pub fn deinit(self: *Editor, allocator: Allocator) void {
         self.paste.deinit(allocator);
+        for (&self.registers) |*held| allocator.free(held.text);
+    }
+
+    /// The register named `name` (`"`, `0` or `a`–`z`); borrows editor
+    /// storage until the next feed.
+    pub fn register(self: *const Editor, name: u8) *const Register {
+        return &self.registers[slot(name)];
     }
 
     pub fn inserting(self: *const Editor) bool {
@@ -98,6 +119,7 @@ pub const Editor = struct {
         switch (action) {
             .file => |file| return file,
             .invalid => self.notice = "Unsupported command or count",
+            .unsupported_register => self.notice = "Unsupported register",
             .prompt => |prompt| switch (prompt) {
                 .open => {
                     self.origin = .{
@@ -136,7 +158,7 @@ pub const Editor = struct {
         buffer: *Buffer,
         goal: *motion.Goal,
         action: command.Action,
-    ) EditError!void {
+    ) Error!void {
         switch (action) {
             .move => |movement| {
                 self.notice = "";
@@ -171,7 +193,8 @@ pub const Editor = struct {
                 }
             },
             .operate => |operation| {
-                if (!buffer.editable) return error.UnsupportedText;
+                const yanking = operation.operator == .yank;
+                if (!yanking and !buffer.editable) return error.UnsupportedText;
                 self.notice = "";
                 const result = switch (operation.movement) {
                     .motion => |movement| motion.resolve(
@@ -198,6 +221,35 @@ pub const Editor = struct {
                     },
                 };
                 const selection = motion.operatorRange(buffer, result, operation.operator);
+                const name = operation.register;
+                const linewise = selection.linewise;
+                const copied = buffer.bytes()[selection.copied.start..selection.copied.end];
+                // Only a read-only buffer can hold text no register may.
+                if (yanking and !buffer.editable and !char.editable(copied))
+                    return error.UnsupportedYank;
+                // Prepared before the edit; stored only after it succeeds.
+                const text = if (name == '_') null else try copy(allocator, copied, linewise);
+                errdefer if (text) |owned| allocator.free(owned);
+                // An unnamed yank also fills "0, which deletes leave alone.
+                const yanked = if (yanking and text != null and name == '"')
+                    try allocator.dupe(u8, text.?)
+                else
+                    null;
+                errdefer if (yanked) |owned| allocator.free(owned);
+                if (yanking) {
+                    // Vim leaves the cursor at the start of what it yanked;
+                    // a line count never moves it.
+                    if (operation.movement != .lines and result.destination < buffer.cursor) {
+                        buffer.cursor = result.destination;
+                        goal.* = motion.screenColumn(buffer, buffer.cursor, false);
+                    }
+                    const owned = text orelse return;
+                    self.store(allocator, name, owned, linewise);
+                    if (yanked) |zero| self.store(allocator, '0', zero, linewise);
+                    const lines = std.mem.count(u8, owned, "\n") + @intFromBool(!linewise);
+                    if (lines > 2) self.report("{d} lines yanked", .{lines});
+                    return;
+                }
                 var range = selection.range;
                 const changing = operation.operator == .change;
                 // A linewise change keeps the last selected terminator, if
@@ -208,6 +260,7 @@ pub const Editor = struct {
                 }
                 buffer.beginGroup();
                 try buffer.replace(allocator, range, "", range.start);
+                if (text) |owned| self.store(allocator, name, owned, linewise);
                 if (changing) {
                     self.parser.mode = .insert;
                 } else {
@@ -328,7 +381,47 @@ pub const Editor = struct {
         };
         return found.start;
     }
+
+    /// Replaces register `name`'s text with `text`, taking ownership.
+    fn store(self: *Editor, allocator: Allocator, name: u8, text: []u8, linewise: bool) void {
+        const held = &self.registers[slot(name)];
+        allocator.free(held.text);
+        held.* = .{ .text = text, .linewise = linewise };
+    }
+
+    /// Formats a notice into the count buffer not written last.
+    fn report(self: *Editor, comptime format: []const u8, args: anytype) void {
+        const storage = &self.counted[self.counted_next];
+        self.counted_next +%= 1;
+        self.notice = std.fmt.bufPrint(storage, format, args) catch unreachable;
+    }
 };
+
+/// A register's slot: the unnamed register, `"0`, then `"a`–`"z`.
+fn slot(name: u8) usize {
+    return switch (name) {
+        '"' => 0,
+        '0' => 1,
+        'a'...'z' => 2 + @as(usize, name - 'a'),
+        else => unreachable,
+    };
+}
+
+/// Register text for `bytes`, which are editable: every CR belongs to a
+/// CRLF and is dropped, and linewise text gets a final LF if it lacks one.
+/// Caller owns the result.
+fn copy(allocator: Allocator, bytes: []const u8, linewise: bool) Allocator.Error![]u8 {
+    const terminate = linewise and (bytes.len == 0 or bytes[bytes.len - 1] != '\n');
+    const len = bytes.len - std.mem.count(u8, bytes, "\r") + @intFromBool(terminate);
+    const text = try allocator.alloc(u8, len);
+    var written: usize = 0;
+    for (bytes) |byte| if (byte != '\r') {
+        text[written] = byte;
+        written += 1;
+    };
+    if (terminate) text[written] = '\n';
+    return text;
+}
 
 /// Moves to the match the prompt's query would reach, or stays put.
 fn preview(buffer: *Buffer, goal: *motion.Goal, movement: command.Search) void {
@@ -348,6 +441,7 @@ fn insert(allocator: Allocator, buffer: *Buffer, bytes: []const u8) EditError!vo
 fn editError(err: anyerror) []const u8 {
     return switch (err) {
         error.UnsupportedText => "Read-only: invalid UTF-8 or unsupported control bytes",
+        error.UnsupportedYank => "Invalid UTF-8 or unsupported control bytes; nothing yanked",
         error.FileTooLarge => "Edit exceeds temporary 8 MiB limit",
         error.TooManyLines => "Edit exceeds temporary 262,144-line limit",
         error.OutOfMemory => "Not enough memory; edit refused",
@@ -1012,4 +1106,218 @@ fn searchOperatorWorkflow(allocator: Allocator) !void {
         editor.parser.cancel();
         buffer.endGroup();
     }
+}
+
+fn expectRegister(editor: *const Editor, name: u8, text: []const u8, linewise: bool) !void {
+    try std.testing.expectEqualStrings(text, editor.register(name).text);
+    try std.testing.expectEqual(linewise, editor.register(name).linewise);
+}
+
+test "yanks fill the unnamed register and \"0 with Vim's text and shape, and edit nothing" {
+    const allocator = std.testing.allocator;
+    // Text, cursor, keys, then the register's text and shape and the cursor.
+    const Case = struct { []const u8, usize, []const u8, []const u8, bool, usize };
+    const cases = [_]Case{
+        .{ "one two three\n", 4, "yw", "two ", false, 4 },
+        .{ "one two three\n", 4, "yb", "one ", false, 0 },
+        .{ "one two three\n", 4, "y$", "two three", false, 4 },
+        .{ "one two three\n", 4, "Y", "two three", false, 4 },
+        .{ "one two three\n", 4, "y0", "one ", false, 0 },
+        .{ "one two three\n", 4, "ye", "two", false, 4 },
+        .{ "abcdef\nbcdef\nc\n", 10, "yk", "abcdef\nbcdef\n", true, 3 },
+        .{ "abcdef\nbcdef\nc\n", 10, "yj", "bcdef\nc\n", true, 10 },
+        .{ "abcdef\nbcdef\nc\n", 10, "yy", "bcdef\n", true, 10 },
+        .{ "a\nbcdef\nc\nd\n", 4, "yG", "bcdef\nc\nd\n", true, 4 },
+        .{ "a\nb\nc\nd\n", 2, "2Y", "b\nc", false, 2 },
+        .{ "a\nb\nc\nd\n", 0, "2y3y", "a\nb\nc\nd\n", true, 0 },
+        // Exclusive to column one from the line's start becomes linewise...
+        .{ "ab cd\nef\n", 0, "y/ef\r", "ab cd\n", true, 0 },
+        .{ "  ab cd\n  ef\n", 5, "y/ef\r", "cd\n  ", false, 5 },
+        // ...but delete's whitespace promotion is delete's alone.
+        .{ "ab\n  cd\n", 0, "y/cd\r", "ab\n  ", false, 0 },
+        .{ "one two\nthree\n", 4, "yw", "two", false, 4 },
+        .{ "one two\nthree\n", 4, "2yw", "two\nthree", false, 4 },
+        .{ "one two\nthree four\n", 14, "yb", "three ", false, 8 },
+        .{ "one two\nthree four\n", 14, "y?two\r", "two\nthree ", false, 4 },
+        // Breaks become LF, and a linewise register's last line is terminated.
+        .{ "x\r\ny\r\nz", 0, "yj", "x\ny\n", true, 0 },
+        .{ "x\r\ny\r\nz", 0, "y/z\r", "x\ny\n", true, 0 },
+        .{ "a\nb", 2, "yy", "b\n", true, 2 },
+        .{ "", 0, "yy", "\n", true, 0 },
+        .{ euro ++ wide ++ " x\n", 3, "yl", wide, false, 3 },
+    };
+    for (cases) |case| {
+        const text, const from, const typed, const yanked, const linewise, const at = case;
+        var buffer = try Buffer.fromBytes(allocator, text);
+        defer buffer.deinit(allocator);
+        buffer.cursor = from;
+        var editor: Editor = .{};
+        defer editor.deinit(allocator);
+        var place: Place = .{ .goal = motion.screenColumn(&buffer, from, false) };
+        type_(&editor, &buffer, &place, typed);
+        errdefer std.debug.print("case {s}: {f}\n", .{ typed, std.zig.fmtString(text) });
+        try expectRegister(&editor, '"', yanked, linewise);
+        try expectRegister(&editor, '0', yanked, linewise);
+        try std.testing.expectEqual(at, buffer.cursor);
+        try std.testing.expectEqualStrings(text, buffer.bytes());
+        try std.testing.expectEqual(@as(usize, 0), buffer.position);
+        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+    }
+}
+
+test "deletes and changes fill the register they name, and only unnamed yanks fill \"0" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "one\ntwo\nthree\nfour\nfive\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "yyjdd");
+    try expectRegister(&editor, '"', "two\n", true);
+    try expectRegister(&editor, '0', "one\n", true);
+    type_(&editor, &buffer, &place, "\"_dd");
+    try std.testing.expectEqualStrings("one\nfour\nfive\n", buffer.bytes());
+    try expectRegister(&editor, '"', "two\n", true);
+    type_(&editor, &buffer, &place, "\"ayy\"b2yy");
+    try expectRegister(&editor, 'a', "four\n", true);
+    try expectRegister(&editor, 'b', "four\nfive\n", true);
+    try expectRegister(&editor, '"', "two\n", true);
+    try expectRegister(&editor, '0', "one\n", true);
+    type_(&editor, &buffer, &place, "\"zcwFOUR\x03");
+    try std.testing.expectEqualStrings("one\nFOUR\nfive\n", buffer.bytes());
+    try expectRegister(&editor, 'z', "four", false);
+    type_(&editor, &buffer, &place, "gg\"ad/v\r");
+    try std.testing.expectEqualStrings("ve\n", buffer.bytes());
+    try expectRegister(&editor, 'a', "one\nFOUR\nfi", false);
+    type_(&editor, &buffer, &place, "cwX\x03");
+    try expectRegister(&editor, '"', "ve", false);
+    try expectRegister(&editor, '0', "one\n", true);
+    // A failed or refused command changes no register.
+    for ([_][]const u8{ "\"ai", "\"aj", "\"au", "\"0y" }) |typed| {
+        type_(&editor, &buffer, &place, typed);
+        try std.testing.expect(editor.notice.len != 0);
+        try expectRegister(&editor, 'a', "one\nFOUR\nfi", false);
+        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+    }
+    try std.testing.expectEqualStrings("Unsupported register", editor.notice);
+}
+
+test "a last line deleted with its preceding break is still one line in the register" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "a\r\nb");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "jdd");
+    try std.testing.expectEqualStrings("a", buffer.bytes());
+    try expectRegister(&editor, '"', "b\n", true);
+    type_(&editor, &buffer, &place, "u");
+    type_(&editor, &buffer, &place, "ccX\x03");
+    try std.testing.expectEqualStrings("a\r\nX", buffer.bytes());
+    try expectRegister(&editor, '"', "b\n", true);
+}
+
+test "registers carry to another document" {
+    const allocator = std.testing.allocator;
+    var first = try Buffer.fromBytes(allocator, "alpha\n");
+    defer first.deinit(allocator);
+    var second = try Buffer.fromBytes(allocator, "beta\n");
+    defer second.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var first_place: Place = .{};
+    var second_place: Place = .{};
+    type_(&editor, &first, &first_place, "\"qyw");
+    type_(&editor, &second, &second_place, "dw");
+    try expectRegister(&editor, 'q', "alpha", false);
+    try expectRegister(&editor, '"', "beta", false);
+}
+
+test "a read-only file yanks editable text and refuses the rest, keeping the registers" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "raw\xff\rline\nok\r\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "jyy");
+    try expectRegister(&editor, '"', "ok\n", true);
+    type_(&editor, &buffer, &place, "kyy");
+    const refused = "Invalid UTF-8 or unsupported control bytes; nothing yanked";
+    try std.testing.expectEqualStrings(refused, editor.notice);
+    type_(&editor, &buffer, &place, "y$");
+    type_(&editor, &buffer, &place, "dd\"add");
+    try expectRegister(&editor, '"', "ok\n", true);
+    try expectRegister(&editor, '0', "ok\n", true);
+    try expectRegister(&editor, 'a', "", false);
+    type_(&editor, &buffer, &place, "y2l");
+    try expectRegister(&editor, '"', "ra", false);
+    try std.testing.expectEqual(@as(usize, 0), buffer.position);
+}
+
+test "yanking more than two lines reports a count and a new count always redraws" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "1\n2\n3\n4\n5\n6\n7\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    type_(&editor, &buffer, &place, "2yy");
+    try std.testing.expectEqualStrings("", editor.notice);
+    type_(&editor, &buffer, &place, "y2j");
+    try std.testing.expectEqualStrings("3 lines yanked", editor.notice);
+    // The notice shown before a key must still read as it did.
+    for ([_][]const u8{ "\"a5yy", "\"a6yy", "\"a4yy" }) |typed| {
+        const shown = editor.notice;
+        const before = try allocator.dupe(u8, shown);
+        defer allocator.free(before);
+        type_(&editor, &buffer, &place, typed);
+        try std.testing.expectEqualStrings(before, shown);
+        try std.testing.expectEqual(typed[2] - '0', editor.notice[0] - '0');
+    }
+    // Lines 1 to 4: the search ends in column one, so the yank is linewise.
+    type_(&editor, &buffer, &place, "y/5\r");
+    try std.testing.expectEqualStrings("4 lines yanked", editor.notice);
+}
+
+test "allocation failures in yanks, deletes and changes keep the text and every register" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, registerWorkflow, .{});
+}
+
+fn registerWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, "one\r\ntwo\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var goal: motion.Goal = 0;
+    const steps = [_]struct { operator: motion.Operator, register: u8, after: []const u8 }{
+        .{ .operator = .yank, .register = '"', .after = "one\r\ntwo\n" },
+        .{ .operator = .yank, .register = 'a', .after = "one\r\ntwo\n" },
+        .{ .operator = .delete, .register = '"', .after = "two\n" },
+        .{ .operator = .change, .register = 'b', .after = "\n" },
+    };
+    for (steps) |step| {
+        const before = try allocator.dupe(u8, buffer.bytes());
+        defer allocator.free(before);
+        const unnamed = editor.register('"').text;
+        const zero = editor.register('0').text;
+        const action: command.Action = .{ .operate = .{
+            .operator = step.operator,
+            .register = step.register,
+            .movement = .{ .lines = 1 },
+        } };
+        editor.edit(allocator, &buffer, &goal, action) catch |err| {
+            try std.testing.expectEqualStrings(before, buffer.bytes());
+            try std.testing.expectEqual(unnamed.ptr, editor.register('"').text.ptr);
+            try std.testing.expectEqual(zero.ptr, editor.register('0').text.ptr);
+            return err;
+        };
+        try std.testing.expectEqualStrings(step.after, buffer.bytes());
+        if (step.operator == .change) try editor.edit(allocator, &buffer, &goal, .end_insert);
+    }
+    try expectRegister(&editor, '0', "one\n", true);
+    try expectRegister(&editor, 'a', "one\n", true);
+    try expectRegister(&editor, '"', "one\n", true);
+    try expectRegister(&editor, 'b', "two\n", true);
 }
