@@ -10,7 +10,7 @@ Goals:
 
 ## Status
 
-Very early. Think Vim, but worse in every way. Nib can open a project, find and switch between files, edit UTF-8 text with a core set of Vim motions and operators, undo, and save safely while watching for changes on disk. Next come yank and put, search, visual mode and repeat, then language-server navigation, formatting and project-wide search.
+Very early. Think Vim, but worse in every way. Nib can open a project, find and switch between files, edit UTF-8 text with a core set of Vim motions and operators, search the current file, undo, and save safely while watching for changes on disk. Next come yank and put, visual mode and repeat, then language-server navigation, formatting and project-wide search.
 
 ## Try it
 
