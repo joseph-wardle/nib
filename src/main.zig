@@ -218,6 +218,7 @@ const App = struct {
         const old_notice = self.editor.notice;
         const old_highlight = self.editor.highlight;
         const old_viewport = entry.viewport;
+        const old_clipboard = self.editor.clipboard;
         if (self.editor.feed(self.gpa, buffer, &entry.goal, &entry.viewport, event)) |action| {
             self.fileAction(action);
             self.redraw = true;
@@ -230,6 +231,7 @@ const App = struct {
             old_position != buffer.position or
             old_text_length != buffer.bytes().len or
             old_highlight != self.editor.highlight or
+            old_clipboard != self.editor.clipboard or
             !std.meta.eql(old_viewport, entry.viewport) or
             !std.mem.eql(u8, old_notice, self.editor.notice);
         if (changed) self.redraw = true;
@@ -562,11 +564,16 @@ const App = struct {
 
     fn draw(self: *App) terminal.Error!void {
         var frame: Frame = .{ .screen = self.screen };
+        // A pending clipboard write leads the frame, whichever screen it shows.
+        if (self.editor.clipboard) try setClipboard(&frame, self.editor.register('"').text);
         try frame.append("\x1b[?25l\x1b[H\x1b[2J");
         if (self.finding) try self.drawFinder(&frame) else try self.drawEditor(&frame);
         // The reset ends every frame and nothing else; tests synchronise on it.
         try frame.append("\x1b[0m");
         try frame.flush();
+        // Only now has the whole write reached the terminal. An interrupted
+        // frame leaves it pending, so the next frame sends it again in full.
+        self.editor.clipboard = false;
     }
 
     fn drawEditor(self: *App, frame: *Frame) terminal.Error!void {
@@ -1105,6 +1112,22 @@ const Frame = struct {
     }
 };
 
+/// Sets the system clipboard to `text` with OSC 52, base64 encoded in whole
+/// 3-byte groups straight into `sink`, which has Frame's `append`, `room`
+/// and `commit`, so the encoding is never held whole.
+fn setClipboard(sink: anytype, text: []const u8) !void {
+    const encoder = std.base64.standard.Encoder;
+    try sink.append("\x1b]52;c;");
+    var rest = text;
+    while (rest.len != 0) {
+        const output = try sink.room(4);
+        const taken = @min(rest.len, output.len / 4 * 3);
+        sink.commit(encoder.encode(output, rest[0..taken]).len);
+        rest = rest[taken..];
+    }
+    try sink.append("\x07");
+}
+
 fn report(err: anyerror) void {
     const message = switch (err) {
         error.NotATerminal => "stdin and stdout must be the controlling terminal",
@@ -1570,6 +1593,103 @@ test "reloading names the file it reloaded or failed to reload" {
     const failed = "Reload of {s} failed; local state retained";
     try expectNotice(&app, failed, .{a_name});
 }
+
+test "the clipboard gets one OSC 52 of the text's base64 however the frame splits it" {
+    const allocator = std.testing.allocator;
+    const largest = @import("editor.zig").clipboard_limit;
+    const text = try allocator.alloc(u8, largest);
+    defer allocator.free(text);
+    for (text, 0..) |*byte, index| byte.* = @truncate(index *% 7 +% index / 251);
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    const frame_size = @sizeOf(@FieldType(Frame, "bytes"));
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, largest }) |size| {
+        const encoded_size = std.base64.standard.Encoder.calcSize(size);
+        try expected.resize(allocator, encoded_size);
+        const encoded = std.base64.standard.Encoder.encode(expected.items, text[0..size]);
+        for ([_]usize{ 7, 8, 9, 10, 11, 64, frame_size }) |capacity| {
+            output.clearRetainingCapacity();
+            var sink: Collector = try .init(allocator, capacity, &output);
+            defer sink.deinit(allocator);
+            try setClipboard(&sink, text[0..size]);
+            try sink.flush();
+            const bytes = output.items;
+            try std.testing.expect(std.mem.startsWith(u8, bytes, "\x1b]52;c;"));
+            try std.testing.expect(std.mem.endsWith(u8, bytes, "\x07"));
+            try std.testing.expectEqualStrings(encoded, bytes[7 .. bytes.len - 1]);
+        }
+    }
+}
+
+test "a yank redraws even when nothing else on screen changes" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "one\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 4, .columns = 11 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    // `Y` in the first column moves nothing. Into a register the clipboard
+    // never sees, it changes nothing on screen.
+    for ("\"_Y\"aY") |byte| app.editorEvent(.{ .key = byte });
+    try testing.expect(!app.redraw);
+    try testing.expect(!app.editor.clipboard);
+    app.editorEvent(.{ .key = 'Y' });
+    try testing.expect(app.redraw);
+    try testing.expect(app.editor.clipboard);
+}
+
+/// Frame's output interface, flushing into `output` whenever `capacity`
+/// bytes are buffered.
+const Collector = struct {
+    bytes: []u8,
+    len: usize = 0,
+    output: *std.ArrayList(u8),
+
+    fn init(allocator: Allocator, capacity: usize, output: *std.ArrayList(u8)) !Collector {
+        return .{ .bytes = try allocator.alloc(u8, capacity), .output = output };
+    }
+
+    fn deinit(self: *Collector, allocator: Allocator) void {
+        allocator.free(self.bytes);
+    }
+
+    fn append(self: *Collector, data: []const u8) !void {
+        const output = try self.room(data.len);
+        @memcpy(output[0..data.len], data);
+        self.commit(data.len);
+    }
+
+    fn room(self: *Collector, count: usize) ![]u8 {
+        std.debug.assert(count <= self.bytes.len);
+        if (self.bytes.len - self.len < count) try self.flush();
+        return self.bytes[self.len..];
+    }
+
+    fn commit(self: *Collector, count: usize) void {
+        std.debug.assert(count <= self.bytes.len - self.len);
+        self.len += count;
+    }
+
+    fn flush(self: *Collector) !void {
+        try self.output.appendSlice(std.testing.allocator, self.bytes[0..self.len]);
+        self.len = 0;
+    }
+};
 
 /// Copies document `id`'s path, which closing it frees, into `buffer`.
 fn copyPath(buffer: []u8, app: *App, id: session.Id) []const u8 {

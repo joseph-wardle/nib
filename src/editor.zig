@@ -19,6 +19,10 @@ pub const Register = struct { text: []u8 = &.{}, linewise: bool = false };
 
 pub const Error = EditError || error{UnsupportedYank};
 
+/// The most register text sent to the system clipboard. Konsole accepts a
+/// 1 MiB OSC 52 payload intact; larger text stays in the register only.
+pub const clipboard_limit = 1 << 20;
+
 /// Modal editing state shared by every document, including the last search
 /// and the registers.
 /// The caller owns the buffer, its vertical goal column and its viewport, and
@@ -50,6 +54,9 @@ pub const Editor = struct {
     /// the notice's text.
     counted: [2][32]u8 = undefined,
     counted_next: u1 = 0,
+    /// The unnamed register changed and fits the clipboard, so the next frame
+    /// sends it. Whoever draws clears this once that frame was written whole.
+    clipboard: bool = false,
 
     const Origin = struct { cursor: usize, goal: motion.Goal, viewport: view.Viewport };
     const not_found_prefix = "Not found: ";
@@ -245,10 +252,11 @@ pub const Editor = struct {
                         goal.* = motion.screenColumn(buffer, buffer.cursor, false);
                     }
                     const owned = text orelse return;
+                    const lines = std.mem.count(u8, owned, "\n") + @intFromBool(!linewise);
+                    // Reported first, so a clipboard refusal replaces it.
+                    if (lines > 2) self.report("{d} lines yanked", .{lines});
                     self.store(allocator, name, owned, linewise);
                     if (yanked) |zero| self.store(allocator, '0', zero, linewise);
-                    const lines = std.mem.count(u8, owned, "\n") + @intFromBool(!linewise);
-                    if (lines > 2) self.report("{d} lines yanked", .{lines});
                     return;
                 }
                 var range = selection.range;
@@ -439,11 +447,16 @@ pub const Editor = struct {
         return found.start;
     }
 
-    /// Replaces register `name`'s text with `text`, taking ownership.
+    /// Replaces register `name`'s text with `text`, taking ownership. The
+    /// unnamed register also goes to the clipboard, unless it is too large,
+    /// which the notice says, replacing any other.
     fn store(self: *Editor, allocator: Allocator, name: u8, text: []u8, linewise: bool) void {
         const held = &self.registers[slot(name)];
         allocator.free(held.text);
         held.* = .{ .text = text, .linewise = linewise };
+        if (name != '"') return;
+        self.clipboard = text.len <= clipboard_limit;
+        if (!self.clipboard) self.notice = "Not copied to the clipboard: over 1 MiB";
     }
 
     /// Formats a notice into the count buffer not written last.
@@ -1587,4 +1600,51 @@ fn putWorkflow(allocator: Allocator) !void {
         };
         try std.testing.expectEqualStrings(step.after, buffer.bytes());
     }
+}
+
+test "the clipboard takes unnamed writes up to 1 MiB and refuses larger ones with a notice" {
+    const allocator = std.testing.allocator;
+    // 1024 lines of 1 KiB make exactly 1 MiB, then one empty line more.
+    const text = try allocator.alloc(u8, clipboard_limit + 1);
+    defer allocator.free(text);
+    @memset(text, 'x');
+    for (1..1025) |number| text[number * 1024 - 1] = '\n';
+    text[clipboard_limit] = '\n';
+    var buffer = try Buffer.fromBytes(allocator, text);
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{};
+    // Neither the black hole nor a named register reaches the clipboard.
+    type_(&editor, &buffer, &place, "\"_yy\"ayy\"_dd\"add");
+    try std.testing.expect(!editor.clipboard);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqualStrings(text, buffer.bytes());
+    type_(&editor, &buffer, &place, "gg1024yy");
+    try std.testing.expect(editor.clipboard);
+    try std.testing.expectEqualStrings("1024 lines yanked", editor.notice);
+    try std.testing.expectEqual(@as(usize, clipboard_limit), editor.register('"').text.len);
+    // One byte more stays in the registers, and cancels the earlier write,
+    // which would now send the larger text.
+    type_(&editor, &buffer, &place, "yG");
+    try std.testing.expect(!editor.clipboard);
+    try std.testing.expectEqualStrings("Not copied to the clipboard: over 1 MiB", editor.notice);
+    try expectRegister(&editor, '0', text, true);
+    try expectRegister(&editor, '"', text, true);
+    // Deletes and changes write the clipboard too.
+    type_(&editor, &buffer, &place, "dd");
+    try std.testing.expect(editor.clipboard);
+    try std.testing.expectEqualStrings("", editor.notice);
+    editor.clipboard = false;
+    type_(&editor, &buffer, &place, "cw");
+    try std.testing.expect(editor.clipboard);
+    escape(&editor, &buffer, &place);
+    type_(&editor, &buffer, &place, "uugg");
+    try std.testing.expectEqualStrings(text, buffer.bytes());
+    editor.clipboard = false;
+    type_(&editor, &buffer, &place, "dG");
+    try std.testing.expect(!editor.clipboard);
+    try std.testing.expectEqualStrings("Not copied to the clipboard: over 1 MiB", editor.notice);
+    try std.testing.expectEqualStrings("", buffer.bytes());
 }
