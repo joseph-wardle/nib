@@ -78,6 +78,10 @@ pub const Editor = struct {
     /// Where the open search prompt started. Every query change, and closing
     /// the prompt, starts again from here.
     origin: ?Origin = null,
+    /// The selection's fixed end while the parser's `visual` is set; the
+    /// cursor is the other. Valid because nothing edits the text or switches
+    /// the document while a selection is on: the editor is not idle.
+    anchor: usize = 0,
     /// The unnamed register, `"0` and `"a`–`"z`, indexed by `slot`.
     registers: [2 + 26]Register = @splat(.{}),
     /// The unnamed register changed and fits the clipboard, so the next frame
@@ -104,6 +108,12 @@ pub const Editor = struct {
         return self.parser.mode;
     }
 
+    /// The visual selection, as drawn, while one is on.
+    pub fn selection(self: *const Editor, buffer: *const Buffer) ?motion.Selection {
+        const kind = self.parser.visual orelse return null;
+        return motion.visualRange(buffer, self.anchor, buffer.cursor, kind, null);
+    }
+
     /// The open search prompt, typed text and all; borrows editor storage
     /// until the next feed.
     pub fn searchPrompt(self: *const Editor) ?SearchPrompt {
@@ -116,8 +126,8 @@ pub const Editor = struct {
     /// replaced underneath, as a reload or a document switch does.
     pub fn idle(self: *const Editor) bool {
         const parser = &self.parser;
-        return parser.mode == .normal and parser.count == null and !parser.pending_g and
-            !parser.naming and parser.register == null and !parser.pasting;
+        return parser.mode == .normal and parser.visual == null and parser.count == null and
+            !parser.pending_g and !parser.naming and parser.register == null and !parser.pasting;
     }
 
     /// The query whose visible matches are drawn: the prompt's while it holds
@@ -151,7 +161,9 @@ pub const Editor = struct {
         const goal = &viewport.goal;
         if (event == .escape or (event == .key and event.key == 3)) {
             status.clear();
-            if (self.parser.mode == .normal) self.highlight = false;
+            // Escape that ends a selection or a prompt keeps the matches.
+            const parser = &self.parser;
+            if (parser.mode == .normal and parser.visual == null) self.highlight = false;
         }
         const parsed = self.parser.feed(event);
         // A dropped character is reported after whatever the event did.
@@ -179,6 +191,15 @@ pub const Editor = struct {
                 .preview => |typed| if (typed) |movement| preview(buffer, goal, movement),
                 .close => {},
                 .invalid => status.set("Unsupported search; ASCII text only"),
+            },
+            .begin_selection => {
+                status.clear();
+                self.anchor = buffer.cursor;
+            },
+            .other_end => {
+                status.clear();
+                std.mem.swap(usize, &self.anchor, &buffer.cursor);
+                goal.* = motion.screenColumn(buffer, buffer.cursor, false);
             },
             .jump => |movement| if (self.find(buffer, status, movement)) |destination| {
                 buffer.cursor = destination;
@@ -439,9 +460,9 @@ pub const Editor = struct {
         target: Target,
     ) Error!void {
         const yanking = operator == .yank;
-        const selection = target.selection;
-        const linewise = selection.linewise;
-        const copied = buffer.bytes()[selection.copied.start..selection.copied.end];
+        const selected = target.selection;
+        const linewise = selected.linewise;
+        const copied = buffer.bytes()[selected.copied.start..selected.copied.end];
         // Only a read-only buffer can hold text no register may.
         if (yanking and !buffer.editable and !char.editable(copied))
             return error.UnsupportedYank;
@@ -473,7 +494,7 @@ pub const Editor = struct {
             if (yanked) |zero| self.store(allocator, status, '0', zero, linewise);
             return;
         }
-        var range = selection.range;
+        var range = selected.range;
         const changing = operator == .change;
         // A linewise change keeps the last selected terminator, if
         // present, so insertion stays on a blank logical line.
@@ -1125,6 +1146,99 @@ test "the editor reports its mode and the open prompt's direction and text" {
     type_(&editor, &status, &buffer, &viewport, "cw");
     try std.testing.expectEqual(keys.Mode.insert, editor.mode());
     try std.testing.expectEqualStrings(" beta\n", buffer.bytes());
+}
+
+test "a selection runs from where v or V was typed to the cursor, and o swaps its ends" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "alpha beta\ngamma\n\ndelta");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{ .goal = null };
+    try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+    type_(&editor, &status, &buffer, &viewport, "wve");
+    try expectSelected(&editor, &buffer, 6, 10, false);
+    type_(&editor, &status, &buffer, &viewport, "o");
+    try std.testing.expectEqual(@as(usize, 6), buffer.cursor);
+    try std.testing.expectEqual(@as(motion.Goal, 6), viewport.goal);
+    try expectSelected(&editor, &buffer, 6, 10, false);
+    // The anchor stays at the old cursor; the cursor moves from the new one.
+    type_(&editor, &status, &buffer, &viewport, "2j");
+    try std.testing.expectEqual(@as(usize, 17), buffer.cursor);
+    try expectSelected(&editor, &buffer, 9, 18, false);
+    type_(&editor, &status, &buffer, &viewport, "V");
+    try expectSelected(&editor, &buffer, 0, 18, true);
+    type_(&editor, &status, &buffer, &viewport, "G");
+    try expectSelected(&editor, &buffer, 0, 23, true);
+    // A refused key reports and keeps the selection; Escape ends it.
+    type_(&editor, &status, &buffer, &viewport, "u");
+    try std.testing.expectEqualStrings("Unsupported command or count", status.text());
+    try expectSelected(&editor, &buffer, 0, 23, true);
+    escape(&editor, &status, &buffer, &viewport);
+    try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+    try std.testing.expectEqualStrings("", status.text());
+    // A new selection starts at the cursor, not the old anchor.
+    type_(&editor, &status, &buffer, &viewport, "ggv");
+    try expectSelected(&editor, &buffer, 0, 1, false);
+    try std.testing.expect(!buffer.modified());
+}
+
+test "searching in visual mode moves the selection's end and keeps the selection" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "one two\nthree two\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{ .goal = null };
+    type_(&editor, &status, &buffer, &viewport, "lv/two\r");
+    try expectSelected(&editor, &buffer, 1, 5, false);
+    type_(&editor, &status, &buffer, &viewport, "n");
+    try expectSelected(&editor, &buffer, 1, 15, false);
+    // A failed search, and a prompt closed while previewing, keep the end.
+    type_(&editor, &status, &buffer, &viewport, "/zz\r");
+    try std.testing.expectEqualStrings("Not found: zz", status.text());
+    try expectSelected(&editor, &buffer, 1, 15, false);
+    type_(&editor, &status, &buffer, &viewport, "?one");
+    try expectSelected(&editor, &buffer, 0, 2, false);
+    escape(&editor, &status, &buffer, &viewport);
+    try expectSelected(&editor, &buffer, 1, 15, false);
+    // Escape that ends the selection keeps the matches; the next hides them.
+    try std.testing.expectEqualStrings("zz", editor.highlighted().?);
+    escape(&editor, &status, &buffer, &viewport);
+    try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+    try std.testing.expectEqualStrings("zz", editor.highlighted().?);
+    escape(&editor, &status, &buffer, &viewport);
+    try std.testing.expectEqual(@as(?[]const u8, null), editor.highlighted());
+}
+
+test "the editor is not idle while a selection is on, including its search prompt" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "one\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{ .goal = null };
+    for ([_][]const u8{ "v", "/o", "\x1b", "l", "V", "V" }, 0..) |sequence, index| {
+        if (sequence[0] == 0x1b) escape(&editor, &status, &buffer, &viewport) else {
+            type_(&editor, &status, &buffer, &viewport, sequence);
+        }
+        try std.testing.expectEqual(index == 5, editor.idle());
+    }
+}
+
+fn expectSelected(
+    editor: *const Editor,
+    buffer: *const Buffer,
+    start: usize,
+    end: usize,
+    linewise: bool,
+) !void {
+    const selected = editor.selection(buffer).?;
+    try std.testing.expectEqual(Range{ .start = start, .end = end }, selected.range);
+    try std.testing.expectEqual(linewise, selected.linewise);
 }
 
 test "Enter keeps the match, records the query, and n and N repeat it with counts and notices" {

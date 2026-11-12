@@ -52,6 +52,10 @@ pub const Action = union(enum) {
     prompt: Prompt,
     operate: Operation,
     put: Put,
+    /// `v` or `V` in normal mode: a selection starts at the cursor.
+    begin_selection,
+    /// `o` in visual mode: the cursor moves to the selection's other end.
+    other_end,
     insert: Insertion,
     /// One typed character; borrows parser storage until the next feed.
     text: []const u8,
@@ -69,6 +73,8 @@ pub const Action = union(enum) {
     /// A `"x` prefix naming a register the command can't use.
     unsupported_register,
 };
+/// Visual mode is not a mode here but `Parser.visual`, which outlives the
+/// pending commands and the search prompt that change `mode`.
 pub const Mode = enum { normal, insert, operator, search };
 /// Longest `:` line or search query, in bytes.
 pub const max_line = 4096;
@@ -137,6 +143,10 @@ pub const Parser = struct {
     register: ?u8 = null,
     register_count: ?usize = null,
     pasting: bool = false,
+    /// The selection's kind while visual mode is on. Cancelling a pending
+    /// command, or a search prompt opened from visual mode, keeps it;
+    /// Escape, Ctrl-C and `v`/`V` of the same kind end it.
+    visual: ?motion.Visual = null,
     character: [4]u8 = undefined,
     character_len: u3 = 0,
     character_need: u3 = 0,
@@ -314,6 +324,20 @@ pub const Parser = struct {
             };
             return searched(operating, register, repeat);
         }
+        if (self.visual) |kind| {
+            if (count != null) return .invalid;
+            switch (byte) {
+                'o' => return .other_end,
+                'v', 'V' => {
+                    const chosen: motion.Visual = if (byte == 'v') .characterwise else .linewise;
+                    self.visual = if (chosen == kind) null else chosen;
+                    return null;
+                },
+                // Undo, `:` and Ctrl-P would act on the text or the document
+                // under the selection; the selection stays.
+                else => return .invalid,
+            }
+        }
         if (pending_operator) {
             if (byte == letter(operator)) {
                 const combined = multiply(operator_count, count) catch return .invalid;
@@ -368,6 +392,10 @@ pub const Parser = struct {
                     else => unreachable,
                 } };
             },
+            'v', 'V' => {
+                self.visual = if (byte == 'v') .characterwise else .linewise;
+                return .begin_selection;
+            },
             'u' => return .undo,
             0x12 => return .redo,
             0x10 => return .{ .request = .find },
@@ -399,14 +427,18 @@ pub const Parser = struct {
         return null;
     }
 
-    /// Escape and Ctrl-C cancel whatever is pending.
+    /// Escape and Ctrl-C cancel whatever is pending. Outside the prompt
+    /// they also end visual mode.
     fn escape(self: *Parser) ?Action {
         const mode = self.mode;
         self.cancel();
         return switch (mode) {
             .insert => .end_insert,
             .search => .{ .prompt = .close },
-            else => null,
+            else => {
+                self.visual = null;
+                return null;
+            },
         };
     }
 
@@ -540,6 +572,64 @@ test "colon asks for the command line, and a paste outside insert mode is ignore
     try std.testing.expectEqualDeep(Action.paste_begin, parser.feed(.paste_begin).?);
     try std.testing.expectEqualDeep(Action{ .paste_byte = 3 }, parser.feed(.{ .paste_byte = 3 }).?);
     try std.testing.expectEqualDeep(Action.paste_end, parser.feed(.paste_end).?);
+}
+
+test "v and V start, switch and end visual mode, which pending commands keep" {
+    for ([_]input.Event{ .escape, .{ .key = 3 } }) |cancel| {
+        var parser: Parser = .{};
+        try std.testing.expectEqualDeep(Action.begin_selection, keys(&parser, "v").?);
+        try std.testing.expectEqual(@as(?motion.Visual, .characterwise), parser.visual);
+        try std.testing.expect(keys(&parser, "V") == null);
+        try std.testing.expectEqual(@as(?motion.Visual, .linewise), parser.visual);
+        try std.testing.expect(keys(&parser, "V") == null);
+        try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+        try std.testing.expectEqualDeep(Action.begin_selection, keys(&parser, "V").?);
+        try std.testing.expect(keys(&parser, "vv") == null);
+        try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+        // Motions with counts, a cancelled count and refused keys keep it.
+        _ = keys(&parser, "v");
+        const movement: Movement = .{ .motion = .down, .count = 3 };
+        try std.testing.expectEqualDeep(Action{ .move = movement }, keys(&parser, "3j").?);
+        const top: Action = .{ .move = .{ .motion = .first_line } };
+        try std.testing.expectEqualDeep(top, keys(&parser, "gg").?);
+        try std.testing.expectEqualDeep(Action.other_end, keys(&parser, "o").?);
+        _ = keys(&parser, "\"a");
+        try std.testing.expect(parser.feed(.ignored) == null);
+        const refused = [_][]const u8{ "2v", "2o", "u", "\x12", ":", "\x10", "i", "Y", "\"aj" };
+        for (refused) |invalid| {
+            try std.testing.expectEqualDeep(Action.invalid, keys(&parser, invalid).?);
+            try std.testing.expectEqual(@as(?motion.Visual, .characterwise), parser.visual);
+        }
+        try std.testing.expect(parser.feed(cancel) == null);
+        try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        // A count does not start a selection.
+        try std.testing.expectEqualDeep(Action.invalid, keys(&parser, "2v").?);
+        try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+    }
+}
+
+test "a search prompt opened in visual mode returns to it however it closes" {
+    const closings = [_][]const u8{ "ab\r", "\x80\r", "ab\x1b", "ab\x03", "\x7f" };
+    for (closings) |closing| {
+        var parser: Parser = .{};
+        _ = keys(&parser, "V");
+        try std.testing.expectEqualDeep(Action{ .prompt = .open }, keys(&parser, "2/").?);
+        try std.testing.expectEqual(Mode.search, parser.mode);
+        for (closing) |byte| {
+            const event: input.Event = if (byte == 0x1b) .escape else .{ .key = byte };
+            _ = parser.feed(event);
+        }
+        try std.testing.expectEqual(Mode.normal, parser.mode);
+        try std.testing.expectEqual(@as(?motion.Visual, .linewise), parser.visual);
+    }
+    var parser: Parser = .{};
+    _ = keys(&parser, "v");
+    const typed: Search = .{ .target = .{ .typed = .{ .query = "ab", .direction = .backward } } };
+    try std.testing.expectEqualDeep(Action{ .jump = typed }, keys(&parser, "?ab\r").?);
+    const repeat: Search = .{ .target = .{ .repeat = .reverse }, .count = 2 };
+    try std.testing.expectEqualDeep(Action{ .jump = repeat }, keys(&parser, "2N").?);
+    try std.testing.expectEqual(@as(?motion.Visual, .characterwise), parser.visual);
 }
 
 test "decoder precedence and cancellation compose with insert and pending commands" {

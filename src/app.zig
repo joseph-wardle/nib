@@ -1022,6 +1022,8 @@ test "a clean file changed on disk reloads only after every pending state ends" 
         .{ .keys = "d", .close = "\x03" }, // operator
         .{ .keys = "i", .close = "\x03" }, // insert
         .{ .keys = "/x", .close = "\x03" }, // search prompt
+        .{ .keys = "v", .close = "\x03" }, // selection
+        .{ .keys = "Vl/x\x03", .close = "\x03" }, // selection after its prompt
         .{ .keys = ":q", .close = "\x03" }, // command line
         .{ .keys = "\x1b[200~x", .close = "\x1b[201~" }, // paste, ignored in normal mode
     };
