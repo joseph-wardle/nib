@@ -206,7 +206,7 @@ const App = struct {
                 &entry.document.buffer,
                 self.size.rows -| 1,
                 self.size.columns -| 1,
-                self.editor.inserting(),
+                self.editor.mode() == .insert,
             );
         }
         return null;
@@ -578,7 +578,7 @@ const App = struct {
     fn drawEditor(self: *App, frame: *Frame) terminal.Error!void {
         const entry = self.documents.current().?;
         const buffer = &entry.document.buffer;
-        const parser = &self.editor.parser;
+        const mode = self.editor.mode();
         const rows = self.size.rows;
         // Reserve the last column on every row to avoid autowrap, including the
         // bottom-right cell.
@@ -601,12 +601,12 @@ const App = struct {
                 line.put(":");
                 const text = self.command_line.line.text();
                 line.put(text[text.len -| line.left()..]);
-            } else if (parser.mode == .search) {
-                line.put(if (parser.prompt_direction == .forward) "/" else "?");
-                const text = parser.line.text();
+            } else if (self.editor.searchPrompt()) |search_prompt| {
+                line.put(if (search_prompt.direction == .forward) "/" else "?");
+                const text = search_prompt.text;
                 line.put(text[text.len -| (line.left() -| 1)..]);
                 prompt = line.used;
-            } else if (parser.mode == .operator) {
+            } else if (mode == .operator) {
                 line.put("OPERATOR pending | Escape/Ctrl-C cancel");
             } else if (self.status.len != 0) {
                 line.put(self.status.text());
@@ -619,10 +619,10 @@ const App = struct {
                 else
                     "";
                 line.put(std.fmt.bufPrint(&status, "{s}{s} | {d}:{d} | ", .{
-                    if (parser.mode == .insert) "INSERT" else "NORMAL",
+                    if (mode == .insert) "INSERT" else "NORMAL",
                     flags,
                     buffer.rowAt(buffer.cursor) + 1,
-                    motion.screenColumn(buffer, buffer.cursor, parser.mode == .insert) + 1,
+                    motion.screenColumn(buffer, buffer.cursor, mode == .insert) + 1,
                 }) catch unreachable);
                 line.put(entry.document.source.path);
                 line.put(" | Ctrl-P files | :qa quit");
@@ -632,12 +632,11 @@ const App = struct {
                 try highlight(frame, buffer, entry.viewport, query, rows - 1, width);
             }
         }
-        if (parser.mode == .search) {
+        if (mode == .search) {
             if (prompt) |column| try frame.cursor(rows - 1, @min(column, width - 1));
             return;
         }
-        const insert = parser.mode == .insert;
-        if (entry.viewport.cursor(buffer, rows -| 1, width, insert)) |cell| {
+        if (entry.viewport.cursor(buffer, rows -| 1, width, mode == .insert)) |cell| {
             try frame.cursor(cell.row, cell.column);
         }
     }

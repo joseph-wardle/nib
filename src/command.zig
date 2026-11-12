@@ -144,6 +144,13 @@ pub const Parser = struct {
     /// interrupted by another key or event; the caller reports it.
     discarded: bool = false,
 
+    /// Starts insertion after an action the parser ended in normal mode,
+    /// such as a change.
+    pub fn enterInsert(self: *Parser) void {
+        std.debug.assert(self.mode == .normal);
+        self.mode = .insert;
+    }
+
     pub fn cancel(self: *Parser) void {
         self.mode = .normal;
         self.count = null;

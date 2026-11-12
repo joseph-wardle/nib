@@ -17,6 +17,8 @@ const view = @import("view.zig");
 /// linewise register's last line is terminated. Owned by the editor.
 pub const Register = struct { text: []u8 = &.{}, linewise: bool = false };
 
+pub const SearchPrompt = struct { direction: search.Direction, text: []const u8 };
+
 pub const Error = EditError || error{UnsupportedYank};
 
 /// The most register text sent to the system clipboard. Konsole accepts a
@@ -95,8 +97,16 @@ pub const Editor = struct {
         return &self.registers[slot(name)];
     }
 
-    pub fn inserting(self: *const Editor) bool {
-        return self.parser.mode == .insert;
+    pub fn mode(self: *const Editor) command.Mode {
+        return self.parser.mode;
+    }
+
+    /// The open search prompt, typed text and all; borrows editor storage
+    /// until the next feed.
+    pub fn searchPrompt(self: *const Editor) ?SearchPrompt {
+        const parser = &self.parser;
+        if (parser.mode != .search) return null;
+        return .{ .direction = parser.prompt_direction, .text = parser.line.text() };
     }
 
     /// No command, insertion or paste is in progress, so the text may be
@@ -111,10 +121,9 @@ pub const Editor = struct {
     /// a valid query, otherwise the last one while highlighting is on. Borrows
     /// editor storage until the next feed.
     pub fn highlighted(self: *const Editor) ?[]const u8 {
-        const parser = &self.parser;
-        if (parser.mode == .search) {
-            if (parser.line.len == 0 or parser.line.invalid) return null;
-            return parser.line.text();
+        if (self.searchPrompt()) |prompt| {
+            if (prompt.text.len == 0 or self.parser.line.invalid) return null;
+            return prompt.text;
         }
         if (!self.highlight or self.last_query_len == 0) return null;
         return self.last_query[0..self.last_query_len];
@@ -308,7 +317,7 @@ pub const Editor = struct {
                 try buffer.replace(allocator, range, "", range.start);
                 if (text) |owned| self.store(allocator, status, name, owned, linewise);
                 if (changing) {
-                    self.parser.mode = .insert;
+                    self.parser.enterInsert();
                 } else {
                     buffer.cursor = motion.normal(buffer, buffer.cursor);
                     // Linewise deletion lands at the first nonblank character.
@@ -774,7 +783,7 @@ test "read-only edits and cancellations preserve original bytes and history" {
     keys(&editor, &status, allocator, &buffer, &goal, "iX\x03ddcwX\x03oO");
     try std.testing.expectEqualStrings("raw\xff\r", buffer.bytes());
     try std.testing.expectEqual(@as(usize, 0), buffer.position);
-    try std.testing.expect(!editor.inserting());
+    try std.testing.expect(editor.mode() != .insert);
     var editable = try Buffer.fromBytes(allocator, "one two\n");
     defer editable.deinit(allocator);
     keys(&editor, &status, allocator, &editable, &goal, "2d3\x03dg\x03\x03");
@@ -889,7 +898,7 @@ test "typing, a, Backspace and insert exit work by character" {
         keys(&editor, &status, allocator, &buffer, &goal, typed);
         try std.testing.expectEqualStrings(after, buffer.bytes());
         try std.testing.expectEqual(cursor, buffer.cursor);
-        try std.testing.expect(!editor.inserting());
+        try std.testing.expect(editor.mode() != .insert);
         keys(&editor, &status, allocator, &buffer, &goal, "u");
         try std.testing.expectEqualStrings(before, buffer.bytes());
         try std.testing.expectEqual(undo_cursor, buffer.cursor);
@@ -915,7 +924,7 @@ test "a dropped character or a non-ASCII command shows a notice and changes noth
     // Escape still leaves insert mode, and the notice survives it.
     keys(&editor, &status, allocator, &buffer, &goal, euro[0..2]);
     _ = editor.feed(allocator, &buffer, &goal, &viewport, &status, .escape);
-    try std.testing.expect(!editor.inserting());
+    try std.testing.expect(editor.mode() != .insert);
     try std.testing.expectEqualStrings(dropped, status.text());
     try std.testing.expectEqualStrings("ok\n", buffer.bytes());
     try std.testing.expect(!buffer.modified());
@@ -950,7 +959,7 @@ test "UTF-8 pastes insert as one step; invalid ones insert nothing with their ow
         pasted(&editor, &status, allocator, &buffer, &goal, bad);
         try std.testing.expectEqualStrings(after, buffer.bytes());
         try std.testing.expectEqualStrings("Unsupported paste; nothing inserted", status.text());
-        try std.testing.expect(editor.inserting());
+        try std.testing.expect(editor.mode() == .insert);
     }
     keys(&editor, &status, allocator, &buffer, &goal, "\x03u");
     try std.testing.expectEqualStrings("a\r\n", buffer.bytes());
@@ -1040,13 +1049,43 @@ test "each query change previews from the origin and closing restores cursor, go
         if (closing[0] != 0x1b) type_(&editor, &status, &buffer, &place, closing) else {
             escape(&editor, &status, &buffer, &place);
         }
-        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        try std.testing.expectEqual(command.Mode.normal, editor.mode());
         try std.testing.expectEqual(@as(usize, 2), buffer.cursor);
         try std.testing.expectEqual(@as(motion.Goal, null), place.goal);
         try std.testing.expectEqual(view.Viewport{ .top = 1, .left = 4 }, place.viewport);
         try std.testing.expectEqual(@as(?[]const u8, null), editor.highlighted());
     }
     try std.testing.expect(!buffer.modified());
+}
+
+test "the editor reports its mode and the open prompt's direction and text" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "alpha beta\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var place: Place = .{ .goal = null, .viewport = .{} };
+    try std.testing.expectEqual(@as(?SearchPrompt, null), editor.searchPrompt());
+    type_(&editor, &status, &buffer, &place, "?");
+    try std.testing.expectEqual(command.Mode.search, editor.mode());
+    try std.testing.expectEqual(search.Direction.backward, editor.searchPrompt().?.direction);
+    try std.testing.expectEqualStrings("", editor.searchPrompt().?.text);
+    type_(&editor, &status, &buffer, &place, "be");
+    try std.testing.expectEqualStrings("be", editor.searchPrompt().?.text);
+    escape(&editor, &status, &buffer, &place);
+    try std.testing.expectEqual(@as(?SearchPrompt, null), editor.searchPrompt());
+    type_(&editor, &status, &buffer, &place, "d");
+    try std.testing.expectEqual(command.Mode.operator, editor.mode());
+    // The prompt holds the operator; closing it drops both.
+    type_(&editor, &status, &buffer, &place, "/beta");
+    try std.testing.expectEqual(search.Direction.forward, editor.searchPrompt().?.direction);
+    escape(&editor, &status, &buffer, &place);
+    try std.testing.expectEqual(command.Mode.normal, editor.mode());
+    // A change ends the operator and starts insertion.
+    type_(&editor, &status, &buffer, &place, "cw");
+    try std.testing.expectEqual(command.Mode.insert, editor.mode());
+    try std.testing.expectEqualStrings(" beta\n", buffer.bytes());
 }
 
 test "Enter keeps the match, records the query, and n and N repeat it with counts and notices" {
@@ -1202,7 +1241,7 @@ test "operators take a search from the origin as a characterwise exclusive motio
         type_(&editor, &status, &buffer, &place, case.keys);
         try std.testing.expectEqualStrings(case.after, buffer.bytes());
         try std.testing.expectEqual(case.at, buffer.cursor);
-        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        try std.testing.expectEqual(command.Mode.normal, editor.mode());
         // One undo step restores the text.
         type_(&editor, &status, &buffer, &place, "u");
         try std.testing.expectEqualStrings(case.text, buffer.bytes());
@@ -1233,7 +1272,7 @@ test "a search motion that fails, lands on the cursor or is cancelled changes no
         if (case.escape) escape(&editor, &status, &buffer, &place);
         try std.testing.expectEqualStrings("ab\ncd\n", buffer.bytes());
         try std.testing.expectEqual(@as(usize, 1), buffer.cursor);
-        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        try std.testing.expectEqual(command.Mode.normal, editor.mode());
         try std.testing.expect(!buffer.modified());
         try std.testing.expect(!try buffer.undo(allocator));
     }
@@ -1253,7 +1292,7 @@ test "a read-only file is searchable but refuses search operators at the origin"
     try std.testing.expectEqual(@as(usize, 2), buffer.cursor);
     const refused = "Read-only: invalid UTF-8 or unsupported control bytes";
     try std.testing.expectEqualStrings(refused, status.text());
-    try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+    try std.testing.expectEqual(command.Mode.normal, editor.mode());
 }
 
 test "allocation failures in a search operator leave text and cursor unchanged" {
@@ -1341,7 +1380,7 @@ test "yanks fill the unnamed register and \"0 with Vim's text and shape, and edi
         try std.testing.expectEqual(at, buffer.cursor);
         try std.testing.expectEqualStrings(text, buffer.bytes());
         try std.testing.expectEqual(@as(usize, 0), buffer.position);
-        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        try std.testing.expectEqual(command.Mode.normal, editor.mode());
     }
 }
 
@@ -1378,7 +1417,7 @@ test "deletes and changes fill the register they name, and only unnamed yanks fi
         type_(&editor, &status, &buffer, &place, typed);
         try std.testing.expect(status.text().len != 0);
         try expectRegister(&editor, 'a', "one\nFOUR\nfi", false);
-        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        try std.testing.expectEqual(command.Mode.normal, editor.mode());
     }
     try std.testing.expectEqualStrings("Unsupported register", status.text());
 }
@@ -1576,7 +1615,7 @@ test "p and P put after real yanks with Vim's text and cursor, as one undo step"
         try std.testing.expectEqualStrings(after, buffer.bytes());
         try std.testing.expectEqual(at, buffer.cursor);
         try std.testing.expectEqual(@as(usize, 1), buffer.position);
-        try std.testing.expectEqual(command.Mode.normal, editor.parser.mode);
+        try std.testing.expectEqual(command.Mode.normal, editor.mode());
         type_(&editor, &status, &buffer, &place, "u");
         try std.testing.expectEqualStrings(text, buffer.bytes());
         try std.testing.expect(!buffer.modified());
