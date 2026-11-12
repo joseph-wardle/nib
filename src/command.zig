@@ -38,19 +38,12 @@ pub const Operation = struct {
     register: u8 = '"',
     movement: union(enum) { motion: Movement, lines: usize, search: Search },
 };
-/// Commands about files and the session rather than the text.
-pub const File = union(enum) {
-    /// `:q`, or `:q!` to discard.
-    quit: bool,
-    /// `:qa`, or `:qa!` to discard every file.
-    quit_all: bool,
-    /// `:w`, or `:w <path>` to write a copy.
-    write: []const u8,
-    /// `:wq`
-    write_quit,
-    reload,
-    /// Ctrl-P: open the finder.
+/// Keys the application handles rather than the editor.
+pub const Request = enum {
+    /// Ctrl-P
     find,
+    /// `:`
+    command_line,
 };
 pub const Action = union(enum) {
     move: Movement,
@@ -68,7 +61,7 @@ pub const Action = union(enum) {
     end_insert,
     undo,
     redo,
-    file: File,
+    request: Request,
     paste_begin,
     paste_byte: u8,
     paste_end,
@@ -76,12 +69,50 @@ pub const Action = union(enum) {
     /// A `"x` prefix naming a register the command can't use.
     unsupported_register,
 };
-pub const Mode = enum { normal, insert, operator, command_line, search };
+pub const Mode = enum { normal, insert, operator, search };
 /// Longest `:` line or search query, in bytes.
 pub const max_line = 4096;
 
-/// Owns incomplete commands, never text or terminal framing. Returned file paths
-/// and typed text borrow parser storage until the next feed; callers must handle
+/// A line typed at the `:` line or the search prompt. Only printable ASCII is
+/// kept; any other byte, or more than `max_line` bytes, makes it invalid.
+pub const Line = struct {
+    bytes: [max_line]u8 = undefined,
+    len: usize = 0,
+    invalid: bool = false,
+
+    /// Borrows the line until it next changes.
+    pub fn text(self: *const Line) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    pub fn clear(self: *Line) void {
+        self.len = 0;
+        self.invalid = false;
+    }
+
+    /// Applies one key. False for Backspace on an empty line, which closes it.
+    pub fn edit(self: *Line, byte: u8) bool {
+        switch (byte) {
+            0x08, 0x7f => {
+                if (self.len == 0) return false;
+                self.len -= 1;
+            },
+            0x20...0x7e => {
+                if (self.len == self.bytes.len) {
+                    self.invalid = true;
+                } else {
+                    self.bytes[self.len] = byte;
+                    self.len += 1;
+                }
+            },
+            else => self.invalid = true,
+        }
+        return true;
+    }
+};
+
+/// Owns incomplete commands, never text or terminal framing. Typed text and
+/// queries borrow parser storage until the next feed; callers must handle
 /// actions promptly. Insert mode collects a character's bytes across keys.
 /// The application decides whether an editing action is available, and cancels
 /// insertion if it refuses entry. Paste collection/mutation belongs to that app.
@@ -92,9 +123,8 @@ pub const Parser = struct {
     pending_g: bool = false,
     operator: motion.Operator = .delete,
     operator_count: ?usize = null,
-    line: [max_line]u8 = undefined,
-    line_len: usize = 0,
-    line_invalid: bool = false,
+    /// The search prompt's query.
+    line: Line = .{},
     /// The search prompt's direction, combined count and pending operator.
     prompt_direction: search.Direction = .forward,
     prompt_count: ?usize = null,
@@ -120,8 +150,7 @@ pub const Parser = struct {
         self.overflow = false;
         self.pending_g = false;
         self.operator_count = null;
-        self.line_len = 0;
-        self.line_invalid = false;
+        self.line.clear();
         self.prompt_count = null;
         self.prompt_operator = null;
         self.prompt_register = '"';
@@ -157,7 +186,6 @@ pub const Parser = struct {
             .escape => return self.escape(),
             .key => |byte| {
                 if (byte == 3) return self.escape();
-                if (self.mode == .command_line) return self.commandLine(byte);
                 if (self.mode == .search) return self.prompt(byte);
                 if (self.mode == .insert) return switch (byte) {
                     '\r', '\n' => .newline,
@@ -335,11 +363,10 @@ pub const Parser = struct {
             },
             'u' => return .undo,
             0x12 => return .redo,
-            0x10 => return .{ .file = .find },
-            ':' => self.mode = .command_line,
+            0x10 => return .{ .request = .find },
+            ':' => return .{ .request = .command_line },
             else => return .invalid,
         }
-        return null;
     }
 
     /// Starts collecting a character at its lead byte; false for a byte that
@@ -381,50 +408,22 @@ pub const Parser = struct {
         return .invalid;
     }
 
-    fn commandLine(self: *Parser, byte: u8) ?Action {
-        switch (byte) {
-            '\r', '\n' => {
-                // Reset state without overwriting storage borrowed by the action.
-                const line = self.line[0..self.line_len];
-                const invalid = self.line_invalid;
-                self.cancel();
-                if (invalid) return .invalid;
-                if (std.mem.eql(u8, line, "q")) return .{ .file = .{ .quit = false } };
-                if (std.mem.eql(u8, line, "q!")) return .{ .file = .{ .quit = true } };
-                if (std.mem.eql(u8, line, "qa")) return .{ .file = .{ .quit_all = false } };
-                if (std.mem.eql(u8, line, "qa!")) return .{ .file = .{ .quit_all = true } };
-                if (std.mem.eql(u8, line, "wq")) return .{ .file = .write_quit };
-                if (std.mem.eql(u8, line, "w")) return .{ .file = .{ .write = "" } };
-                if (std.mem.eql(u8, line, "e!")) return .{ .file = .reload };
-                if (std.mem.startsWith(u8, line, "w ") and line.len > 2)
-                    return .{ .file = .{ .write = line[2..] } };
-                return .invalid;
-            },
-            else => self.editLine(byte),
-        }
-        return null;
-    }
-
     fn prompt(self: *Parser, byte: u8) Action {
-        switch (byte) {
-            '\r', '\n' => {
-                // Reset state without overwriting storage borrowed by the action.
-                const typed = self.promptSearch();
-                const invalid = self.line_invalid;
-                const operator = self.prompt_operator;
-                const register = self.prompt_register;
-                self.cancel();
-                if (invalid) return .{ .prompt = .invalid };
-                return searched(operator, register, typed);
-            },
-            0x08, 0x7f => if (self.line_len == 0) {
-                self.cancel();
-                return .{ .prompt = .close };
-            },
-            else => {},
+        if (byte == '\r' or byte == '\n') {
+            // Reset state without overwriting storage borrowed by the action.
+            const typed = self.promptSearch();
+            const invalid = self.line.invalid;
+            const operator = self.prompt_operator;
+            const register = self.prompt_register;
+            self.cancel();
+            if (invalid) return .{ .prompt = .invalid };
+            return searched(operator, register, typed);
         }
-        self.editLine(byte);
-        if (self.line_len == 0 or self.line_invalid) return .{ .prompt = .{ .preview = null } };
+        if (!self.line.edit(byte)) {
+            self.cancel();
+            return .{ .prompt = .close };
+        }
+        if (self.line.len == 0 or self.line.invalid) return .{ .prompt = .{ .preview = null } };
         return .{ .prompt = .{ .preview = self.promptSearch() } };
     }
 
@@ -432,30 +431,11 @@ pub const Parser = struct {
     fn promptSearch(self: *const Parser) Search {
         return .{
             .target = .{ .typed = .{
-                .query = self.line[0..self.line_len],
+                .query = self.line.text(),
                 .direction = self.prompt_direction,
             } },
             .count = self.prompt_count,
         };
-    }
-
-    /// Editing shared by the `:` line and the search prompt. Only ASCII is
-    /// accepted; anything else, or too long a line, invalidates it.
-    fn editLine(self: *Parser, byte: u8) void {
-        switch (byte) {
-            0x08, 0x7f => {
-                if (self.line_len == 0) self.cancel() else self.line_len -= 1;
-            },
-            0x20...0x7e => {
-                if (self.line_len == self.line.len) {
-                    self.line_invalid = true;
-                } else {
-                    self.line[self.line_len] = byte;
-                    self.line_len += 1;
-                }
-            },
-            else => self.line_invalid = true,
-        }
     }
 };
 
@@ -496,7 +476,7 @@ test "motion and operator counts compose, distinguish zero and reject overflow" 
     try std.testing.expectEqualDeep(Action{ .operate = .{ .operator = .delete, .movement = .{ .motion = .{ .motion = .word, .count = 6 } } } }, keys(&parser, "2d3w").?);
     try std.testing.expectEqualDeep(Action{ .operate = .{ .operator = .change, .movement = .{ .lines = 6 } } }, keys(&parser, "2c3c").?);
     try std.testing.expectEqualDeep(Action{ .operate = .{ .operator = .delete, .movement = .{ .motion = .{ .motion = .start, .count = 2 } } } }, keys(&parser, "2d0").?);
-    try std.testing.expectEqualDeep(Action{ .file = .find }, keys(&parser, "\x10").?);
+    try std.testing.expectEqualDeep(Action{ .request = .find }, keys(&parser, "\x10").?);
     const refused = [_][]const u8{
         "999999999999999999999999999999999999l", "9223372036854775808d2w",
         "dgx",                                   "2i",
@@ -513,7 +493,7 @@ test "motion and operator counts compose, distinguish zero and reject overflow" 
 
 test "Escape and Ctrl-C cancel each incomplete command; insert actions retain no buffer" {
     for ([_]input.Event{ .escape, .{ .key = 3 } }) |cancel| {
-        for ([_][]const u8{ "2", "3g", "2d3", ":w source" }) |pending| {
+        for ([_][]const u8{ "2", "3g", "2d3" }) |pending| {
             var parser: Parser = .{};
             _ = keys(&parser, pending);
             try std.testing.expect(parser.feed(cancel) == null);
@@ -531,26 +511,15 @@ test "Escape and Ctrl-C cancel each incomplete command; insert actions retain no
     }
 }
 
-test "restricted command line borrows paths, edits, refuses overflow and ignores pasted commands" {
+test "colon asks for the command line, and a paste outside insert mode is ignored" {
     var parser: Parser = .{};
-    try std.testing.expectEqualDeep(Action{ .file = .{ .quit = false } }, keys(&parser, ":q\r").?);
-    try std.testing.expectEqualDeep(Action{ .file = .{ .quit = true } }, keys(&parser, ":q!\n").?);
-    try std.testing.expectEqualDeep(Action{ .file = .reload }, keys(&parser, ":e!\r").?);
-    try std.testing.expectEqualStrings("my copy.zig", keys(&parser, ":w my copy.zig\r").?.file.write);
-    try std.testing.expectEqualDeep(Action{ .file = .{ .quit = false } }, keys(&parser, ":w\x7fq\r").?);
-    const quit_all: Action = .{ .file = .{ .quit_all = false } };
-    try std.testing.expectEqualDeep(quit_all, keys(&parser, ":qa\r").?);
-    const discard_all: Action = .{ .file = .{ .quit_all = true } };
-    try std.testing.expectEqualDeep(discard_all, keys(&parser, ":qa!\r").?);
-    try std.testing.expectEqualDeep(Action{ .file = .write_quit }, keys(&parser, ":wq\r").?);
-    for ([_][]const u8{ ":qa!!\r", ":wq!\r", ":w \r", ":q\x00\r" }) |invalid| {
-        try std.testing.expectEqualDeep(Action.invalid, keys(&parser, invalid).?);
+    try std.testing.expectEqualDeep(Action{ .request = .command_line }, keys(&parser, ":").?);
+    try std.testing.expectEqual(Mode.normal, parser.mode);
+    for ([_][]const u8{ "2:", "d:", "g:" }) |refused| {
+        try std.testing.expectEqualDeep(Action.invalid, keys(&parser, refused).?);
+        try std.testing.expectEqual(Mode.normal, parser.mode);
     }
-    _ = keys(&parser, ":");
-    for (0..4097) |_| _ = keys(&parser, "q");
-    _ = keys(&parser, "\x7f");
-    try std.testing.expectEqualDeep(Action.invalid, keys(&parser, "\r").?);
-    for ([_][]const u8{ "", "d", ":" }) |prefix| {
+    for ([_][]const u8{ "", "d" }) |prefix| {
         parser.cancel();
         _ = keys(&parser, prefix);
         const mode = parser.mode;
@@ -783,12 +752,12 @@ test "a non-ASCII, control or overlong query previews nothing and is refused on 
     }
     var parser: Parser = .{};
     _ = keys(&parser, "/");
-    for (0..parser.line.len) |_| _ = keys(&parser, "q");
+    for (0..max_line) |_| _ = keys(&parser, "q");
     try std.testing.expect(keys(&parser, "q").?.prompt.preview == null);
     try expectAction(Action{ .prompt = .invalid }, keys(&parser, "\r"));
 }
 
-test "the prompt ignores paste and arrows, and the command line is unchanged by it" {
+test "the prompt ignores paste and arrows" {
     var parser: Parser = .{};
     _ = keys(&parser, "/a");
     try std.testing.expect(parser.feed(.paste_begin) == null);
@@ -798,8 +767,6 @@ test "the prompt ignores paste and arrows, and the command line is unchanged by 
     try std.testing.expect(parser.feed(.{ .arrow = .up }) == null);
     try std.testing.expectEqual(Mode.search, parser.mode);
     try expectAction(jump("a", .forward, null), keys(&parser, "\r"));
-    try expectAction(Action{ .file = .{ .quit = false } }, keys(&parser, ":q\r"));
-    try expectAction(Action.invalid, keys(&parser, ":/a\r"));
 }
 
 fn yank(register: u8, movement: @FieldType(Operation, "movement")) Action {

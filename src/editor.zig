@@ -57,9 +57,8 @@ pub const Status = struct {
 /// Modal editing state shared by every document, including the last search
 /// and the registers.
 /// The caller owns the buffer, its vertical goal column and its viewport, and
-/// handles file actions immediately (their paths borrow parser storage). The
-/// editor words its messages into the caller's `Status`. No terminal or I/O
-/// ownership.
+/// handles the keys `feed` returns as requests. The editor words its messages
+/// into the caller's `Status`. No terminal or I/O ownership.
 pub const Editor = struct {
     parser: command.Parser = .{},
     paste: std.ArrayList(u8) = .empty,
@@ -114,8 +113,8 @@ pub const Editor = struct {
     pub fn highlighted(self: *const Editor) ?[]const u8 {
         const parser = &self.parser;
         if (parser.mode == .search) {
-            if (parser.line_len == 0 or parser.line_invalid) return null;
-            return parser.line[0..parser.line_len];
+            if (parser.line.len == 0 or parser.line.invalid) return null;
+            return parser.line.text();
         }
         if (!self.highlight or self.last_query_len == 0) return null;
         return self.last_query[0..self.last_query_len];
@@ -137,7 +136,7 @@ pub const Editor = struct {
         viewport: *view.Viewport,
         status: *Status,
         event: input.Event,
-    ) ?command.File {
+    ) ?command.Request {
         if (event == .escape or (event == .key and event.key == 3)) {
             status.clear();
             if (self.parser.mode == .normal) self.highlight = false;
@@ -158,7 +157,7 @@ pub const Editor = struct {
             if (!(action == .prompt and action.prompt == .preview)) self.origin = null;
         }
         switch (action) {
-            .file => |file| return file,
+            .request => |request| return request,
             .invalid => status.set("Unsupported command or count"),
             .unsupported_register => status.set("Unsupported register"),
             .prompt => |prompt| switch (prompt) {

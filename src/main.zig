@@ -10,6 +10,7 @@ const motion = @import("motion.zig");
 const view = @import("view.zig");
 const input = @import("input.zig");
 const command = @import("command.zig");
+const command_line = @import("command_line.zig");
 const discovery = @import("discovery.zig");
 const jobs = @import("jobs.zig");
 const match = @import("match.zig");
@@ -96,8 +97,9 @@ fn run(
     return app.loop();
 }
 
-/// The session's interactive state. Focus is on the finder or on the active
-/// document; the editor exists only while a document is open.
+/// The session's interactive state. Focus is on the `:` line when it is open,
+/// otherwise on the finder or on the active document; the editor exists only
+/// while a document is open.
 const App = struct {
     gpa: Allocator,
     io: std.Io,
@@ -106,8 +108,10 @@ const App = struct {
     finder: *Finder,
     editor: Editor = .{},
     documents: Session = .{},
-    /// The finder has focus. Always set when no document is open.
+    /// The finder is shown. Always set when no document is open.
     finding: bool = false,
+    /// Open over either screen, with the same commands on both.
+    command_line: command_line.CommandLine = .{},
     /// The finder's keys move through the list rather than edit the query.
     browsing: bool = false,
     /// A `g` in the list awaits a second `g`.
@@ -163,10 +167,10 @@ const App = struct {
     }
 
     /// Feeds one read, or an expired Escape deadline, through `decoder`; then
-    /// reloads the active document if it is clean and changed on disk and the
-    /// editor is idle, and keeps its viewport on the cursor. Any delivered
-    /// event sets `redraw`, unless a bracketed paste is still arriving. Returns
-    /// the exit code once a command quits.
+    /// reloads the active document if it is clean and changed on disk, the
+    /// editor is idle and the `:` line is closed, and keeps its viewport on
+    /// the cursor. Any delivered event sets `redraw`, unless a bracketed paste
+    /// is still arriving. Returns the exit code once a command quits.
     fn step(self: *App, decoder: *input.Decoder, bytes: []const u8, expired: bool, now: i64) ?u8 {
         var fed: usize = 0;
         var pending = expired;
@@ -180,13 +184,18 @@ const App = struct {
                     continue;
                 }
                 delivered = true;
-                if (self.finding) self.finderEvent(decoded) else self.editorEvent(decoded);
+                if (self.command_line.open)
+                    self.commandLineEvent(decoded)
+                else if (self.finding)
+                    self.finderEvent(decoded)
+                else
+                    self.editorEvent(decoded);
                 if (self.exit) |code| return code;
             }
         }
         if (delivered and decoder.state != .paste) self.redraw = true;
         if (self.documents.current()) |entry| {
-            if (self.editor.idle()) {
+            if (self.editor.idle() and !self.command_line.open) {
                 const document = &entry.document;
                 const reload = entry.disk.automatic(self.gpa, self.io, document, &entry.goal);
                 self.announce(reload, false);
@@ -225,7 +234,7 @@ const App = struct {
     fn editorEvent(self: *App, event: input.Event) void {
         const entry = self.documents.current().?;
         const buffer = &entry.document.buffer;
-        const action = self.editor.feed(
+        const request = self.editor.feed(
             self.gpa,
             buffer,
             &entry.goal,
@@ -233,23 +242,24 @@ const App = struct {
             &self.status,
             event,
         );
-        if (action) |requested| self.fileAction(requested);
+        switch (request orelse return) {
+            .find => {
+                self.browsing = false;
+                self.find(self.finder.category);
+            },
+            .command_line => self.command_line.begin(),
+        }
+    }
+
+    fn commandLineEvent(self: *App, event: input.Event) void {
+        switch (self.command_line.feed(event) orelse return) {
+            .run => |requested| self.fileAction(requested),
+            .invalid => self.status.set("Unsupported command"),
+            .cancel => self.status.clear(),
+        }
     }
 
     fn finderEvent(self: *App, event: input.Event) void {
-        const parser = &self.editor.parser;
-        if (parser.mode == .command_line) {
-            // Command entry borrows the editor's idle command line, so the
-            // same commands mean the same thing on either screen.
-            const action = parser.feed(event) orelse return;
-            switch (action) {
-                .file => |requested| self.fileAction(requested),
-                .invalid => self.status.set("Unsupported command"),
-                // A command line yields only commands.
-                else => unreachable,
-            }
-            return;
-        }
         switch (event) {
             // A paste never reaches the query.
             .ignored, .paste_begin, .paste_byte, .paste_end => return,
@@ -267,10 +277,7 @@ const App = struct {
                 0x10 => return self.move(-1),
                 // Ctrl-R refreshes the category; Ctrl-X enters a command.
                 0x12 => return self.find(self.finder.category),
-                0x18 => {
-                    parser.mode = .command_line;
-                    return;
-                },
+                0x18 => return self.command_line.begin(),
                 else => {},
             },
             .arrow => |direction| return switch (direction) {
@@ -310,7 +317,7 @@ const App = struct {
             0x04 => self.move(half),
             0x15 => self.move(-half),
             '/', 'i' => self.browsing = false,
-            ':' => parser.mode = .command_line,
+            ':' => self.command_line.begin(),
             else => {},
         }
     }
@@ -410,13 +417,9 @@ const App = struct {
 
     /// Runs a file command from either screen. Closing the last document
     /// exits, as does quitting without one; the other commands need one.
-    fn fileAction(self: *App, action: command.File) void {
+    fn fileAction(self: *App, action: command_line.File) void {
         std.debug.assert(self.editor.idle());
         switch (action) {
-            .find => {
-                self.browsing = false;
-                self.find(self.finder.category);
-            },
             .quit => |discard| {
                 const entry = self.documents.current() orelse {
                     self.exit = 0;
@@ -592,17 +595,17 @@ const App = struct {
             var line: Line = .init(try frame.reserve(width));
             // The persistent disk/monitor status fills tiny status rows.
             line.put(entry.disk.status());
-            if (parser.mode == .command_line or parser.mode == .search) {
-                line.put(switch (parser.mode) {
-                    .command_line => ":",
-                    else => if (parser.prompt_direction == .forward) "/" else "?",
-                });
-                // Keep the end of a long line visible in the reserved status row,
-                // with a cell after it for the prompt's cursor.
-                const text = parser.line[0..parser.line_len];
-                const room = if (parser.mode == .search) line.left() -| 1 else line.left();
-                line.put(text[text.len -| room..]);
-                if (parser.mode == .search) prompt = line.used;
+            // Keep the end of a long line visible in the reserved status row,
+            // with a cell after a search query for the prompt's cursor.
+            if (self.command_line.open) {
+                line.put(":");
+                const text = self.command_line.line.text();
+                line.put(text[text.len -| line.left()..]);
+            } else if (parser.mode == .search) {
+                line.put(if (parser.prompt_direction == .forward) "/" else "?");
+                const text = parser.line.text();
+                line.put(text[text.len -| (line.left() -| 1)..]);
+                prompt = line.used;
             } else if (parser.mode == .operator) {
                 line.put("OPERATOR pending | Escape/Ctrl-C cancel");
             } else if (self.status.len != 0) {
@@ -697,11 +700,10 @@ const App = struct {
         }
         try frame.append("\x1b[7m");
         var status: Line = .init(try frame.reserve(width));
-        const parser = &self.editor.parser;
-        if (parser.mode == .command_line) {
+        if (self.command_line.open) {
             status.put(":");
             // Leave the last cell for the cursor.
-            const text = parser.line[0..parser.line_len];
+            const text = self.command_line.line.text();
             status.put(text[text.len -| (status.left() -| 1)..]);
         } else if (self.status.len != 0) {
             status.put(self.status.text());
@@ -714,8 +716,9 @@ const App = struct {
             status.put("^X command | ^R refresh");
         }
         try frame.append("\x1b[27m");
-        if (parser.mode == .command_line) {
-            try frame.cursor(self.size.rows - 1, @min(1 + parser.line_len, width - 1));
+        if (self.command_line.open) {
+            const column = 1 + self.command_line.line.len;
+            try frame.cursor(self.size.rows - 1, @min(column, width - 1));
         } else if (query_rows != 0 and !self.browsing) {
             try frame.cursor(header_rows + progress_rows, @min(2 + query.len, width - 1));
         }
@@ -1160,6 +1163,7 @@ test {
     _ = @import("view.zig");
     _ = @import("input.zig");
     _ = @import("command.zig");
+    _ = @import("command_line.zig");
     _ = @import("jobs.zig");
     _ = @import("session.zig");
     _ = @import("finder.zig");
@@ -1745,6 +1749,47 @@ test "every read that delivers an event draws, except while a paste is arriving"
     try testing.expect(app.step(&decoder, "\x1b[201~", false, 0) == null);
     try testing.expect(app.redraw);
     try testing.expectEqualStrings("abcone\n", app.documents.current().?.document.buffer.bytes());
+}
+
+test "the command line means the same on either screen and leaves the editor idle" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "one\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 4, .columns = 20 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
+    var decoder: input.Decoder = .{};
+    try testing.expect(app.step(&decoder, ":x", false, 0) == null);
+    try testing.expect(app.command_line.open);
+    try testing.expect(app.editor.idle());
+    try testing.expect(app.step(&decoder, "\r", false, 0) == null);
+    try testing.expectEqualStrings("Unsupported command", app.status.text());
+    try testing.expect(app.step(&decoder, ":\x03", false, 0) == null);
+    try testing.expectEqualStrings("", app.status.text());
+    // Open starts no job, unlike the Ctrl-P that would show it. Ctrl-X opens
+    // the line while searching, `:` while browsing the list.
+    app.find(.open);
+    for ([_][]const u8{ "\x18x\r", "\x1b", ":x\r" }) |keys| {
+        try testing.expect(app.step(&decoder, keys, false, 0) == null);
+    }
+    try testing.expectEqualStrings("Unsupported command", app.status.text());
+    try testing.expect(app.browsing);
+    try testing.expect(app.step(&decoder, "\x18w\r", false, 0) == null);
+    try testing.expectEqualStrings("Written", app.status.text());
+    try testing.expect(app.finding);
 }
 
 /// Frame's output interface, flushing into `output` whenever `capacity`
