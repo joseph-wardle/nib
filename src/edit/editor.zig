@@ -285,6 +285,8 @@ pub const Editor = struct {
                     status.set("Register empty");
                     return;
                 }
+                if (put.selection) |kind|
+                    return self.replaceSelection(allocator, buffer, goal, status, put, kind);
                 const row = buffer.rowAt(buffer.cursor);
                 const range = buffer.lineRange(row);
                 const end = buffer.contentEnd(row);
@@ -299,39 +301,17 @@ pub const Editor = struct {
                 // and the text loses its last one: the file still has no
                 // final newline.
                 const newline = buffer.newlineAt(buffer.cursor);
-                const lead = if (held.linewise and put.side == .after and range.end == end)
-                    newline.len
-                else
-                    0;
-                const breaks = std.mem.count(u8, held.text, "\n");
-                const one = held.text.len + breaks * (newline.len - 1);
-                const total = std.math.mul(usize, one, put.count) catch return error.FileTooLarge;
-                // Checked before allocating, so a large count costs nothing.
-                if (total > max_file_bytes - buffer.bytes().len) return error.FileTooLarge;
-                const built = try allocator.alloc(u8, lead + total);
+                const below = held.linewise and put.side == .after and range.end == end;
+                const lead = if (below) newline else "";
+                const room = max_file_bytes - buffer.bytes().len;
+                const count = put.count;
+                const built = try build(allocator, held.text, newline, false, count, lead, room);
                 defer allocator.free(built);
-                @memcpy(built[0..lead], newline[0..lead]);
-                expand(built[lead..][0..one], held.text, newline);
-                var copied = lead + one;
-                while (copied < built.len) : (copied += one) {
-                    @memcpy(built[copied..][0..one], built[lead..][0..one]);
-                }
-                const inserted = built[0..total];
+                const inserted = built[0 .. built.len - lead.len];
                 buffer.beginGroup();
                 const at: Range = .{ .start = offset, .end = offset };
-                try buffer.replace(allocator, at, inserted, offset + lead);
-                // As in Vim: a linewise put lands on the first put line's first
-                // nonblank, a multi-line characterwise put at its start, and any
-                // other on the last put character.
-                if (held.linewise) {
-                    buffer.cursor = motion.resolve(buffer, 0, .first, null, null).?.destination;
-                } else if (breaks == 0) {
-                    buffer.cursor = char.start(buffer.bytes(), offset + total - 1);
-                }
-                buffer.endCommand();
-                goal.* = motion.screenColumn(buffer, buffer.cursor, false);
-                const lines = std.mem.count(u8, inserted, "\n");
-                if (lines > 2) status.print("{d} more lines", .{lines});
+                try buffer.replace(allocator, at, inserted, offset + lead.len);
+                finishPut(buffer, goal, status, held.linewise, held.text, offset, inserted);
             },
             .text => |text| try insert(allocator, buffer, text),
             .tab => try insert(allocator, buffer, "\t"),
@@ -404,6 +384,51 @@ pub const Editor = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// Replaces the selection visual mode ended, of `kind`, with `put`'s
+    /// register, which holds text. As in Vim, text put over lines becomes
+    /// lines, and lines put over characters split the line around them. A
+    /// `p` stores the replaced text in the unnamed register; both read their
+    /// register first. One undo step, which returns to the selection's start.
+    fn replaceSelection(
+        self: *Editor,
+        allocator: Allocator,
+        buffer: *Buffer,
+        goal: *motion.Goal,
+        status: *Status,
+        put: keys.Put,
+        kind: motion.Visual,
+    ) Error!void {
+        const held = self.register(put.register);
+        const selected = motion.visualRange(buffer, self.anchor, buffer.cursor, kind, null);
+        const range = selected.range;
+        const bytes = buffer.bytes();
+        const newline = buffer.newlineAt(range.start);
+        const over_lines = kind == .linewise;
+        const lead = if (held.linewise and !over_lines) newline else "";
+        const room = max_file_bytes - (bytes.len - (range.end - range.start));
+        const terminate = over_lines and !held.linewise;
+        const built = try build(allocator, held.text, newline, terminate, put.count, lead, room);
+        defer allocator.free(built);
+        // Over an unterminated last line, the text loses its last
+        // terminator: the file still has no final newline.
+        const unterminated = over_lines and (range.end == 0 or bytes[range.end - 1] != '\n');
+        const inserted = built[0 .. built.len - if (unterminated) newline.len else 0];
+        const replaced = if (put.side == .after)
+            try copy(allocator, bytes[range.start..range.end], over_lines)
+        else
+            null;
+        errdefer if (replaced) |owned| allocator.free(owned);
+        const cursor = buffer.cursor;
+        buffer.cursor = range.start;
+        buffer.beginGroup();
+        errdefer buffer.cursor = cursor;
+        try buffer.replace(allocator, range, inserted, range.start + lead.len);
+        const lines = held.linewise or over_lines;
+        finishPut(buffer, goal, status, lines, held.text, range.start, inserted);
+        // After the line count, so a clipboard refusal replaces it.
+        if (replaced) |owned| self.store(allocator, status, '"', owned, over_lines);
     }
 
     /// Resolves an operation's movement from the cursor, or takes the
@@ -623,6 +648,59 @@ fn copy(allocator: Allocator, bytes: []const u8, linewise: bool) Allocator.Error
     };
     if (terminate) text[written] = '\n';
     return text;
+}
+
+/// `lead`, then `count` copies of register `text`, each with every LF as
+/// `newline` and followed by `newline` when `terminate`. Refuses copies
+/// longer than `room` before allocating, so a large count costs nothing.
+/// Caller owns the result.
+fn build(
+    allocator: Allocator,
+    text: []const u8,
+    newline: []const u8,
+    terminate: bool,
+    count: usize,
+    lead: []const u8,
+    room: usize,
+) Error![]u8 {
+    const breaks = std.mem.count(u8, text, "\n");
+    const expanded = text.len + breaks * (newline.len - 1);
+    const one = expanded + if (terminate) newline.len else 0;
+    const total = std.math.mul(usize, one, count) catch return error.FileTooLarge;
+    if (total > room) return error.FileTooLarge;
+    const built = try allocator.alloc(u8, lead.len + total);
+    @memcpy(built[0..lead.len], lead);
+    const first = built[lead.len..][0..one];
+    expand(first[0..expanded], text, newline);
+    @memcpy(first[expanded..], newline[0 .. one - expanded]);
+    var copied = lead.len + one;
+    while (copied < built.len) : (copied += one) @memcpy(built[copied..][0..one], first);
+    return built;
+}
+
+/// Places the cursor after a put of register `text` as `inserted` at
+/// `offset`, as in Vim: a linewise put on the first put line's first
+/// nonblank, a multi-line characterwise put at its start, and any other on
+/// the last put character. Ends the put's undo step and reports its lines.
+fn finishPut(
+    buffer: *Buffer,
+    goal: *motion.Goal,
+    status: *Status,
+    linewise: bool,
+    text: []const u8,
+    offset: usize,
+    inserted: []const u8,
+) void {
+    if (linewise) {
+        buffer.cursor = motion.normal(buffer, buffer.cursor);
+        buffer.cursor = motion.resolve(buffer, 0, .first, null, null).?.destination;
+    } else if (std.mem.indexOfScalar(u8, text, '\n') == null) {
+        buffer.cursor = char.start(buffer.bytes(), offset + inserted.len - 1);
+    }
+    buffer.endCommand();
+    goal.* = motion.screenColumn(buffer, buffer.cursor, false);
+    const lines = std.mem.count(u8, inserted, "\n");
+    if (lines > 2) status.print("{d} more lines", .{lines});
 }
 
 /// Writes register `text` into `destination`, with each LF as `newline`.
@@ -1284,8 +1362,9 @@ test "d, c and y act on a selection with Vim's text and cursor, and undo returns
         .{ "alpha beta\n", "wvey", "alpha beta\n", 6, "beta", false, 6 },
     };
     for (cases) |case| {
-        const text, const typed, const after, const cursor = .{ case[0], case[1], case[2], case[3] };
-        const held, const linewise, const undone = .{ case[4], case[5], case[6] };
+        const text, const typed, const after = .{ case[0], case[1], case[2] };
+        const cursor, const held = .{ case[3], case[4] };
+        const linewise, const undone = .{ case[5], case[6] };
         var buffer = try Buffer.fromBytes(allocator, text);
         defer buffer.deinit(allocator);
         var editor: Editor = .{};
@@ -1399,7 +1478,126 @@ test "a read-only file yanks a selection of editable text and refuses the rest, 
     try expectRegister(&editor, '"', "ok", false);
 }
 
-test "allocation failures in visual yanks, deletes and changes keep everything but the selection" {
+test "p and P replace a selection in each kind with Vim's text and cursor, undone at its start" {
+    const allocator = std.testing.allocator;
+    // Text, keys, then the text, cursor and unnamed register after, and the
+    // cursor after one undo.
+    const Case = struct { []const u8, []const u8, []const u8, usize, []const u8, bool, usize };
+    const cases = [_]Case{
+        // Characters over characters, repeated by a count.
+        .{ "one two\nthree\n", "yewvep", "one one\nthree\n", 6, "two", false, 4 },
+        .{ "one two\nthree\n", "yewve3p", "one oneoneone\nthree\n", 12, "two", false, 4 },
+        .{ "ab\ncd\n", "vjyjlvp", "ab\ncab\nc\n", 4, "d", false, 4 },
+        // Lines over lines, with the file's own line breaks.
+        .{ "one\ntwo\nthree\n", "yyjVp", "one\none\nthree\n", 4, "two\n", true, 4 },
+        .{ "one\ntwo\n", "yyjV2p", "one\none\none\n", 4, "two\n", true, 4 },
+        .{ "ab\r\ncd\r\n", "yyjVp", "ab\r\nab\r\n", 4, "cd\n", true, 4 },
+        // Characters over lines become a line of their own.
+        .{ "one\ntwo\nthree\n", "yejVjp", "one\none\n", 4, "two\nthree\n", true, 4 },
+        // Lines over characters split the line around them.
+        .{ "one\ntwo\nthree\n", "yyjlvp", "one\nt\none\no\nthree\n", 6, "w", false, 5 },
+        // P keeps the register it put.
+        .{ "one\ntwo\n", "yejvlP", "one\noneo\n", 6, "one", false, 4 },
+    };
+    for (cases) |case| {
+        const text, const typed, const after = .{ case[0], case[1], case[2] };
+        const cursor, const held = .{ case[3], case[4] };
+        const linewise, const undone = .{ case[5], case[6] };
+        var buffer = try Buffer.fromBytes(allocator, text);
+        defer buffer.deinit(allocator);
+        var editor: Editor = .{};
+        var status: Status = .{};
+        defer editor.deinit(allocator);
+        var viewport: Viewport = .{};
+        type_(&editor, &status, &buffer, &viewport, typed);
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(cursor, buffer.cursor);
+        try std.testing.expectEqual(keys.Mode.normal, editor.mode());
+        try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+        try expectRegister(&editor, '"', held, linewise);
+        type_(&editor, &status, &buffer, &viewport, "u");
+        try std.testing.expectEqualStrings(text, buffer.bytes());
+        try std.testing.expectEqual(undone, buffer.cursor);
+        try std.testing.expectEqual(@as(usize, 0), buffer.position);
+    }
+}
+
+test "visual p keeps the replaced text in the unnamed register and P keeps none" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "alpha beta\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{};
+    type_(&editor, &status, &buffer, &viewport, "\"ayewve\"ap");
+    try std.testing.expectEqualStrings("alpha alpha\n", buffer.bytes());
+    try expectRegister(&editor, '"', "beta", false);
+    try expectRegister(&editor, 'a', "alpha", false);
+    try expectRegister(&editor, '0', "", false);
+    try std.testing.expect(editor.clipboard);
+    editor.clipboard = false;
+    type_(&editor, &status, &buffer, &viewport, "0veP");
+    try std.testing.expectEqualStrings("beta alpha\n", buffer.bytes());
+    try expectRegister(&editor, '"', "beta", false);
+    try std.testing.expect(!editor.clipboard);
+    // The black hole is refused and keeps the selection; an empty register
+    // ends it and changes nothing.
+    type_(&editor, &status, &buffer, &viewport, "ve\"_p");
+    try std.testing.expectEqualStrings("Unsupported register", status.text());
+    try expectSelected(&editor, &buffer, 3, 10, false);
+    type_(&editor, &status, &buffer, &viewport, "\"bp");
+    try std.testing.expectEqualStrings("Register empty", status.text());
+    try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+    try std.testing.expectEqualStrings("beta alpha\n", buffer.bytes());
+}
+
+test "replacing an unterminated last line keeps the file without a final newline" {
+    const allocator = std.testing.allocator;
+    const Case = struct { []const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "yyjVp", "one\none", 4 },
+        .{ "yejVp", "one\none", 4 },
+        .{ "yyVjp", "one", 0 },
+        .{ "yeVjP", "one", 0 },
+    };
+    for (cases) |case| {
+        const typed, const after, const cursor = case;
+        var buffer = try Buffer.fromBytes(allocator, "one\ntwo");
+        defer buffer.deinit(allocator);
+        var editor: Editor = .{};
+        var status: Status = .{};
+        defer editor.deinit(allocator);
+        var viewport: Viewport = .{};
+        type_(&editor, &status, &buffer, &viewport, typed);
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(cursor, buffer.cursor);
+        type_(&editor, &status, &buffer, &viewport, "u");
+        try std.testing.expectEqualStrings("one\ntwo", buffer.bytes());
+    }
+}
+
+test "a read-only file refuses p and P over a selection, ending it" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "raw\xff\nok\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{};
+    type_(&editor, &status, &buffer, &viewport, "jvly");
+    for ([_][]const u8{ "vp", "VP" }) |typed| {
+        type_(&editor, &status, &buffer, &viewport, typed);
+        const read_only = "Read-only: invalid UTF-8 or unsupported control bytes";
+        try std.testing.expectEqualStrings(read_only, status.text());
+        try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+    }
+    try std.testing.expectEqualStrings("raw\xff\nok\n", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 0), buffer.position);
+    try expectRegister(&editor, '"', "ok", false);
+}
+
+test "allocation failures in visual operators and puts keep everything but the selection" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, visualWorkflow, .{});
 }
 
@@ -1414,7 +1612,9 @@ fn visualWorkflow(allocator: Allocator) !void {
     const steps = [_]struct { []const u8, []const u8, []const u8 }{
         .{ "vj", "\"ay", "one\r\ntwo\nthree\n" },
         .{ "Vj", "d", "three\n" },
-        .{ "ve", "c", "\n" },
+        .{ "ve", "p", "\none\ntwo\n\n" },
+        .{ "V", "\"aP", "\none\nt\ntwo\n\n" },
+        .{ "ve", "c", "\n\nt\ntwo\n\n" },
     };
     for (steps) |step| {
         const selecting, const operating, const after = step;
@@ -1440,7 +1640,7 @@ fn visualWorkflow(allocator: Allocator) !void {
         try std.testing.expectEqualStrings(after, buffer.bytes());
     }
     try expectRegister(&editor, 'a', "one\nt", false);
-    try expectRegister(&editor, '"', "three", false);
+    try expectRegister(&editor, '"', "one", false);
     try std.testing.expectEqual(keys.Mode.insert, editor.mode());
 }
 

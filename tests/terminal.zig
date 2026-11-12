@@ -985,6 +985,15 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try process.until("\x1b[2Jthird");
     try process.until("NORMAL [+] | 1:1 | ");
     try process.ready();
+    // Putting them back over the line left sends the replaced line instead.
+    try process.send("V");
+    try process.until("VISUAL LINE [+] | 1:1 | ");
+    try process.ready();
+    try process.send("p");
+    try process.until(clipboard ++ "dGhpcmQK\x07");
+    try process.until("\x1b[2Jalpha beta");
+    try process.until("NORMAL [+] | 1:1 | ");
+    try process.ready();
     try process.send(":w\r");
     try process.until("Written");
     try process.ready();
@@ -992,7 +1001,7 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
-    try expectFile(path, "third\n");
+    try expectFile(path, "alpha beta\ngamma\n");
 }
 
 /// Consumes the rest of the frame, after the status row, and checks that it
