@@ -95,7 +95,6 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         defer document.deinit(testing.allocator);
         var editor: Editor = .{};
         var status: Status = .{};
-        var goal: motion.Goal = 0;
         var viewport: view.Viewport = .{};
         defer editor.deinit(testing.allocator);
         var external: External = .{};
@@ -103,7 +102,6 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         for ("lh") |byte| _ = editor.feed(
             testing.allocator,
             &document.buffer,
-            &goal,
             &viewport,
             &status,
             .{ .key = byte },
@@ -111,17 +109,26 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         try testing.expectEqual(@as(usize, 0), document.buffer.cursor);
         try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "\tother\n0123456789\n" });
         if (explicit) {
-            const outcome = external.reload(testing.allocator, testing.io, &document, &goal);
+            const outcome = external.reload(
+                testing.allocator,
+                testing.io,
+                &document,
+                &viewport.goal,
+            );
             try testing.expect(outcome == .reloaded);
         } else {
             external.inspect(testing.allocator, &document, true);
-            const outcome = external.automatic(testing.allocator, testing.io, &document, &goal);
+            const outcome = external.automatic(
+                testing.allocator,
+                testing.io,
+                &document,
+                &viewport.goal,
+            );
             try testing.expect(outcome != null);
         }
         _ = editor.feed(
             testing.allocator,
             &document.buffer,
-            &goal,
             &viewport,
             &status,
             .{ .key = 'j' },
@@ -131,7 +138,6 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         _ = editor.feed(
             testing.allocator,
             &document.buffer,
-            &goal,
             &viewport,
             &status,
             .{ .key = 'k' },
@@ -159,7 +165,6 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             defer document.deinit(testing.allocator);
             var editor: Editor = .{};
             var status: Status = .{};
-            var goal: motion.Goal = 0;
             var viewport: view.Viewport = .{};
             defer editor.deinit(testing.allocator);
             var external: External = .{};
@@ -167,26 +172,34 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             _ = editor.feed(
                 testing.allocator,
                 &document.buffer,
-                &goal,
                 &viewport,
                 &status,
                 .{ .key = '$' },
             );
             try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
             if (explicit) {
-                const outcome = external.reload(testing.allocator, testing.io, &document, &goal);
+                const outcome = external.reload(
+                    testing.allocator,
+                    testing.io,
+                    &document,
+                    &viewport.goal,
+                );
                 try testing.expect(outcome == .reloaded);
             } else {
                 external.inspect(testing.allocator, &document, true);
-                const outcome = external.automatic(testing.allocator, testing.io, &document, &goal);
+                const outcome = external.automatic(
+                    testing.allocator,
+                    testing.io,
+                    &document,
+                    &viewport.goal,
+                );
                 try testing.expect(outcome != null);
             }
             try testing.expectEqual(case.cursor, document.buffer.cursor);
-            try testing.expectEqual(@as(?usize, case.goal), goal);
+            try testing.expectEqual(@as(?usize, case.goal), viewport.goal);
             _ = editor.feed(
                 testing.allocator,
                 &document.buffer,
-                &goal,
                 &viewport,
                 &status,
                 .{ .key = 'k' },
@@ -195,7 +208,6 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             _ = editor.feed(
                 testing.allocator,
                 &document.buffer,
-                &goal,
                 &viewport,
                 &status,
                 .{ .key = 'j' },
@@ -219,22 +231,26 @@ test "reload snaps a cursor inside shifted multi-byte text or a CRLF to a charac
         defer document.deinit(testing.allocator);
         var editor: Editor = .{};
         var status: Status = .{};
-        var goal: motion.Goal = 0;
         var viewport: view.Viewport = .{};
         defer editor.deinit(testing.allocator);
         var external: External = .{};
         defer external.deinit(testing.allocator);
         for ("llll") |byte| {
             const buffer = &document.buffer;
-            _ = editor.feed(testing.allocator, buffer, &goal, &viewport, &status, .{ .key = byte });
+            _ = editor.feed(testing.allocator, buffer, &viewport, &status, .{ .key = byte });
         }
         try testing.expectEqual(@as(usize, 4), document.buffer.cursor);
         try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
         external.inspect(testing.allocator, &document, true);
-        const outcome = external.automatic(testing.allocator, testing.io, &document, &goal);
+        const outcome = external.automatic(
+            testing.allocator,
+            testing.io,
+            &document,
+            &viewport.goal,
+        );
         try testing.expect(outcome != null);
         try testing.expectEqual(case.cursor, document.buffer.cursor);
-        try testing.expectEqual(@as(?usize, case.goal), goal);
+        try testing.expectEqual(@as(?usize, case.goal), viewport.goal);
     }
 }
 
@@ -246,7 +262,6 @@ test "notifications reload clean documents and keep dirty history until explicit
     defer document.deinit(testing.allocator);
     var editor: Editor = .{};
     var status: Status = .{};
-    var goal: motion.Goal = 0;
     var viewport: view.Viewport = .{};
     defer editor.deinit(testing.allocator);
     var external: External = .{};
@@ -258,7 +273,12 @@ test "notifications reload clean documents and keep dirty history until explicit
     try changed(&external);
     external.inspect(testing.allocator, &document, true);
     try testing.expect(external.diverged);
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) != null);
+    try testing.expect(external.automatic(
+        testing.allocator,
+        testing.io,
+        &document,
+        &viewport.goal,
+    ) != null);
     try testing.expectEqualStrings("new", document.buffer.bytes());
     try testing.expectEqual(@as(usize, 2), document.buffer.cursor);
     try testing.expectEqual(@as(usize, 0), document.buffer.history.items.len);
@@ -266,7 +286,6 @@ test "notifications reload clean documents and keep dirty history until explicit
     _ = editor.feed(
         testing.allocator,
         &document.buffer,
-        &goal,
         &viewport,
         &status,
         .{ .key = 'i' },
@@ -274,7 +293,6 @@ test "notifications reload clean documents and keep dirty history until explicit
     _ = editor.feed(
         testing.allocator,
         &document.buffer,
-        &goal,
         &viewport,
         &status,
         .{ .key = 'X' },
@@ -282,16 +300,26 @@ test "notifications reload clean documents and keep dirty history until explicit
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "disk" });
     try changed(&external);
     external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) == null);
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, &status, .{ .key = 3 });
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) == null);
+    try testing.expect(external.automatic(
+        testing.allocator,
+        testing.io,
+        &document,
+        &viewport.goal,
+    ) == null);
+    _ = editor.feed(testing.allocator, &document.buffer, &viewport, &status, .{ .key = 3 });
+    try testing.expect(external.automatic(
+        testing.allocator,
+        testing.io,
+        &document,
+        &viewport.goal,
+    ) == null);
     try testing.expectEqualStrings("neXw", document.buffer.bytes());
     try testing.expectEqualStrings("new", document.buffer.base);
     try testing.expectEqual(@as(usize, 1), document.buffer.position);
     try testing.expectEqual(error.SourceChanged, document.source.save(testing.allocator, &document.buffer, .{}).failure.?);
     // Failed explicit reload, including allocation failure, retains the document.
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const exhausted = external.reload(failing.allocator(), testing.io, &document, &goal);
+    const exhausted = external.reload(failing.allocator(), testing.io, &document, &viewport.goal);
     try testing.expect(exhausted == .out_of_memory);
     try testing.expectEqualStrings("neXw", document.buffer.bytes());
     try testing.expectEqual(@as(usize, 1), document.buffer.position);
@@ -299,16 +327,26 @@ test "notifications reload clean documents and keep dirty history until explicit
     try changed(&external);
     external.inspect(testing.allocator, &document, true);
     try testing.expect(external.missing);
-    try testing.expect(external.reload(testing.allocator, testing.io, &document, &goal) == .failed);
+    try testing.expect(external.reload(
+        testing.allocator,
+        testing.io,
+        &document,
+        &viewport.goal,
+    ) == .failed);
     try testing.expectEqualStrings("new", document.buffer.base);
     try testing.expect(try document.buffer.undo(testing.allocator));
     try testing.expectEqualStrings("new", document.buffer.bytes());
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) == null);
+    try testing.expect(external.automatic(
+        testing.allocator,
+        testing.io,
+        &document,
+        &viewport.goal,
+    ) == null);
     try testing.expect(try document.buffer.redo(testing.allocator));
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "recreated" });
     try changed(&external);
     external.inspect(testing.allocator, &document, true);
-    const outcome = external.reload(testing.allocator, testing.io, &document, &goal);
+    const outcome = external.reload(testing.allocator, testing.io, &document, &viewport.goal);
     try testing.expect(outcome == .reloaded);
     try testing.expectEqualStrings("recreated", document.buffer.bytes());
     try testing.expect(!document.buffer.modified());
@@ -318,7 +356,6 @@ test "notifications reload clean documents and keep dirty history until explicit
     _ = editor.feed(
         testing.allocator,
         &document.buffer,
-        &goal,
         &viewport,
         &status,
         .{ .key = 'i' },
@@ -326,12 +363,11 @@ test "notifications reload clean documents and keep dirty history until explicit
     _ = editor.feed(
         testing.allocator,
         &document.buffer,
-        &goal,
         &viewport,
         &status,
         .{ .key = 'Y' },
     );
-    _ = editor.feed(testing.allocator, &document.buffer, &goal, &viewport, &status, .{ .key = 3 });
+    _ = editor.feed(testing.allocator, &document.buffer, &viewport, &status, .{ .key = 3 });
     const report = document.source.save(testing.allocator, &document.buffer, .{});
     try testing.expect(report.verified);
     try changed(&external);
@@ -351,8 +387,8 @@ test "watch paths cover intermediate symlinks, directory replacement, inode alia
     try temp.dir.symLink(testing.io, "middle/source", "outer", .{});
     var document = try file.Source.load(testing.allocator, testing.io, temp.dir, "outer");
     defer document.deinit(testing.allocator);
-    var goal: motion.Goal = 0;
     var external: External = .{};
+    var goal: motion.Goal = 0;
     defer external.deinit(testing.allocator);
     external.inspect(testing.allocator, &document, true);
     // Alias writes produce target-inode notifications, even outside watched parents.

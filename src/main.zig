@@ -197,7 +197,12 @@ const App = struct {
         if (self.documents.current()) |entry| {
             if (self.editor.idle() and !self.command_line.open) {
                 const document = &entry.document;
-                const reload = entry.disk.automatic(self.gpa, self.io, document, &entry.goal);
+                const reload = entry.disk.automatic(
+                    self.gpa,
+                    self.io,
+                    document,
+                    &entry.viewport.goal,
+                );
                 self.announce(reload, false);
                 self.redraw = reload != null or self.redraw;
             }
@@ -237,7 +242,6 @@ const App = struct {
         const request = self.editor.feed(
             self.gpa,
             buffer,
-            &entry.goal,
             &entry.viewport,
             &self.status,
             event,
@@ -470,7 +474,12 @@ const App = struct {
             },
             .reload => {
                 const entry = self.documents.current() orelse return self.refuse();
-                const reload = entry.disk.reload(self.gpa, self.io, &entry.document, &entry.goal);
+                const reload = entry.disk.reload(
+                    self.gpa,
+                    self.io,
+                    &entry.document,
+                    &entry.viewport.goal,
+                );
                 self.announce(reload, true);
             },
         }

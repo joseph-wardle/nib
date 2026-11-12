@@ -2,7 +2,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const file = @import("file.zig");
-const motion = @import("motion.zig");
 const view = @import("view.zig");
 const External = @import("external.zig").External;
 
@@ -13,7 +12,6 @@ pub const Id = enum(u64) { _ };
 pub const Entry = struct {
     id: Id,
     document: file.Document,
-    goal: motion.Goal = 0,
     viewport: view.Viewport = .{},
     /// Last known disk status. Only the active entry's watch is armed.
     disk: External = .{},
@@ -109,7 +107,7 @@ pub const Session = struct {
         self.clock += 1;
         entry.used = self.clock;
         entry.disk.inspect(allocator, &entry.document, true);
-        return entry.disk.automatic(allocator, io, &entry.document, &entry.goal);
+        return entry.disk.automatic(allocator, io, &entry.document, &entry.viewport.goal);
     }
 
     /// Refuses unsaved edits unless `discard`. Closing the active document
@@ -196,9 +194,10 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
     defer session.deinit(testing.allocator);
     const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
     keys(&session, &editor, &status, "iZ\x03$j");
-    session.current().?.viewport = .{ .top = 1, .left = 3 };
+    session.current().?.viewport.top = 1;
+    session.current().?.viewport.left = 3;
     try testing.expectEqual(@as(usize, 23), session.current().?.document.buffer.cursor);
-    try testing.expectEqual(@as(motion.Goal, null), session.current().?.goal);
+    try testing.expectEqual(@as(motion.Goal, null), session.current().?.viewport.goal);
     const b = (try session.open(testing.allocator, testing.io, temp.dir, "b")).id;
     try testing.expectEqual(b, session.active.?);
     try testing.expect(session.get(a).?.disk.watch.fd < 0);
@@ -210,8 +209,7 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
     try testing.expect(session.get(b).?.disk.watch.fd < 0 and after.disk.watch.fd >= 0);
     try testing.expectEqualStrings("Za long first line\nshort\n", after.document.buffer.bytes());
     try testing.expectEqual(@as(usize, 23), after.document.buffer.cursor);
-    try testing.expectEqual(@as(motion.Goal, null), after.goal);
-    try testing.expectEqual(view.Viewport{ .top = 1, .left = 3 }, after.viewport);
+    try testing.expectEqual(view.Viewport{ .top = 1, .left = 3, .goal = null }, after.viewport);
     try testing.expectEqual(@as(usize, 1), after.document.buffer.history.items.len);
     try testing.expect(after.document.buffer.modified());
     // The end-of-line goal survives the switch: up lands on the longer line's end.
@@ -225,6 +223,7 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
 
 const Editor = @import("editor.zig").Editor;
 const Status = @import("editor.zig").Status;
+const motion = @import("motion.zig");
 
 fn keys(session: *Session, editor: *Editor, status: *Status, bytes: []const u8) void {
     const entry = session.current().?;
@@ -233,7 +232,6 @@ fn keys(session: *Session, editor: *Editor, status: *Status, bytes: []const u8) 
         _ = editor.feed(
             testing.allocator,
             buffer,
-            &entry.goal,
             &entry.viewport,
             status,
             .{ .key = byte },

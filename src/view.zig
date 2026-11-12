@@ -10,6 +10,8 @@ const char = @import("char.zig");
 pub const Viewport = struct {
     top: usize = 0,
     left: usize = 0,
+    /// The display column vertical motions aim for; null means line ends.
+    goal: motion.Goal = 0,
 
     pub fn follow(self: *Viewport, buffer: *const Buffer, rows: usize, columns: usize, insert: bool) void {
         const count = if (insert) buffer.insertionRows() else buffer.lineCount();
