@@ -4,7 +4,8 @@ const nib = @import("nib");
 const Buffer = nib.buffer.Buffer;
 const motion = nib.motion;
 const search = nib.search;
-const view = nib.view;
+const Viewport = nib.viewport.Viewport;
+const Highlights = nib.viewport.Highlights;
 
 // Per-key motion work as the event loop does it, without a terminal: resolve
 // the motion, move the cursor, follow it, place the terminal cursor and compute
@@ -49,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
             const row = buffer.lineCount() / 2;
             const start = buffer.lineRange(row).start;
             const origin = motion.normal(&buffer, start + buffer.line(row).len * 9 / 10);
-            var viewport: view.Viewport = .{};
+            var viewport: Viewport = .{};
             std.debug.print("{s} {s}, {d} bytes, cursor at byte {d} of its line:\n", .{
                 line.name,
                 if (long) "100 KiB single line" else "100 KiB source",
@@ -114,7 +115,7 @@ fn incremental(io: std.Io, buffer: *Buffer, origin: usize, query: []const u8) vo
     var times: [samples]i96 = undefined;
     for (&times) |*elapsed| {
         buffer.cursor = origin;
-        var viewport: view.Viewport = .{};
+        var viewport: Viewport = .{};
         viewport.follow(buffer, rows, columns, false);
         const before = std.Io.Timestamp.now(io, .awake);
         if (search.find(buffer.bytes(), query, origin, .forward, 1)) |found| {
@@ -124,7 +125,7 @@ fn incremental(io: std.Io, buffer: *Buffer, origin: usize, query: []const u8) vo
         const shown = buffer.insertionRows() -| viewport.top;
         for (0..@min(rows, shown)) |row| {
             const text = buffer.line(viewport.top + row);
-            var highlights: view.Highlights = .init(text, query, viewport.left, columns);
+            var highlights: Highlights = .init(text, query, viewport.left, columns);
             while (highlights.next()) |part| std.mem.doNotOptimizeAway(part.bytes);
         }
         const after = std.Io.Timestamp.now(io, .awake);

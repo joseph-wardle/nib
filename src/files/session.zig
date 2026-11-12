@@ -2,7 +2,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const file = @import("file.zig");
-const view = @import("../text/viewport.zig");
+const Viewport = @import("../text/viewport.zig").Viewport;
 const Disk = @import("disk.zig").Disk;
 
 /// A document's identity for the whole session; never reused.
@@ -12,7 +12,7 @@ pub const Id = enum(u64) { _ };
 pub const Entry = struct {
     id: Id,
     document: file.Document,
-    viewport: view.Viewport = .{},
+    viewport: Viewport = .{},
     /// Last known disk status. Only the active entry's watch is armed.
     disk: Disk = .{},
     /// Activation order; larger is more recent.
@@ -54,12 +54,12 @@ pub const Session = struct {
         self.* = undefined;
     }
 
-    pub fn get(self: *Session, id: Id) ?*Entry {
+    pub fn get(self: *const Session, id: Id) ?*Entry {
         for (self.entries.items) |*entry| if (entry.id == id) return entry;
         return null;
     }
 
-    pub fn current(self: *Session) ?*Entry {
+    pub fn current(self: *const Session) ?*Entry {
         return self.get(self.active orelse return null);
     }
 
@@ -209,7 +209,7 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
     try testing.expect(session.get(b).?.disk.watch.fd < 0 and after.disk.watch.fd >= 0);
     try testing.expectEqualStrings("Za long first line\nshort\n", after.document.buffer.bytes());
     try testing.expectEqual(@as(usize, 23), after.document.buffer.cursor);
-    try testing.expectEqual(view.Viewport{ .top = 1, .left = 3, .goal = null }, after.viewport);
+    try testing.expectEqual(Viewport{ .top = 1, .left = 3, .goal = null }, after.viewport);
     try testing.expectEqual(@as(usize, 1), after.document.buffer.history.items.len);
     try testing.expect(after.document.buffer.modified());
     // The end-of-line goal survives the switch: up lands on the longer line's end.

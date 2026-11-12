@@ -5,7 +5,8 @@ const Frame = @import("../terminal/frame.zig").Frame;
 const Line = @import("../terminal/frame.zig").Line;
 const Buffer = @import("../text/buffer.zig").Buffer;
 const motion = @import("../text/motion.zig");
-const view = @import("../text/viewport.zig");
+const Viewport = @import("../text/viewport.zig").Viewport;
+const Highlights = @import("../text/viewport.zig").Highlights;
 const Editor = @import("../edit/editor.zig").Editor;
 const session = @import("../files/session.zig");
 
@@ -89,7 +90,7 @@ pub fn draw(
 fn highlight(
     frame: *Frame,
     buffer: *const Buffer,
-    viewport: view.Viewport,
+    viewport: Viewport,
     query: []const u8,
     rows: usize,
     width: usize,
@@ -97,7 +98,7 @@ fn highlight(
     const shown = buffer.insertionRows() -| viewport.top;
     for (0..@min(rows, shown)) |row| {
         const text = buffer.line(viewport.top + row);
-        var highlights: view.Highlights = .init(text, query, viewport.left, width);
+        var highlights: Highlights = .init(text, query, viewport.left, width);
         while (highlights.next()) |part| {
             var position: [32]u8 = undefined;
             const move = "\x1b[{d};{d}H\x1b[7m";

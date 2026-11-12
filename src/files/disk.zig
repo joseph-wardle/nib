@@ -95,7 +95,7 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         defer document.deinit(testing.allocator);
         var editor: Editor = .{};
         var status: Status = .{};
-        var viewport: view.Viewport = .{};
+        var viewport: Viewport = .{};
         defer editor.deinit(testing.allocator);
         var disk: Disk = .{};
         defer disk.deinit(testing.allocator);
@@ -148,7 +148,7 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
 
 const Editor = @import("../edit/editor.zig").Editor;
 const Status = @import("../edit/editor.zig").Status;
-const view = @import("../text/viewport.zig");
+const Viewport = @import("../text/viewport.zig").Viewport;
 
 test "reload recomputes the vertical goal after clamping to shorter or empty text" {
     const cases = [_]struct { text: []const u8, cursor: usize, up: usize, goal: usize }{
@@ -165,7 +165,7 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             defer document.deinit(testing.allocator);
             var editor: Editor = .{};
             var status: Status = .{};
-            var viewport: view.Viewport = .{};
+            var viewport: Viewport = .{};
             defer editor.deinit(testing.allocator);
             var disk: Disk = .{};
             defer disk.deinit(testing.allocator);
@@ -231,7 +231,7 @@ test "reload snaps a cursor inside shifted multi-byte text or a CRLF to a charac
         defer document.deinit(testing.allocator);
         var editor: Editor = .{};
         var status: Status = .{};
-        var viewport: view.Viewport = .{};
+        var viewport: Viewport = .{};
         defer editor.deinit(testing.allocator);
         var disk: Disk = .{};
         defer disk.deinit(testing.allocator);
@@ -262,7 +262,7 @@ test "notifications reload clean documents and keep dirty history until explicit
     defer document.deinit(testing.allocator);
     var editor: Editor = .{};
     var status: Status = .{};
-    var viewport: view.Viewport = .{};
+    var viewport: Viewport = .{};
     defer editor.deinit(testing.allocator);
     var disk: Disk = .{};
     defer disk.deinit(testing.allocator);

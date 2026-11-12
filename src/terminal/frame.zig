@@ -96,12 +96,12 @@ test "a row of 3-byte characters at the widest terminal fits the frame unsplit" 
     for (0..columns) |index| @memcpy(text[3 * index ..][0..3], "\u{2014}");
     var frame: Frame = .{ .screen = undefined };
     const output = try frame.room(3 * columns);
-    frame.commit(view.renderText(text, 0, columns, output));
+    frame.commit(renderText(text, 0, columns, output));
     try std.testing.expectEqualSlices(u8, text, frame.bytes[0..frame.len]);
 }
 
 const Allocator = std.mem.Allocator;
-const view = @import("../text/viewport.zig");
+const renderText = @import("../text/viewport.zig").renderText;
 
 test "status lines show only printable ASCII and stop at the row's end" {
     var row: [8]u8 = undefined;

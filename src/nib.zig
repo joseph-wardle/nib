@@ -7,4 +7,4 @@ pub const finder = @import("finder/finder.zig");
 pub const jobs = @import("finder/jobs.zig");
 pub const motion = @import("text/motion.zig");
 pub const search = @import("text/search.zig");
-pub const view = @import("text/viewport.zig");
+pub const viewport = @import("text/viewport.zig");

@@ -4,7 +4,8 @@ const terminal = @import("../terminal/terminal.zig");
 const Frame = @import("../terminal/frame.zig").Frame;
 const Line = @import("../terminal/frame.zig").Line;
 const Buffer = @import("../text/buffer.zig").Buffer;
-const view = @import("../text/viewport.zig");
+const Viewport = @import("../text/viewport.zig").Viewport;
+const renderText = @import("../text/viewport.zig").renderText;
 const jobs = @import("../finder/jobs.zig");
 const match = @import("../finder/match.zig");
 const Finder = @import("../finder/finder.zig").Finder;
@@ -22,7 +23,7 @@ pub fn draw(
     frame: *Frame,
     size: terminal.Size,
     finder: *const Finder,
-    documents: *Session,
+    documents: *const Session,
     status: []const u8,
     command_line: ?[]const u8,
     browsing: bool,
@@ -178,7 +179,7 @@ fn progress(finder: *const Finder, row: []u8) void {
 fn drawResults(
     frame: *Frame,
     finder: *const Finder,
-    documents: *Session,
+    documents: *const Session,
     rows: usize,
     width: usize,
 ) terminal.Error!void {
@@ -206,7 +207,7 @@ fn drawResults(
 }
 
 /// The selection's preview, its title formatted into `title` when needed.
-fn previewPane(finder: *const Finder, documents: *Session, title: *[96]u8) Pane {
+fn previewPane(finder: *const Finder, documents: *const Session, title: *[96]u8) Pane {
     return switch (finder.preview()) {
         .none => .{ .title = "" },
         .loading => .{ .title = "Loading preview" },
@@ -233,7 +234,7 @@ fn previewPane(finder: *const Finder, documents: *Session, title: *[96]u8) Pane 
 }
 
 /// The open document the finder lists as `id`.
-fn opened(documents: *Session, id: DocumentId) ?*session.Entry {
+fn opened(documents: *const Session, id: DocumentId) ?*const session.Entry {
     return documents.get(@fromBackingInt(@backingInt(id)));
 }
 
@@ -244,7 +245,7 @@ fn opened(documents: *Session, id: DocumentId) ?*session.Entry {
 fn drawResult(
     frame: *Frame,
     finder: *const Finder,
-    documents: *Session,
+    documents: *const Session,
     result: match.Match,
     chosen: bool,
     marks: bool,
@@ -285,7 +286,7 @@ const Pane = struct {
     text: ?[]const u8 = null,
     /// An open document, drawn from its own scroll position.
     buffer: ?*const Buffer = null,
-    viewport: view.Viewport = .{},
+    viewport: Viewport = .{},
     row: usize = 0,
 
     /// Draws the next row into `columns` cells: the title as escaped ASCII,
@@ -310,7 +311,7 @@ const Pane = struct {
         self.text = if (end) |newline| text[newline + 1 ..] else null;
         // CR before LF ends the line; it is not shown.
         if (end != null and line.len != 0 and line[line.len - 1] == '\r') line.len -= 1;
-        return view.renderText(line, 0, columns, output);
+        return renderText(line, 0, columns, output);
     }
 };
 
@@ -361,7 +362,7 @@ test "previews of UTF-8 text, from a snapshot or an open buffer, render like the
         "            ",
     };
     for (rows, 0..) |expected, number| {
-        const viewport: view.Viewport = .{};
+        const viewport: Viewport = .{};
         const used = viewport.renderRow(&buffer, number, 12, &editor);
         try std.testing.expectEqualStrings(expected, editor[0..used]);
         try std.testing.expectEqualStrings(expected, row[0..snapshot.render(12, &row)]);

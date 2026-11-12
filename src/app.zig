@@ -247,9 +247,9 @@ const App = struct {
         }
         if (!self.browsing) return switch (event) {
             // Escape and Ctrl-C leave the query for the list.
-            .escape => self.browse(),
+            .escape => self.browsing = true,
             .key => |byte| switch (byte) {
-                3 => self.browse(),
+                3 => self.browsing = true,
                 0x08, 0x7f => self.edit(null),
                 0x20...0x7e => self.edit(byte),
                 else => {},
@@ -278,10 +278,6 @@ const App = struct {
             ':' => self.command_line.begin(),
             else => {},
         }
-    }
-
-    fn browse(self: *App) void {
-        self.browsing = true;
     }
 
     fn move(self: *App, delta: isize) void {
