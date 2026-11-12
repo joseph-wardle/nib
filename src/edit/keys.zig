@@ -36,7 +36,13 @@ pub const Put = struct { register: u8 = '"', count: usize = 1, side: enum { afte
 pub const Operation = struct {
     operator: motion.Operator,
     register: u8 = '"',
-    movement: union(enum) { motion: Movement, lines: usize, search: Search },
+    movement: union(enum) {
+        motion: Movement,
+        lines: usize,
+        search: Search,
+        /// Visual mode's selection, of this kind; the parser has ended it.
+        selection: motion.Visual,
+    },
 };
 /// Keys the application handles rather than the editor.
 pub const Request = enum {
@@ -145,7 +151,7 @@ pub const Parser = struct {
     pasting: bool = false,
     /// The selection's kind while visual mode is on. Cancelling a pending
     /// command, or a search prompt opened from visual mode, keeps it;
-    /// Escape, Ctrl-C and `v`/`V` of the same kind end it.
+    /// Escape, Ctrl-C, `v`/`V` of the same kind and an operator end it.
     visual: ?motion.Visual = null,
     character: [4]u8 = undefined,
     character_len: u3 = 0,
@@ -325,13 +331,27 @@ pub const Parser = struct {
             return searched(operating, register, repeat);
         }
         if (self.visual) |kind| {
-            if (count != null) return .invalid;
+            if (count != null or register_count != null) return .invalid;
             switch (byte) {
                 'o' => return .other_end,
                 'v', 'V' => {
                     const chosen: motion.Visual = if (byte == 'v') .characterwise else .linewise;
                     self.visual = if (chosen == kind) null else chosen;
                     return null;
+                },
+                'd', 'c', 'y' => {
+                    // As in normal mode, `"0` holds the last yank and nothing else.
+                    if (register == '0') return .unsupported_register;
+                    self.visual = null;
+                    return .{ .operate = .{
+                        .operator = switch (byte) {
+                            'd' => .delete,
+                            'c' => .change,
+                            else => .yank,
+                        },
+                        .register = register,
+                        .movement = .{ .selection = kind },
+                    } };
                 },
                 // Undo, `:` and Ctrl-P would act on the text or the document
                 // under the selection; the selection stays.
@@ -606,6 +626,42 @@ test "v and V start, switch and end visual mode, which pending commands keep" {
         // A count does not start a selection.
         try std.testing.expectEqualDeep(Action.invalid, keys(&parser, "2v").?);
         try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+    }
+}
+
+test "d, c and y in visual mode act on the selection with a register and end it" {
+    var parser: Parser = .{};
+    const deleted: Action = .{ .operate = .{
+        .operator = .delete,
+        .movement = .{ .selection = .characterwise },
+    } };
+    try std.testing.expectEqualDeep(deleted, keys(&parser, "vjd").?);
+    try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+    try std.testing.expectEqual(Mode.normal, parser.mode);
+    const changed: Action = .{ .operate = .{
+        .operator = .change,
+        .movement = .{ .selection = .linewise },
+    } };
+    try std.testing.expectEqualDeep(changed, keys(&parser, "Vc").?);
+    const yanked: Action = .{ .operate = .{
+        .operator = .yank,
+        .register = 'a',
+        .movement = .{ .selection = .linewise },
+    } };
+    try std.testing.expectEqualDeep(yanked, keys(&parser, "vV\"ay").?);
+    try std.testing.expectEqual(@as(?motion.Visual, null), parser.visual);
+    // Counts, and `"0` for any operator, are refused and keep the selection.
+    _ = keys(&parser, "v");
+    const refused = [_]struct { []const u8, Action }{
+        .{ "2d", .invalid },
+        .{ "2\"ay", .invalid },
+        .{ "\"a2y", .invalid },
+        .{ "\"0d", .unsupported_register },
+        .{ "\"0y", .unsupported_register },
+    };
+    for (refused) |case| {
+        try std.testing.expectEqualDeep(case[1], keys(&parser, case[0]).?);
+        try std.testing.expectEqual(@as(?motion.Visual, .characterwise), parser.visual);
     }
 }
 

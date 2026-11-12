@@ -948,11 +948,51 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try process.send("\x1b");
     try process.until("NORMAL | 2:");
     try plainFrame(&process);
+    // Suspended and resumed, the selection is drawn again.
+    try editingKeys(&process, "ggwv");
+    try process.send("e");
+    try process.until("VISUAL | 1:10 | ");
+    try process.ready();
+    try process.send("\x1a");
+    _ = try process.wait(true);
+    try process.until(leave);
+    try process.restored();
+    try process.signal(.CONT);
+    try process.until(enter);
+    try process.until("VISUAL | 1:10 | ");
+    try process.until("\x1b[1;7H\x1b[7mbeta\x1b[27m");
+    try process.ready();
+    // A yank ends it and sends "beta" to the clipboard.
+    try process.send("y");
+    try process.until(clipboard ++ "YmV0YQ==\x07");
+    try withoutClipboard(&process, "NORMAL | 1:7 | ");
+    // A clean file changed on disk reloads only once the selection ends.
+    try process.send("V");
+    try process.until("VISUAL LINE | 1:7 | ");
+    try process.ready();
+    try putFile(path, "alpha beta\ngamma\nthird\n");
+    try process.until("DISK CONFLICT | VISUAL LINE | ");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("\x1b");
+    try process.until("third");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    // Two selected lines are deleted, and go to the clipboard.
+    try editingKeys(&process, "ggVj");
+    try process.send("d");
+    try process.until(clipboard ++ "YWxwaGEgYmV0YQpnYW1tYQo=\x07");
+    try process.until("\x1b[2Jthird");
+    try process.until("NORMAL [+] | 1:1 | ");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("Written");
+    try process.ready();
     try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
-    try expectFile(path, "alpha beta\ngamma\n");
+    try expectFile(path, "third\n");
 }
 
 /// Consumes the rest of the frame, after the status row, and checks that it

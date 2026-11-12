@@ -89,9 +89,10 @@ pub const Editor = struct {
     clipboard: bool = false,
 
     const Origin = struct { cursor: usize, viewport: Viewport };
-    /// What an operator acts on, and where a yank of it leaves the cursor
-    /// when that is before the cursor.
-    const Target = struct { selection: motion.Selection, destination: usize };
+    /// What an operator acts on, where a yank of it leaves the cursor when
+    /// that is before the cursor, and where the cursor is when a delete or
+    /// change starts, so undo returns there: the cursor, or a selection's start.
+    const Target = struct { selection: motion.Selection, destination: usize, start: usize };
 
     pub fn deinit(self: *Editor, allocator: Allocator) void {
         self.paste.deinit(allocator);
@@ -405,8 +406,9 @@ pub const Editor = struct {
         }
     }
 
-    /// Resolves an operation's movement from the cursor to what its operator
-    /// acts on; null is a failed movement. Moves nothing and changes no text.
+    /// Resolves an operation's movement from the cursor, or takes the
+    /// selection visual mode ended, to what its operator acts on; null is a
+    /// failed movement. Moves nothing and changes no text.
     fn select(
         self: *Editor,
         buffer: *const Buffer,
@@ -441,11 +443,25 @@ pub const Editor = struct {
                     .goal = null,
                 };
             },
+            .selection => |kind| {
+                const selected = motion.visualRange(
+                    buffer,
+                    self.anchor,
+                    buffer.cursor,
+                    kind,
+                    operation.operator,
+                );
+                // Where the selection is drawn from: a line delete's range can
+                // start a terminator earlier.
+                const start = selected.copied.start;
+                return .{ .selection = selected, .destination = start, .start = start };
+            },
         };
         return .{
             .selection = motion.operatorRange(buffer, buffer.cursor, result, operation.operator),
             // A line count never moves a yank's cursor.
             .destination = if (operation.movement == .lines) buffer.cursor else result.destination,
+            .start = buffer.cursor,
         };
     }
 
@@ -505,7 +521,10 @@ pub const Editor = struct {
             range.end -= 1;
             if (range.end > range.start and bytes[range.end - 1] == '\r') range.end -= 1;
         }
+        const cursor = buffer.cursor;
+        buffer.cursor = target.start;
         buffer.beginGroup();
+        errdefer buffer.cursor = cursor;
         try buffer.replace(allocator, range, "", range.start);
         if (text) |owned| self.store(allocator, status, name, owned, linewise);
         if (changing) {
@@ -1243,6 +1262,186 @@ fn expectSelected(
     const selected = editor.selection(buffer).?;
     try std.testing.expectEqual(Range{ .start = start, .end = end }, selected.range);
     try std.testing.expectEqual(linewise, selected.linewise);
+}
+
+test "d, c and y act on a selection with Vim's text and cursor, and undo returns to its start" {
+    const allocator = std.testing.allocator;
+    // Text, keys, then the text, cursor and register after, and the cursor
+    // after one undo.
+    const Case = struct { []const u8, []const u8, []const u8, usize, []const u8, bool, usize };
+    const cases = [_]Case{
+        .{ "alpha beta\ngamma\n", "wved", "alpha \ngamma\n", 5, "beta", false, 6 },
+        .{ "alpha beta\ngamma\n", "wvjd", "alpha \n", 5, "beta\ngamma", false, 6 },
+        .{ "  one\ntwo\nthree\n", "llVjd", "three\n", 0, "  one\ntwo\n", true, 0 },
+        // An empty line's character is its break, so deleting it joins lines.
+        .{ "a\n\nb\n", "jvd", "a\nb\n", 2, "\n", false, 2 },
+        .{ "ab\r\ncd\r\n", "lvjd", "a\r\n", 0, "b\ncd", false, 1 },
+        .{ "alpha beta\ngamma\n", "wvjcX\x03", "alpha X\n", 6, "beta\ngamma", false, 6 },
+        // A line change keeps the last break, so insertion is on a blank line.
+        .{ "  one\ntwo\nthree\n", "llVjcX\x03", "X\nthree\n", 0, "  one\ntwo\n", true, 0 },
+        // A yank leaves the cursor at the selection's start: column one for lines.
+        .{ "  one\ntwo\n", "jllVky", "  one\ntwo\n", 0, "  one\ntwo\n", true, 0 },
+        .{ "alpha beta\n", "wvey", "alpha beta\n", 6, "beta", false, 6 },
+    };
+    for (cases) |case| {
+        const text, const typed, const after, const cursor = .{ case[0], case[1], case[2], case[3] };
+        const held, const linewise, const undone = .{ case[4], case[5], case[6] };
+        var buffer = try Buffer.fromBytes(allocator, text);
+        defer buffer.deinit(allocator);
+        var editor: Editor = .{};
+        var status: Status = .{};
+        defer editor.deinit(allocator);
+        var viewport: Viewport = .{};
+        type_(&editor, &status, &buffer, &viewport, typed);
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(cursor, buffer.cursor);
+        try std.testing.expectEqual(keys.Mode.normal, editor.mode());
+        try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+        try expectRegister(&editor, '"', held, linewise);
+        try std.testing.expect(editor.clipboard);
+        const yanked = typed[typed.len - 1] == 'y';
+        try expectRegister(&editor, '0', if (yanked) held else "", yanked and linewise);
+        if (yanked) {
+            try std.testing.expectEqual(@as(usize, 0), buffer.position);
+            continue;
+        }
+        type_(&editor, &status, &buffer, &viewport, "u");
+        try std.testing.expectEqualStrings(text, buffer.bytes());
+        try std.testing.expectEqual(undone, buffer.cursor);
+        try std.testing.expectEqual(@as(usize, 0), buffer.position);
+    }
+}
+
+test "visual operators take a register, refuse counts and \"0, and keep the selection then" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "alpha beta\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{};
+    type_(&editor, &status, &buffer, &viewport, "wve");
+    const refused = [_]struct { []const u8, []const u8 }{
+        .{ "2d", "Unsupported command or count" },
+        .{ "2\"ay", "Unsupported command or count" },
+        .{ "\"0d", "Unsupported register" },
+    };
+    for (refused) |case| {
+        type_(&editor, &status, &buffer, &viewport, case[0]);
+        try std.testing.expectEqualStrings(case[1], status.text());
+        try expectSelected(&editor, &buffer, 6, 10, false);
+    }
+    // A named yank leaves the unnamed register, "0 and the clipboard alone.
+    type_(&editor, &status, &buffer, &viewport, "\"ay");
+    try std.testing.expectEqualStrings("", status.text());
+    try expectRegister(&editor, 'a', "beta", false);
+    try expectRegister(&editor, '"', "", false);
+    try expectRegister(&editor, '0', "", false);
+    try std.testing.expect(!editor.clipboard);
+    try std.testing.expectEqual(@as(usize, 6), buffer.cursor);
+    type_(&editor, &status, &buffer, &viewport, "ve\"_d");
+    try std.testing.expectEqualStrings("alpha \n", buffer.bytes());
+    try expectRegister(&editor, '"', "", false);
+    try expectRegister(&editor, 'a', "beta", false);
+}
+
+test "a line selection deleted or changed at an unterminated last line keeps it unterminated" {
+    const allocator = std.testing.allocator;
+    const Case = struct { []const u8, []const u8, usize };
+    const cases = [_]Case{
+        .{ "jVd", "one", 0 },
+        .{ "Vjd", "", 0 },
+        .{ "jVcX\x03", "one\nX", 4 },
+        .{ "VjcX\x03", "X", 0 },
+    };
+    for (cases) |case| {
+        const typed, const after, const cursor = case;
+        var buffer = try Buffer.fromBytes(allocator, "one\ntwo");
+        defer buffer.deinit(allocator);
+        var editor: Editor = .{};
+        var status: Status = .{};
+        defer editor.deinit(allocator);
+        var viewport: Viewport = .{};
+        type_(&editor, &status, &buffer, &viewport, typed);
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+        try std.testing.expectEqual(cursor, buffer.cursor);
+        const lines = if (typed[0] == 'j') "two\n" else "one\ntwo\n";
+        try expectRegister(&editor, '"', lines, true);
+        type_(&editor, &status, &buffer, &viewport, "u");
+        try std.testing.expectEqualStrings("one\ntwo", buffer.bytes());
+    }
+}
+
+test "a read-only file yanks a selection of editable text and refuses the rest, ending it" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "raw\xff\rline\nok\r\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{};
+    type_(&editor, &status, &buffer, &viewport, "jvly");
+    try expectRegister(&editor, '"', "ok", false);
+    const read_only = "Read-only: invalid UTF-8 or unsupported control bytes";
+    const refused = [_]struct { []const u8, []const u8 }{
+        .{ "Vd", read_only },
+        .{ "vc", read_only },
+        .{ "kVy", "Invalid UTF-8 or unsupported control bytes; nothing yanked" },
+    };
+    for (refused) |case| {
+        type_(&editor, &status, &buffer, &viewport, case[0]);
+        try std.testing.expectEqualStrings(case[1], status.text());
+        try std.testing.expectEqual(keys.Mode.normal, editor.mode());
+        try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+    }
+    try std.testing.expectEqualStrings("raw\xff\rline\nok\r\n", buffer.bytes());
+    try std.testing.expectEqual(@as(usize, 0), buffer.position);
+    try expectRegister(&editor, '"', "ok", false);
+}
+
+test "allocation failures in visual yanks, deletes and changes keep everything but the selection" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, visualWorkflow, .{});
+}
+
+fn visualWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, "one\r\ntwo\nthree\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{};
+    // Keys that select, the operator's keys, then the text after.
+    const steps = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "vj", "\"ay", "one\r\ntwo\nthree\n" },
+        .{ "Vj", "d", "three\n" },
+        .{ "ve", "c", "\n" },
+    };
+    for (steps) |step| {
+        const selecting, const operating, const after = step;
+        press(&editor, &status, allocator, &buffer, &viewport, selecting);
+        const before = try allocator.dupe(u8, buffer.bytes());
+        defer allocator.free(before);
+        const cursor = buffer.cursor;
+        const position = buffer.position;
+        var held: [3][]const u8 = undefined;
+        for (&held, "\"0a") |*text, name| text.* = editor.register(name).text;
+        press(&editor, &status, allocator, &buffer, &viewport, operating);
+        if (std.mem.eql(u8, status.text(), "Not enough memory; edit refused")) {
+            try std.testing.expectEqualStrings(before, buffer.bytes());
+            try std.testing.expectEqual(cursor, buffer.cursor);
+            try std.testing.expectEqual(position, buffer.position);
+            for (held, "\"0a") |text, name| {
+                try std.testing.expectEqual(text.ptr, editor.register(name).text.ptr);
+            }
+            try std.testing.expectEqual(keys.Mode.normal, editor.mode());
+            try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
+            return error.OutOfMemory;
+        }
+        try std.testing.expectEqualStrings(after, buffer.bytes());
+    }
+    try expectRegister(&editor, 'a', "one\nt", false);
+    try expectRegister(&editor, '"', "three", false);
+    try std.testing.expectEqual(keys.Mode.insert, editor.mode());
 }
 
 test "Enter keeps the match, records the query, and n and N repeat it with counts and notices" {
