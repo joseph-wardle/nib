@@ -17,17 +17,20 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     b.step("run", "Run Nib").dependOn(&run.step);
 
+    // The benchmarks share one module rooted at `src/`, so they can import any
+    // part of Nib without it re-exporting its neighbours.
+    const nib = b.createModule(.{
+        .root_source_file = b.path("src/nib.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseFast,
+    });
     const buffer_bench = b.addExecutable(.{
         .name = "buffer-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/buffer_bench.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "buffer", .module = b.createModule(.{
-                .root_source_file = b.path("src/buffer.zig"),
-                .target = b.graph.host,
-                .optimize = .ReleaseFast,
-            }) }},
+            .imports = &.{.{ .name = "nib", .module = nib }},
         }),
     });
     b.step("bench-buffer", "Measure ReleaseFast buffer edits, history, and retained bytes").dependOn(&b.addRunArtifact(buffer_bench).step);
@@ -38,11 +41,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/motion_bench.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "view", .module = b.createModule(.{
-                .root_source_file = b.path("src/view.zig"),
-                .target = b.graph.host,
-                .optimize = .ReleaseFast,
-            }) }},
+            .imports = &.{.{ .name = "nib", .module = nib }},
         }),
     });
     const motion_step = b.step(
@@ -57,11 +56,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/finder_bench.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "finder", .module = b.createModule(.{
-                .root_source_file = b.path("src/finder.zig"),
-                .target = b.graph.host,
-                .optimize = .ReleaseFast,
-            }) }},
+            .imports = &.{.{ .name = "nib", .module = nib }},
         }),
     });
     b.step("bench-finder", "Measure ReleaseFast finder discovery, filtering, classification, cancellation and memory").dependOn(&b.addRunArtifact(finder_bench).step);

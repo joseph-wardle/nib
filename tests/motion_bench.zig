@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const view = @import("view");
-const Buffer = view.Buffer;
-const motion = view.motion;
-const search = view.search;
+const nib = @import("nib");
+const Buffer = nib.buffer.Buffer;
+const motion = nib.motion;
+const search = nib.search;
+const view = nib.view;
 
 // Per-key motion work as the event loop does it, without a terminal: resolve
 // the motion, move the cursor, follow it, place the terminal cursor and compute

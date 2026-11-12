@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-// Public for the motion benchmark, which reaches Nib through this module.
-pub const Buffer = @import("buffer.zig").Buffer;
-pub const motion = @import("motion.zig");
-pub const search = @import("search.zig");
+const Buffer = @import("buffer.zig").Buffer;
+const motion = @import("motion.zig");
+const search = @import("search.zig");
 const char = @import("char.zig");
 
 /// Logical rows and display columns; the caller reserves terminal margins/status.

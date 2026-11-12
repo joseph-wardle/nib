@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const Buffer = @import("buffer").Buffer;
+const Buffer = @import("nib").buffer.Buffer;
 
 // Storage-only measurement: no terminal, file I/O, save, or presentation claims.
 // Retain 1,000 insertion deltas in one command, including a newline every 16

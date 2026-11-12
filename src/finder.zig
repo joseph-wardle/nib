@@ -3,8 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const discovery = @import("discovery.zig");
-/// Public for `tests/finder_bench.zig`, which drives the finder's jobs.
-pub const jobs = @import("jobs.zig");
+const jobs = @import("jobs.zig");
 const match = @import("match.zig");
 const Snapshot = @import("preview.zig").Snapshot;
 

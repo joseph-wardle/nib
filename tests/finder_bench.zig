@@ -3,10 +3,10 @@ const std = @import("std");
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const finder_module = @import("finder");
-const Finder = finder_module.Finder;
-const Category = finder_module.Category;
-const jobs = finder_module.jobs;
+const nib = @import("nib");
+const Finder = nib.finder.Finder;
+const Category = nib.finder.Category;
+const jobs = nib.jobs;
 
 // Drives the finder and its jobs as the event loop does, without a terminal,
 // over generated fixtures of about 1k, 10k and 100k paths, with and without
