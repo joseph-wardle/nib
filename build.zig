@@ -85,6 +85,19 @@ pub fn build(b: *std.Build) void {
     check.dependOn(b.getInstallStep());
     check.dependOn(&format.step);
     check.dependOn(test_step);
+    const layout = b.addExecutable(.{
+        .name = "layout-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/layout.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const layout_check = b.addRunArtifact(layout);
+    layout_check.addDirectoryArg(b.path("src"));
+    // The run is cached by its arguments, not by the directory's contents.
+    layout_check.has_side_effects = true;
+    check.dependOn(&layout_check.step);
     // Benchmarks are compiled, not run: a stale benchmark fails the check.
     for ([_]*std.Build.Step.Compile{ buffer_bench, motion_bench, finder_bench }) |bench| {
         check.dependOn(&bench.step);
