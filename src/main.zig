@@ -87,14 +87,10 @@ fn run(
     defer app.editor.deinit(init.gpa);
     defer app.documents.deinit(init.gpa);
     // A named file must open before the screen is taken over.
-    if (how == .file) _ = try app.documents.open(
-        init.gpa,
-        init.io,
-        .cwd(),
-        how.file,
-        &app.editor,
-        &app.status,
-    );
+    if (how == .file) {
+        const opened = try app.documents.open(init.gpa, init.io, .cwd(), how.file);
+        app.announce(opened.activation, false);
+    }
     finder.start(init.gpa, init.io, background, how);
     if (app.documents.current() == null) app.find(.project);
     return app.loop();
@@ -167,8 +163,8 @@ const App = struct {
     }
 
     /// Feeds one read, or an expired Escape deadline, through `decoder`; then
-    /// reloads the active document if it is clean, changed on disk and at a
-    /// safe boundary, and keeps its viewport on the cursor. Any delivered
+    /// reloads the active document if it is clean and changed on disk and the
+    /// editor is idle, and keeps its viewport on the cursor. Any delivered
     /// event sets `redraw`, unless a bracketed paste is still arriving. Returns
     /// the exit code once a command quits.
     fn step(self: *App, decoder: *input.Decoder, bytes: []const u8, expired: bool, now: i64) ?u8 {
@@ -190,15 +186,12 @@ const App = struct {
         }
         if (delivered and decoder.state != .paste) self.redraw = true;
         if (self.documents.current()) |entry| {
-            const reload = entry.disk.automatic(
-                self.gpa,
-                self.io,
-                &entry.document,
-                &entry.goal,
-                &self.editor,
-                &self.status,
-            );
-            self.redraw = reload != null or self.redraw;
+            if (self.editor.idle()) {
+                const document = &entry.document;
+                const reload = entry.disk.automatic(self.gpa, self.io, document, &entry.goal);
+                self.announce(reload, false);
+                self.redraw = reload != null or self.redraw;
+            }
             // The finder never scrolls the document behind it.
             if (!self.finding) entry.viewport.follow(
                 &entry.document.buffer,
@@ -389,6 +382,7 @@ const App = struct {
 
     /// Opens the selection, or activates it when it is already open.
     fn choose(self: *App) void {
+        std.debug.assert(self.editor.idle());
         const choice = self.finder.choice() orelse return;
         switch (choice) {
             .document => |id| {
@@ -398,23 +392,16 @@ const App = struct {
                     if (self.status.len == 0) self.status.set("File no longer open");
                     return;
                 }
-                _ = self.documents.activate(self.gpa, self.io, id, &self.editor, &self.status);
+                self.announce(self.documents.activate(self.gpa, self.io, id), false);
             },
             .path => |path| {
                 // Only discovered listings offer paths, and they need the root.
                 const root = self.finder.root.?.dir;
-                const opened = self.documents.open(
-                    self.gpa,
-                    self.io,
-                    root,
-                    path,
-                    &self.editor,
-                    &self.status,
-                );
-                _ = opened catch |err| {
+                const opened = self.documents.open(self.gpa, self.io, root, path) catch |err| {
                     self.status.print("Cannot open: {s}", .{openFailure(err)});
                     return;
                 };
+                self.announce(opened.activation, false);
             },
         }
         self.finder.leave(self.gpa, self.io, self.background);
@@ -424,6 +411,7 @@ const App = struct {
     /// Runs a file command from either screen. Closing the last document
     /// exits, as does quitting without one; the other commands need one.
     fn fileAction(self: *App, action: command.File) void {
+        std.debug.assert(self.editor.idle());
         switch (action) {
             .find => {
                 self.browsing = false;
@@ -442,14 +430,7 @@ const App = struct {
                 const verb = if (modified) "Discarded edits and closed" else "Closed";
                 notice.print("{s} {f}", .{ verb, name }) catch unreachable;
                 const id = entry.id;
-                const closing = self.documents.close(
-                    self.gpa,
-                    self.io,
-                    id,
-                    discard,
-                    &self.editor,
-                    &self.status,
-                );
+                const closing = self.documents.close(self.gpa, self.io, id, discard);
                 const activation = closing catch {
                     self.status.print("Unsaved changes in {f}; use :q! to discard", .{name});
                     return;
@@ -480,34 +461,14 @@ const App = struct {
                 var text: [Status.capacity]u8 = undefined;
                 var notice: std.Io.Writer = .fixed(&text);
                 notice.print("Written and closed {f}", .{name}) catch unreachable;
-                const closing = self.documents.saveAndClose(
-                    self.gpa,
-                    self.io,
-                    &self.editor,
-                    &self.status,
-                    .{},
-                );
+                const closing = self.documents.saveAndClose(self.gpa, self.io, .{});
                 if (!closing.closed) return self.saved(closing.report, false);
                 self.closed(&notice, closing.activation);
             },
             .reload => {
                 const entry = self.documents.current() orelse return self.refuse();
-                const reload = entry.disk.reload(
-                    self.gpa,
-                    self.io,
-                    &entry.document,
-                    &entry.goal,
-                    &self.editor,
-                    &self.status,
-                    true,
-                );
-                // Named only now: a successful reload replaces the path.
-                const name = self.named(entry);
-                var text: [Status.capacity]u8 = undefined;
-                var notice: std.Io.Writer = .fixed(&text);
-                reloaded(&notice, reload, true, name) catch unreachable;
-                text[0] = std.ascii.toUpper(text[0]);
-                self.status.set(notice.buffered());
+                const reload = entry.disk.reload(self.gpa, self.io, &entry.document, &entry.goal);
+                self.announce(reload, true);
             },
         }
     }
@@ -519,6 +480,19 @@ const App = struct {
 
     fn refuse(self: *App) void {
         self.status.set("No file open");
+    }
+
+    /// Says what reloading the active document did, naming it; nothing when
+    /// no reload was attempted. `explicit` is `:e!`.
+    fn announce(self: *App, reload: ?External.Reload, explicit: bool) void {
+        const attempt = reload orelse return;
+        // Named only now: a successful reload replaces the path.
+        const name = self.named(self.documents.current().?);
+        var text: [Status.capacity]u8 = undefined;
+        var notice: std.Io.Writer = .fixed(&text);
+        reloaded(&notice, attempt, explicit, name) catch unreachable;
+        text[0] = std.ascii.toUpper(text[0]);
+        self.status.set(notice.buffered());
     }
 
     /// Closing the last document exits. Otherwise `notice`, which says what
@@ -1213,26 +1187,12 @@ test "Enter on an Open row whose file has closed relists rather than activating 
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
-    const a = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
-    const b = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "b",
-        &app.editor,
-        &app.status,
-    );
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
     app.find(.open);
     try testing.expectEqual(b, finder.choice().?.document);
     // As when relisting after the close runs out of memory.
-    _ = try app.documents.close(testing.allocator, testing.io, b, false, &app.editor, &app.status);
+    _ = try app.documents.close(testing.allocator, testing.io, b, false);
     app.choose();
     try testing.expectEqual(a, app.documents.active.?);
     try testing.expect(app.finding);
@@ -1321,14 +1281,7 @@ test "the search prompt and its matches are drawn until Escape in normal mode hi
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     // Three content rows and the status row, ten columns wide.
     const matches = "\x1b[1;1H\x1b[7mab\x1b[27m" ++
         "\x1b[2;1H\x1b[7mAB\x1b[27m" ++
@@ -1400,23 +1353,9 @@ test "closing names the closed file and the next file when activating it reloads
     // Without a root, the finder displays absolute paths.
     var a_path: [std.fs.max_path_bytes]u8 = undefined;
     var b_path: [std.fs.max_path_bytes]u8 = undefined;
-    const a = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
     const a_name = copyPath(&a_path, &app, a);
-    const b = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "b",
-        &app.editor,
-        &app.status,
-    );
+    const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
     const b_name = copyPath(&b_path, &app, b);
     // Inactive a changes on disk; closing b activates and reloads it.
     try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "changed\n" });
@@ -1425,14 +1364,7 @@ test "closing names the closed file and the next file when activating it reloads
     try testing.expectEqualStrings("changed\n", app.documents.current().?.document.buffer.bytes());
     const text = "Closed {s}; reloaded external changes to {s}; history cleared";
     try expectNotice(&app, text, .{ b_name, a_name });
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "b",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "b");
     try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "again\n" });
     app.fileAction(.write_quit);
     try testing.expectEqual(a, app.documents.active.?);
@@ -1440,25 +1372,11 @@ test "closing names the closed file and the next file when activating it reloads
     const both = "Written and closed {s}; reloaded external changes to {s}; history cleared";
     try expectNotice(&app, both, .{ b_name, a_name });
     // Nothing reloads: the notice names only the closed file.
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "b",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "b");
     app.fileAction(.{ .quit = false });
     try expectNotice(&app, "Closed {s}", .{b_name});
     // A next file that fails to reload is named the same way.
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "b",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "b");
     try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "unreadable\n" });
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.fchmodat(temp.dir.handle, "a", 0)));
     defer _ = linux.fchmodat(temp.dir.handle, "a", 0o600);
@@ -1491,22 +1409,8 @@ test "closing from the finder names the file whose edits it refuses or discards"
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
     var b_path: [std.fs.max_path_bytes]u8 = undefined;
-    const a = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
-    const b = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "b",
-        &app.editor,
-        &app.status,
-    );
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
     const b_name = copyPath(&b_path, &app, b);
     for ("iZ") |byte| app.editorEvent(.{ .key = byte });
     app.editorEvent(.escape);
@@ -1545,25 +1449,11 @@ test "a close whose relisting runs out of memory still names the closed file" {
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
     var b_path: [std.fs.max_path_bytes]u8 = undefined;
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     var failures: usize = 0;
     var index: usize = 0;
     while (true) : (index += 1) {
-        const b = try app.documents.open(
-            testing.allocator,
-            testing.io,
-            temp.dir,
-            "b",
-            &app.editor,
-            &app.status,
-        );
+        const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
         const b_name = copyPath(&b_path, &app, b);
         // Open starts no job, so only this thread uses the failing allocator.
         app.find(.open);
@@ -1617,14 +1507,7 @@ test "a relisting failure that would overflow the close notice is cut short" {
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     app.find(.open);
     var text: [Status.capacity]u8 = undefined;
     var notice: std.Io.Writer = .fixed(&text);
@@ -1661,14 +1544,7 @@ test "the finder's unsaved mark follows a save made from the finder" {
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     for ("iZ") |byte| app.editorEvent(.{ .key = byte });
     app.editorEvent(.escape);
     app.find(.open);
@@ -1701,14 +1577,7 @@ test "reloading names the file it reloaded or failed to reload" {
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
     var a_path: [std.fs.max_path_bytes]u8 = undefined;
-    const a = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
     const a_name = copyPath(&a_path, &app, a);
     for ("iZ") |byte| app.editorEvent(.{ .key = byte });
     app.editorEvent(.escape);
@@ -1720,6 +1589,39 @@ test "reloading names the file it reloaded or failed to reload" {
     app.fileAction(.reload);
     const failed = "Reload of {s} failed; local state retained";
     try expectNotice(&app, failed, .{a_name});
+}
+
+test "choosing an open file that changed on disk names it as it reloads" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "beta\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    var a_path: [std.fs.max_path_bytes]u8 = undefined;
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    const a_name = copyPath(&a_path, &app, a);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "b");
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "changed\n" });
+    app.find(.open);
+    app.move(1);
+    try testing.expectEqual(a, finder.choice().?.document);
+    app.choose();
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqualStrings("changed\n", app.documents.current().?.document.buffer.bytes());
+    try expectNotice(&app, "Reloaded external changes to {s}; history cleared", .{a_name});
 }
 
 test "the clipboard gets one OSC 52 of the text's base64 however the frame splits it" {
@@ -1783,14 +1685,9 @@ test "a clean file changed on disk reloads only after every pending state ends" 
         };
         defer app.editor.deinit(testing.allocator);
         defer app.documents.deinit(testing.allocator);
-        _ = try app.documents.open(
-            testing.allocator,
-            testing.io,
-            temp.dir,
-            "a",
-            &app.editor,
-            &app.status,
-        );
+        const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
+        var a_path: [std.fs.max_path_bytes]u8 = undefined;
+        const a_name = copyPath(&a_path, &app, a);
         const entry = app.documents.current().?;
         var decoder: input.Decoder = .{};
         try testing.expect(app.step(&decoder, case.keys, false, 0) == null);
@@ -1801,10 +1698,7 @@ test "a clean file changed on disk reloads only after every pending state ends" 
         try testing.expectEqualStrings("alpha\n", entry.document.buffer.bytes());
         try testing.expect(app.step(&decoder, case.close, false, 0) == null);
         try testing.expectEqualStrings("beta\n", entry.document.buffer.bytes());
-        try testing.expectEqualStrings(
-            "Reloaded external changes; history cleared",
-            app.status.text(),
-        );
+        try expectNotice(&app, "Reloaded external changes to {s}; history cleared", .{a_name});
     }
 }
 
@@ -1827,14 +1721,7 @@ test "every read that delivers an event draws, except while a paste is arriving"
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
-    _ = try app.documents.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "a",
-        &app.editor,
-        &app.status,
-    );
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     var decoder: input.Decoder = .{};
     // A count digit, a register prefix and an unknown sequence change nothing
     // visible, yet each read draws.

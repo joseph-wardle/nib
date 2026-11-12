@@ -100,6 +100,14 @@ pub const Editor = struct {
         return self.parser.mode == .insert;
     }
 
+    /// No command, insertion or paste is in progress, so the text may be
+    /// replaced underneath, as a reload or a document switch does.
+    pub fn idle(self: *const Editor) bool {
+        const parser = &self.parser;
+        return parser.mode == .normal and parser.count == null and !parser.pending_g and
+            !parser.naming and parser.register == null and !parser.pasting;
+    }
+
     /// The query whose visible matches are drawn: the prompt's while it holds
     /// a valid query, otherwise the last one while highlighting is on. Borrows
     /// editor storage until the next feed.

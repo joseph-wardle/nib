@@ -4,8 +4,6 @@ const Allocator = std.mem.Allocator;
 const file = @import("file.zig");
 const motion = @import("motion.zig");
 const view = @import("view.zig");
-const Editor = @import("editor.zig").Editor;
-const Status = @import("editor.zig").Status;
 const External = @import("external.zig").External;
 
 /// A document's identity for the whole session; never reused.
@@ -28,6 +26,13 @@ pub const Entry = struct {
     }
 };
 
+/// What `open` did: the document it activated, and how activating it
+/// reloaded it, if it did.
+pub const Opened = struct {
+    id: Id,
+    activation: ?External.Reload,
+};
+
 /// What `saveAndClose` did. `activation` is how activating the next document
 /// reloaded it, if it did.
 pub const Closing = struct {
@@ -38,7 +43,7 @@ pub const Closing = struct {
 
 /// Owns every open document and the active selection. `open` and `close`
 /// move entries, so hold an `Id` across them, never an `*Entry`. Activation
-/// requires the editor at a safe boundary (`External.safe`).
+/// may reload a clean document, so callers activate only between edits.
 pub const Session = struct {
     entries: std.ArrayList(Entry) = .empty,
     active: ?Id = null,
@@ -70,15 +75,12 @@ pub const Session = struct {
         io: std.Io,
         dir: std.Io.Dir,
         path: []const u8,
-        editor: *Editor,
-        status: *Status,
-    ) file.Error!Id {
+    ) file.Error!Opened {
         const spelling = try file.absolutePath(allocator, io, dir, path);
         defer allocator.free(spelling);
         for (self.entries.items) |*entry| {
             if (!std.mem.eql(u8, entry.document.source.path, spelling)) continue;
-            _ = self.activate(allocator, io, entry.id, editor, status);
-            return entry.id;
+            return .{ .id = entry.id, .activation = self.activate(allocator, io, entry.id) };
         }
         try self.entries.ensureUnusedCapacity(allocator, 1);
         var document = try file.Source.load(allocator, io, .cwd(), spelling);
@@ -88,28 +90,18 @@ pub const Session = struct {
         for (self.entries.items) |*entry| {
             if (!try entry.document.source.names(document.source.version)) continue;
             document.deinit(allocator);
-            _ = self.activate(allocator, io, entry.id, editor, status);
-            return entry.id;
+            return .{ .id = entry.id, .activation = self.activate(allocator, io, entry.id) };
         }
         const id: Id = @fromBackingInt(@intCast(self.next_id));
         self.next_id += 1;
         self.entries.appendAssumeCapacity(.{ .id = id, .document = document });
-        _ = self.activate(allocator, io, id, editor, status);
-        return id;
+        return .{ .id = id, .activation = self.activate(allocator, io, id) };
     }
 
     /// Disarms the previous entry's watch, then rearms and revalidates `id`,
     /// reloading it if it is clean and changed on disk, and says how that
     /// reload went. Dirty documents keep their text, base and history.
-    pub fn activate(
-        self: *Session,
-        allocator: Allocator,
-        io: std.Io,
-        id: Id,
-        editor: *Editor,
-        status: *Status,
-    ) ?External.Reload {
-        std.debug.assert(External.safe(editor));
+    pub fn activate(self: *Session, allocator: Allocator, io: std.Io, id: Id) ?External.Reload {
         if (self.active == id) return null;
         if (self.current()) |previous| previous.disk.watch.deinit(allocator);
         const entry = self.get(id).?;
@@ -117,7 +109,7 @@ pub const Session = struct {
         self.clock += 1;
         entry.used = self.clock;
         entry.disk.inspect(allocator, &entry.document, true);
-        return entry.disk.automatic(allocator, io, &entry.document, &entry.goal, editor, status);
+        return entry.disk.automatic(allocator, io, &entry.document, &entry.goal);
     }
 
     /// Refuses unsaved edits unless `discard`. Closing the active document
@@ -129,8 +121,6 @@ pub const Session = struct {
         io: std.Io,
         id: Id,
         discard: bool,
-        editor: *Editor,
-        status: *Status,
     ) error{Unsaved}!?External.Reload {
         const entry = self.get(id).?;
         if (!discard and entry.document.buffer.modified()) return error.Unsaved;
@@ -143,7 +133,7 @@ pub const Session = struct {
             if (recent == null or other.used > recent.?.used) recent = other;
         }
         const next = recent orelse return null;
-        return self.activate(allocator, io, next.id, editor, status);
+        return self.activate(allocator, io, next.id);
     }
 
     /// Saves the active document, then rechecks its disk status.
@@ -160,8 +150,6 @@ pub const Session = struct {
         self: *Session,
         allocator: Allocator,
         io: std.Io,
-        editor: *Editor,
-        status: *Status,
         options: file.Options,
     ) Closing {
         const id = self.active.?;
@@ -169,7 +157,7 @@ pub const Session = struct {
         const confirmed = report.publication == .installed and report.verified and
             report.durable and report.failure == null and !report.cleanup_failure;
         if (!confirmed) return .{ .report = report, .closed = false };
-        const activation = self.close(allocator, io, id, false, editor, status) catch {
+        const activation = self.close(allocator, io, id, false) catch {
             return .{ .report = report, .closed = false };
         };
         return .{ .report = report, .closed = true, .activation = activation };
@@ -191,21 +179,6 @@ fn put(dir: std.Io.Dir, path: []const u8, data: []const u8) !void {
     try dir.writeFile(testing.io, .{ .sub_path = path, .data = data });
 }
 
-fn keys(session: *Session, editor: *Editor, status: *Status, bytes: []const u8) void {
-    const entry = session.current().?;
-    const buffer = &entry.document.buffer;
-    for (bytes) |byte| {
-        _ = editor.feed(
-            testing.allocator,
-            buffer,
-            &entry.goal,
-            &entry.viewport,
-            status,
-            .{ .key = byte },
-        );
-    }
-}
-
 fn expectDisk(dir: std.Io.Dir, path: []const u8, expected: []const u8) !void {
     var storage: [64]u8 = undefined;
     try testing.expectEqualStrings(expected, try dir.readFile(testing.io, path, &storage));
@@ -221,18 +194,18 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
     defer editor.deinit(testing.allocator);
     var session: Session = .{};
     defer session.deinit(testing.allocator);
-    const a = try session.open(testing.allocator, testing.io, temp.dir, "a", &editor, &status);
+    const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
     keys(&session, &editor, &status, "iZ\x03$j");
     session.current().?.viewport = .{ .top = 1, .left = 3 };
     try testing.expectEqual(@as(usize, 23), session.current().?.document.buffer.cursor);
     try testing.expectEqual(@as(motion.Goal, null), session.current().?.goal);
-    const b = try session.open(testing.allocator, testing.io, temp.dir, "b", &editor, &status);
+    const b = (try session.open(testing.allocator, testing.io, temp.dir, "b")).id;
     try testing.expectEqual(b, session.active.?);
     try testing.expect(session.get(a).?.disk.watch.fd < 0);
     keys(&session, &editor, &status, "iB\x03");
     try testing.expect(session.save(testing.allocator, .{}).verified);
     try expectDisk(temp.dir, "b", "Bbee\n");
-    _ = session.activate(testing.allocator, testing.io, a, &editor, &status);
+    _ = session.activate(testing.allocator, testing.io, a);
     const after = session.get(a).?;
     try testing.expect(session.get(b).?.disk.watch.fd < 0 and after.disk.watch.fd >= 0);
     try testing.expectEqualStrings("Za long first line\nshort\n", after.document.buffer.bytes());
@@ -250,6 +223,24 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
     try testing.expectEqual(@as(usize, 1), session.get(b).?.document.buffer.history.items.len);
 }
 
+const Editor = @import("editor.zig").Editor;
+const Status = @import("editor.zig").Status;
+
+fn keys(session: *Session, editor: *Editor, status: *Status, bytes: []const u8) void {
+    const entry = session.current().?;
+    const buffer = &entry.document.buffer;
+    for (bytes) |byte| {
+        _ = editor.feed(
+            testing.allocator,
+            buffer,
+            &entry.goal,
+            &entry.viewport,
+            status,
+            .{ .key = byte },
+        );
+    }
+}
+
 test "close refuses unsaved edits, discards on request and falls back to the most recent" {
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
@@ -261,33 +252,33 @@ test "close refuses unsaved edits, discards on request and falls back to the mos
     defer session.deinit(testing.allocator);
     var ids: [4]Id = undefined;
     for (&ids, [_][]const u8{ "a", "b", "c", "d" }) |*id, name| {
-        id.* = try session.open(testing.allocator, testing.io, temp.dir, name, &editor, &status);
+        id.* = (try session.open(testing.allocator, testing.io, temp.dir, name)).id;
     }
     const a, const b, const c, const d = ids;
     // The fallback is neither the first nor the last entry left.
-    _ = session.activate(testing.allocator, testing.io, b, &editor, &status);
-    _ = session.activate(testing.allocator, testing.io, d, &editor, &status);
+    _ = session.activate(testing.allocator, testing.io, b);
+    _ = session.activate(testing.allocator, testing.io, d);
     keys(&session, &editor, &status, "iZ\x03");
     try testing.expectEqual(@as(usize, 1), session.unsaved());
     try testing.expectError(
         error.Unsaved,
-        session.close(testing.allocator, testing.io, d, false, &editor, &status),
+        session.close(testing.allocator, testing.io, d, false),
     );
     try testing.expectEqual(@as(usize, 4), session.entries.items.len);
     try testing.expectEqualStrings("Zd", session.get(d).?.document.buffer.bytes());
-    _ = try session.close(testing.allocator, testing.io, d, true, &editor, &status);
+    _ = try session.close(testing.allocator, testing.io, d, true);
     try expectDisk(temp.dir, "d", "d");
     try testing.expectEqual(b, session.active.?);
     try testing.expect(session.current().?.disk.watch.fd >= 0);
-    _ = try session.close(testing.allocator, testing.io, a, false, &editor, &status);
+    _ = try session.close(testing.allocator, testing.io, a, false);
     try testing.expectEqual(b, session.active.?);
-    _ = try session.close(testing.allocator, testing.io, b, false, &editor, &status);
+    _ = try session.close(testing.allocator, testing.io, b, false);
     try testing.expectEqual(c, session.active.?);
-    _ = try session.close(testing.allocator, testing.io, c, false, &editor, &status);
+    _ = try session.close(testing.allocator, testing.io, c, false);
     try testing.expectEqual(@as(?Id, null), session.active);
     try testing.expectEqual(@as(?*Entry, null), session.current());
     try testing.expectEqual(@as(usize, 0), session.unsaved());
-    const again = try session.open(testing.allocator, testing.io, temp.dir, "a", &editor, &status);
+    const again = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
     try testing.expect(again != a);
 }
 
@@ -305,24 +296,10 @@ test "spellings, symlinks and hard links reuse one document with its first path"
     defer editor.deinit(testing.allocator);
     var session: Session = .{};
     defer session.deinit(testing.allocator);
-    const first = try session.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "link",
-        &editor,
-        &status,
-    );
+    const first = (try session.open(testing.allocator, testing.io, temp.dir, "link")).id;
     keys(&session, &editor, &status, "iZ\x03");
     for ([_][]const u8{ "link", "./link", "sub/../link", "sub/a", "hard" }) |alias| {
-        const reused = try session.open(
-            testing.allocator,
-            testing.io,
-            temp.dir,
-            alias,
-            &editor,
-            &status,
-        );
+        const reused = (try session.open(testing.allocator, testing.io, temp.dir, alias)).id;
         try testing.expectEqual(first, reused);
     }
     try testing.expectEqual(@as(usize, 1), session.entries.items.len);
@@ -336,21 +313,18 @@ test "a retargeted link never claims its old target, which opens as its own docu
     try put(temp.dir, "A", "alpha");
     try put(temp.dir, "B", "beta");
     try temp.dir.symLink(testing.io, "A", "S", .{});
-    var editor: Editor = .{};
-    var status: Status = .{};
-    defer editor.deinit(testing.allocator);
     var session: Session = .{};
     defer session.deinit(testing.allocator);
-    const s = try session.open(testing.allocator, testing.io, temp.dir, "S", &editor, &status);
+    const s = (try session.open(testing.allocator, testing.io, temp.dir, "S")).id;
     try temp.dir.deleteFile(testing.io, "S");
     try temp.dir.symLink(testing.io, "B", "S", .{});
-    const a = try session.open(testing.allocator, testing.io, temp.dir, "A", &editor, &status);
+    const a = (try session.open(testing.allocator, testing.io, temp.dir, "A")).id;
     try testing.expect(a != s);
     try testing.expectEqualStrings("alpha", session.get(a).?.document.buffer.bytes());
     try testing.expectEqualStrings("alpha", session.get(s).?.document.buffer.bytes());
     try testing.expect(std.mem.endsWith(u8, session.get(a).?.document.source.path, "/A"));
     // S follows its own path when it is next activated, and only because it is clean.
-    _ = session.activate(testing.allocator, testing.io, s, &editor, &status);
+    _ = session.activate(testing.allocator, testing.io, s);
     try testing.expectEqualStrings("beta", session.get(s).?.document.buffer.bytes());
     try testing.expectEqualStrings("alpha", session.get(a).?.document.buffer.bytes());
 }
@@ -364,41 +338,23 @@ test "inactive documents are revalidated on activation: clean ones reload, dirty
     defer editor.deinit(testing.allocator);
     var session: Session = .{};
     defer session.deinit(testing.allocator);
-    const clean = try session.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "clean",
-        &editor,
-        &status,
-    );
-    const dirty = try session.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "dirty",
-        &editor,
-        &status,
-    );
+    const clean = (try session.open(testing.allocator, testing.io, temp.dir, "clean")).id;
+    const dirty = (try session.open(testing.allocator, testing.io, temp.dir, "dirty")).id;
     keys(&session, &editor, &status, "iZ\x03");
-    _ = try session.open(testing.allocator, testing.io, temp.dir, "other", &editor, &status);
+    _ = try session.open(testing.allocator, testing.io, temp.dir, "other");
     // Atomic replacement, as an agent's editor would do it.
     for ([_][]const u8{ "clean", "dirty" }) |name| {
         try put(temp.dir, "replacement", "after");
         try std.Io.Dir.rename(temp.dir, "replacement", temp.dir, name, testing.io);
     }
     try testing.expectEqualStrings("before", session.get(clean).?.document.buffer.bytes());
-    const reload = session.activate(testing.allocator, testing.io, clean, &editor, &status);
-    try testing.expectEqual(External.Reload.reloaded, reload.?);
+    // Reopening by path activates it and says how that reloaded it.
+    const reopened = try session.open(testing.allocator, testing.io, temp.dir, "clean");
+    try testing.expectEqual(clean, reopened.id);
+    try testing.expectEqual(External.Reload.reloaded, reopened.activation.?);
     try testing.expectEqualStrings("after", session.get(clean).?.document.buffer.bytes());
     try testing.expect(!session.get(clean).?.disk.diverged);
-    try testing.expectEqual(null, session.activate(
-        testing.allocator,
-        testing.io,
-        dirty,
-        &editor,
-        &status,
-    ));
+    try testing.expectEqual(null, session.activate(testing.allocator, testing.io, dirty));
     const entry = session.get(dirty).?;
     try testing.expectEqualStrings("Zbefore", entry.document.buffer.bytes());
     try testing.expectEqualStrings("before", entry.document.buffer.base);
@@ -407,7 +363,7 @@ test "inactive documents are revalidated on activation: clean ones reload, dirty
     try testing.expectEqual(error.SourceChanged, session.save(testing.allocator, .{}).failure.?);
     try testing.expectError(
         error.Unsaved,
-        session.close(testing.allocator, testing.io, dirty, false, &editor, &status),
+        session.close(testing.allocator, testing.io, dirty, false),
     );
 }
 
@@ -442,19 +398,13 @@ test "save-and-close closes only on a verified durable save and keeps truthful s
         defer editor.deinit(testing.allocator);
         var session: Session = .{};
         defer session.deinit(testing.allocator);
-        const b = try session.open(testing.allocator, testing.io, temp.dir, "b", &editor, &status);
-        const a = try session.open(testing.allocator, testing.io, temp.dir, "a", &editor, &status);
+        const b = (try session.open(testing.allocator, testing.io, temp.dir, "b")).id;
+        const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
         keys(&session, &editor, &status, "iX\x03");
         var failure: Failure = .{ .stage = case.stage orelse .loaded };
         if (case.external) failure.dir = temp.dir;
         const options: file.Options = .{ .context = &failure, .hook = Failure.hook };
-        const result = session.saveAndClose(
-            testing.allocator,
-            testing.io,
-            &editor,
-            &status,
-            options,
-        );
+        const result = session.saveAndClose(testing.allocator, testing.io, options);
         const succeeded = case.stage == null;
         try testing.expectEqual(succeeded, result.closed);
         if (succeeded) {
@@ -481,26 +431,23 @@ test "allocation failure while opening or switching leaves every document intact
 }
 
 fn allocationWorkflow(allocator: Allocator, dir: std.Io.Dir) !void {
-    var editor: Editor = .{};
-    var status: Status = .{};
-    defer editor.deinit(allocator);
     var session: Session = .{};
     defer session.deinit(allocator);
-    const a = try session.open(allocator, testing.io, dir, "a", &editor, &status);
+    const a = (try session.open(allocator, testing.io, dir, "a")).id;
     try armed(&session);
     try session.current().?.document.buffer.replace(allocator, .{ .start = 0, .end = 0 }, "X", 0);
-    const b = session.open(allocator, testing.io, dir, "b", &editor, &status) catch |err| {
+    const b = (session.open(allocator, testing.io, dir, "b") catch |err| {
         try testing.expectEqual(@as(usize, 1), session.entries.items.len);
         try testing.expectEqual(a, session.active.?);
         try testing.expectEqualStrings("Xa\n", session.current().?.document.buffer.bytes());
         return err;
-    };
+    }).id;
     try armed(&session);
-    _ = session.activate(allocator, testing.io, a, &editor, &status);
+    _ = session.activate(allocator, testing.io, a);
     try armed(&session);
     try testing.expectEqualStrings("Xa\n", session.current().?.document.buffer.bytes());
     try testing.expectEqual(@as(usize, 1), session.unsaved());
-    _ = try session.close(allocator, testing.io, a, true, &editor, &status);
+    _ = try session.close(allocator, testing.io, a, true);
     try testing.expectEqual(b, session.active.?);
     try armed(&session);
 }
@@ -524,32 +471,25 @@ test "an open path that no longer reaches a file never blocks opening another" {
     defer editor.deinit(testing.allocator);
     var session: Session = .{};
     defer session.deinit(testing.allocator);
-    const l = try session.open(testing.allocator, testing.io, temp.dir, "L", &editor, &status);
+    const l = (try session.open(testing.allocator, testing.io, temp.dir, "L")).id;
     keys(&session, &editor, &status, "iZ\x03");
     // L now loops: it names nothing, so A opens as its own document.
     try temp.dir.deleteFile(testing.io, "L");
     try temp.dir.symLink(testing.io, "L", "L", .{});
-    const a = try session.open(testing.allocator, testing.io, temp.dir, "A", &editor, &status);
+    const a = (try session.open(testing.allocator, testing.io, temp.dir, "A")).id;
     try testing.expect(a != l);
     try testing.expectEqualStrings("alpha", session.get(a).?.document.buffer.bytes());
     try testing.expectEqualStrings("Zalpha", session.get(l).?.document.buffer.bytes());
     // Behind a directory it may not search, M names nothing either.
     if (linux.geteuid() == 0) return;
-    const m = try session.open(
-        testing.allocator,
-        testing.io,
-        temp.dir,
-        "locked/M",
-        &editor,
-        &status,
-    );
+    const m = (try session.open(testing.allocator, testing.io, temp.dir, "locked/M")).id;
     const locked = linux.openat(temp.dir.handle, "locked", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(locked));
     const fd: std.posix.fd_t = @intCast(locked);
     defer _ = linux.close(fd);
     defer _ = linux.fchmod(fd, 0o700);
     try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(linux.fchmod(fd, 0)));
-    const b = try session.open(testing.allocator, testing.io, temp.dir, "B", &editor, &status);
+    const b = (try session.open(testing.allocator, testing.io, temp.dir, "B")).id;
     try testing.expect(b != m and b != a and b != l);
     try testing.expectEqual(@as(usize, 4), session.entries.items.len);
 }
