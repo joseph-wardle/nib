@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const char = @import("char.zig");
-const input = @import("input.zig");
-const motion = @import("motion.zig");
-const search = @import("search.zig");
+const char = @import("../text/char.zig");
+const input = @import("../terminal/input.zig");
+const motion = @import("../text/motion.zig");
+const search = @import("../text/search.zig");
 
 pub const Movement = struct { motion: motion.Motion, count: ?usize = null };
 /// A search motion. A typed query borrows parser storage until the next feed.

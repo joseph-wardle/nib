@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const terminal = @import("terminal.zig");
-const Frame = @import("frame.zig").Frame;
-const Line = @import("frame.zig").Line;
-const Buffer = @import("buffer.zig").Buffer;
-const view = @import("view.zig");
-const jobs = @import("jobs.zig");
-const match = @import("match.zig");
-const Finder = @import("finder.zig").Finder;
-const Category = @import("finder.zig").Category;
-const DocumentId = @import("finder.zig").DocumentId;
-const session = @import("session.zig");
+const terminal = @import("../terminal/terminal.zig");
+const Frame = @import("../terminal/frame.zig").Frame;
+const Line = @import("../terminal/frame.zig").Line;
+const Buffer = @import("../text/buffer.zig").Buffer;
+const view = @import("../text/viewport.zig");
+const jobs = @import("../finder/jobs.zig");
+const match = @import("../finder/match.zig");
+const Finder = @import("../finder/finder.zig").Finder;
+const Category = @import("../finder/finder.zig").Category;
+const DocumentId = @import("../finder/finder.zig").DocumentId;
+const session = @import("../files/session.zig");
 const Session = session.Session;
 
 /// Rows top to bottom: categories and root, progress, query, results

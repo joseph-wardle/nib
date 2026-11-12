@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Buffer = @import("buffer.zig").Buffer;
-const EditError = @import("buffer.zig").Error;
-const max_file_bytes = @import("buffer.zig").max_file_bytes;
-const max_lines = @import("buffer.zig").max_lines;
-const Range = @import("buffer.zig").Range;
-const char = @import("char.zig");
-const motion = @import("motion.zig");
-const input = @import("input.zig");
-const command = @import("command.zig");
-const search = @import("search.zig");
-const view = @import("view.zig");
+const Buffer = @import("../text/buffer.zig").Buffer;
+const EditError = @import("../text/buffer.zig").Error;
+const max_file_bytes = @import("../text/buffer.zig").max_file_bytes;
+const max_lines = @import("../text/buffer.zig").max_lines;
+const Range = @import("../text/buffer.zig").Range;
+const char = @import("../text/char.zig");
+const motion = @import("../text/motion.zig");
+const input = @import("../terminal/input.zig");
+const command = @import("keys.zig");
+const search = @import("../text/search.zig");
+const view = @import("../text/viewport.zig");
 
 /// Text an operator took. Breaks are always LF, whatever the source used; a
 /// linewise register's last line is terminated. Owned by the editor.

@@ -3,9 +3,9 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const Buffer = @import("buffer.zig").Buffer;
-const max_file_bytes = @import("buffer.zig").max_file_bytes;
-const max_lines = @import("buffer.zig").max_lines;
+const Buffer = @import("../text/buffer.zig").Buffer;
+const max_file_bytes = @import("../text/buffer.zig").max_file_bytes;
+const max_lines = @import("../text/buffer.zig").max_lines;
 const Watch = @import("watch.zig").Watch;
 
 pub const Error = Allocator.Error || error{

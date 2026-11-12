@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const file = @import("file.zig");
-const motion = @import("motion.zig");
+const motion = @import("../text/motion.zig");
 const Watch = @import("watch.zig").Watch;
 
 /// Disk status is independent of local modified state and transient notices.
@@ -146,9 +146,9 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
     }
 }
 
-const Editor = @import("editor.zig").Editor;
-const Status = @import("editor.zig").Status;
-const view = @import("view.zig");
+const Editor = @import("../edit/editor.zig").Editor;
+const Status = @import("../edit/editor.zig").Status;
+const view = @import("../text/viewport.zig");
 
 test "reload recomputes the vertical goal after clamping to shorter or empty text" {
     const cases = [_]struct { text: []const u8, cursor: usize, up: usize, goal: usize }{

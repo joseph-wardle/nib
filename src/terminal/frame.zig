@@ -101,7 +101,7 @@ test "a row of 3-byte characters at the widest terminal fits the frame unsplit" 
 }
 
 const Allocator = std.mem.Allocator;
-const view = @import("view.zig");
+const view = @import("../text/viewport.zig");
 
 test "status lines show only printable ASCII and stop at the row's end" {
     var row: [8]u8 = undefined;
@@ -114,7 +114,7 @@ test "status lines show only printable ASCII and stop at the row's end" {
 
 test "the clipboard gets one OSC 52 of the text's base64 however the frame splits it" {
     const allocator = std.testing.allocator;
-    const largest = @import("editor.zig").clipboard_limit;
+    const largest = @import("../edit/editor.zig").clipboard_limit;
     const text = try allocator.alloc(u8, largest);
     defer allocator.free(text);
     for (text, 0..) |*byte, index| byte.* = @truncate(index *% 7 +% index / 251);

@@ -2,8 +2,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const file = @import("file.zig");
-const view = @import("view.zig");
-const External = @import("external.zig").External;
+const view = @import("../text/viewport.zig");
+const External = @import("disk.zig").External;
 
 /// A document's identity for the whole session; never reused.
 pub const Id = enum(u64) { _ };
@@ -221,9 +221,9 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
     try testing.expectEqual(@as(usize, 1), session.get(b).?.document.buffer.history.items.len);
 }
 
-const Editor = @import("editor.zig").Editor;
-const Status = @import("editor.zig").Status;
-const motion = @import("motion.zig");
+const Editor = @import("../edit/editor.zig").Editor;
+const Status = @import("../edit/editor.zig").Status;
+const motion = @import("../text/motion.zig");
 
 fn keys(session: *Session, editor: *Editor, status: *Status, bytes: []const u8) void {
     const entry = session.current().?;

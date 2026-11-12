@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const terminal = @import("terminal.zig");
-const Frame = @import("frame.zig").Frame;
-const Line = @import("frame.zig").Line;
-const Buffer = @import("buffer.zig").Buffer;
-const motion = @import("motion.zig");
-const view = @import("view.zig");
-const Editor = @import("editor.zig").Editor;
-const session = @import("session.zig");
+const terminal = @import("../terminal/terminal.zig");
+const Frame = @import("../terminal/frame.zig").Frame;
+const Line = @import("../terminal/frame.zig").Line;
+const Buffer = @import("../text/buffer.zig").Buffer;
+const motion = @import("../text/motion.zig");
+const view = @import("../text/viewport.zig");
+const Editor = @import("../edit/editor.zig").Editor;
+const session = @import("../files/session.zig");
 
 /// Draws the active document's rows, then the status row: the disk status,
 /// then the open `:` line, the search prompt, the operator hint, `status`

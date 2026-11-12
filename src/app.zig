@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const terminal = @import("terminal.zig");
-const file = @import("file.zig");
-const input = @import("input.zig");
+const terminal = @import("terminal/terminal.zig");
+const file = @import("files/file.zig");
+const input = @import("terminal/input.zig");
 const command_line = @import("command_line.zig");
-const discovery = @import("discovery.zig");
-const jobs = @import("jobs.zig");
-const match = @import("match.zig");
-const Editor = @import("editor.zig").Editor;
-const Status = @import("editor.zig").Status;
-const External = @import("external.zig").External;
-const session = @import("session.zig");
+const discovery = @import("finder/discovery.zig");
+const jobs = @import("finder/jobs.zig");
+const match = @import("finder/match.zig");
+const Editor = @import("edit/editor.zig").Editor;
+const Status = @import("edit/editor.zig").Status;
+const External = @import("files/disk.zig").External;
+const session = @import("files/session.zig");
 const Session = session.Session;
-const Finder = @import("finder.zig").Finder;
-const Category = @import("finder.zig").Category;
-const OpenFile = @import("finder.zig").OpenFile;
-const Frame = @import("frame.zig").Frame;
-const setClipboard = @import("frame.zig").setClipboard;
-const editor_view = @import("editor_view.zig");
-const finder_view = @import("finder_view.zig");
+const Finder = @import("finder/finder.zig").Finder;
+const Category = @import("finder/finder.zig").Category;
+const OpenFile = @import("finder/finder.zig").OpenFile;
+const Frame = @import("terminal/frame.zig").Frame;
+const setClipboard = @import("terminal/frame.zig").setClipboard;
+const editor_view = @import("views/editor_view.zig");
+const finder_view = @import("views/finder_view.zig");
 
 /// Runs Nib on `device` until a command quits, opening a named file first.
 pub fn run(

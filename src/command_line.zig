@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
-const input = @import("input.zig");
-const Line = @import("command.zig").Line;
+const input = @import("terminal/input.zig");
+const Line = @import("edit/keys.zig").Line;
 
 /// Commands about files and the session rather than the text.
 pub const File = union(enum) {
@@ -79,7 +79,7 @@ fn parse(line: []const u8) ?File {
 }
 
 const testing = std.testing;
-const max_line = @import("command.zig").max_line;
+const max_line = @import("edit/keys.zig").max_line;
 
 /// Opens the line and types `keys`, returning the last key's outcome.
 fn typed(command_line: *CommandLine, keys: []const u8) ?Outcome {

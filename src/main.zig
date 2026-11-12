@@ -2,10 +2,10 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const terminal = @import("terminal.zig");
-const discovery = @import("discovery.zig");
-const jobs = @import("jobs.zig");
-const Finder = @import("finder.zig").Finder;
+const terminal = @import("terminal/terminal.zig");
+const discovery = @import("finder/discovery.zig");
+const jobs = @import("finder/jobs.zig");
+const Finder = @import("finder/finder.zig").Finder;
 const app = @import("app.zig");
 
 pub fn main(init: std.process.Init) u8 {
@@ -83,24 +83,24 @@ fn diagnostic(message: []const u8) void {
 }
 
 test {
-    _ = @import("external.zig");
-    _ = @import("editor.zig");
-    _ = @import("file.zig");
-    _ = @import("buffer.zig");
-    _ = @import("char.zig");
-    _ = @import("terminal.zig");
-    _ = @import("view.zig");
-    _ = @import("input.zig");
-    _ = @import("command.zig");
+    _ = @import("files/disk.zig");
+    _ = @import("edit/editor.zig");
+    _ = @import("files/file.zig");
+    _ = @import("text/buffer.zig");
+    _ = @import("text/char.zig");
+    _ = @import("terminal/terminal.zig");
+    _ = @import("text/viewport.zig");
+    _ = @import("terminal/input.zig");
+    _ = @import("edit/keys.zig");
     _ = @import("command_line.zig");
-    _ = @import("jobs.zig");
-    _ = @import("session.zig");
-    _ = @import("finder.zig");
-    _ = @import("match.zig");
-    _ = @import("preview.zig");
+    _ = @import("finder/jobs.zig");
+    _ = @import("files/session.zig");
+    _ = @import("finder/finder.zig");
+    _ = @import("finder/match.zig");
+    _ = @import("finder/preview.zig");
     _ = @import("app.zig");
-    _ = @import("frame.zig");
-    _ = @import("editor_view.zig");
-    _ = @import("finder_view.zig");
-    _ = @import("search.zig");
+    _ = @import("terminal/frame.zig");
+    _ = @import("views/editor_view.zig");
+    _ = @import("views/finder_view.zig");
+    _ = @import("text/search.zig");
 }
