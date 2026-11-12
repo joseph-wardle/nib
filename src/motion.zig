@@ -224,13 +224,19 @@ pub fn resolve(buffer: *const Buffer, goal: Goal, motion: Motion, count: ?usize,
     return .{ .destination = destination, .shape = shape, .goal = new_goal };
 }
 
-/// Resolves the same unchanged normal cursor and motion to a byte selection.
-/// Includes CRLF as a unit. Linewise EOF deletion also
-/// consumes the preceding terminator when the final line is unterminated.
-/// Change callers keep a linewise replacement's line break when inserting.
-pub fn operatorRange(buffer: *const Buffer, result: Result, operator: Operator) Selection {
-    var low = @min(buffer.cursor, result.destination);
-    var high = @max(buffer.cursor, result.destination);
+/// The byte selection from `origin`, the normal-mode offset `result` was
+/// resolved from, to its destination. Includes CRLF as a unit. Linewise EOF
+/// deletion also consumes the preceding terminator when the final line is
+/// unterminated. Change callers keep a linewise replacement's line break when
+/// inserting.
+pub fn operatorRange(
+    buffer: *const Buffer,
+    origin: usize,
+    result: Result,
+    operator: Operator,
+) Selection {
+    var low = @min(origin, result.destination);
+    var high = @max(origin, result.destination);
     var shape = result.shape;
     const low_row = buffer.rowAt(low);
     var high_row = buffer.rowAt(high);
@@ -359,7 +365,7 @@ test "operator fixtures resolve independently without moving the cursor or editi
         defer buffer.deinit(std.testing.allocator);
         buffer.cursor = case.cursor;
         const result = resolve(&buffer, 0, case.motion, case.count, case.operator).?;
-        const selection = operatorRange(&buffer, result, case.operator);
+        const selection = operatorRange(&buffer, buffer.cursor, result, case.operator);
         if (case.linewise) |expected| try expect(expected, selection.linewise);
         const range = selection.range;
         try std.testing.expectEqualStrings(case.expected, buffer.bytes()[range.start..range.end]);
@@ -387,21 +393,21 @@ test "word operators respect empty EOF and exclusive column-one conversion" {
     defer buffer.deinit(std.testing.allocator);
     buffer.cursor = 1;
     const result = resolve(&buffer, 1, .word, 2, .delete).?;
-    const selection = operatorRange(&buffer, result, .delete);
+    const selection = operatorRange(&buffer, buffer.cursor, result, .delete);
     try std.testing.expectEqualStrings("bc", buffer.bytes()[selection.range.start..selection.range.end]);
     try std.testing.expect(!selection.linewise);
     buffer.cursor = 5;
     try std.testing.expect(resolve(&buffer, 0, .word, null, .delete) == null);
     buffer.cursor = 0;
     const forward = resolve(&buffer, 0, .word, 2, .delete).?;
-    try std.testing.expect(operatorRange(&buffer, forward, .delete).linewise);
+    try std.testing.expect(operatorRange(&buffer, buffer.cursor, forward, .delete).linewise);
     var leading = try Buffer.fromBytes(std.testing.allocator, "\nabc");
     defer leading.deinit(std.testing.allocator);
     leading.cursor = 2;
     try std.testing.expect(resolve(&leading, 1, .back, 6, .delete) == null);
     leading.cursor = 1;
     const backward = resolve(&leading, 0, .back, 1, .delete).?;
-    const line = operatorRange(&leading, backward, .delete);
+    const line = operatorRange(&leading, leading.cursor, backward, .delete);
     try std.testing.expect(line.linewise);
     try std.testing.expectEqualStrings("\n", leading.bytes()[line.range.start..line.range.end]);
 }
@@ -413,7 +419,8 @@ test "empty documents have one normal position and no characterwise edit range" 
         for ([_]?usize{ null, 1, std.math.maxInt(usize) }) |count| {
             if (resolve(&buffer, 0, command, count, null)) |result| try expect(@as(usize, 0), result.destination);
             if (resolve(&buffer, 0, command, count, .delete)) |result| {
-                try std.testing.expectEqualDeep(Range{ .start = 0, .end = 0 }, operatorRange(&buffer, result, .delete).range);
+                const selection = operatorRange(&buffer, buffer.cursor, result, .delete);
+                try std.testing.expectEqualDeep(Range{ .start = 0, .end = 0 }, selection.range);
             }
         }
     }
@@ -507,7 +514,7 @@ test "word motions and operators step whole characters with Unicode classes" {
     for (cases) |case| {
         buffer.cursor = case.cursor;
         const result = resolve(&buffer, 0, case.motion, null, case.operator).?;
-        const range = operatorRange(&buffer, result, case.operator).range;
+        const range = operatorRange(&buffer, buffer.cursor, result, case.operator).range;
         try std.testing.expectEqualStrings(case.expected, buffer.bytes()[range.start..range.end]);
     }
 }

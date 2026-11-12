@@ -85,6 +85,9 @@ pub const Editor = struct {
     clipboard: bool = false,
 
     const Origin = struct { cursor: usize, viewport: view.Viewport };
+    /// What an operator acts on, and where a yank of it leaves the cursor
+    /// when that is before the cursor.
+    const Target = struct { selection: motion.Selection, destination: usize };
 
     pub fn deinit(self: *Editor, allocator: Allocator) void {
         self.paste.deinit(allocator);
@@ -236,90 +239,19 @@ pub const Editor = struct {
                 }
             },
             .operate => |operation| {
-                const yanking = operation.operator == .yank;
-                if (!yanking and !buffer.editable) return error.UnsupportedText;
+                if (operation.operator != .yank and !buffer.editable)
+                    return error.UnsupportedText;
                 status.clear();
-                const result = switch (operation.movement) {
-                    .motion => |movement| motion.resolve(
-                        buffer,
-                        goal.*,
-                        movement.motion,
-                        movement.count,
-                        operation.operator,
-                    ) orelse return,
-                    .lines => |count| result: {
-                        const row = buffer.rowAt(buffer.cursor);
-                        const last = row + @min(count - 1, buffer.lineCount() - row - 1);
-                        break :result motion.Result{ .destination = buffer.lineStart(last), .shape = .linewise, .goal = 0 };
-                    },
-                    .search => |movement| result: {
-                        const destination = self.find(buffer, status, movement) orelse return;
-                        // Landing on the cursor is a failed motion, like finding nothing.
-                        if (destination == buffer.cursor) return;
-                        break :result motion.Result{
-                            .destination = destination,
-                            .shape = .exclusive,
-                            .goal = null,
-                        };
-                    },
-                };
-                const selection = motion.operatorRange(buffer, result, operation.operator);
-                const name = operation.register;
-                const linewise = selection.linewise;
-                const copied = buffer.bytes()[selection.copied.start..selection.copied.end];
-                // Only a read-only buffer can hold text no register may.
-                if (yanking and !buffer.editable and !char.editable(copied))
-                    return error.UnsupportedYank;
-                // As in Vim, a characterwise delete of nothing writes no register.
-                const removes_nothing = operation.operator == .delete and !linewise and
-                    copied.len == 0;
-                // Prepared before the edit; stored only after it succeeds.
-                const text = if (name == '_' or removes_nothing)
-                    null
-                else
-                    try copy(allocator, copied, linewise);
-                errdefer if (text) |owned| allocator.free(owned);
-                // An unnamed yank also fills "0, which deletes leave alone.
-                const yanked = if (yanking and text != null and name == '"')
-                    try allocator.dupe(u8, text.?)
-                else
-                    null;
-                errdefer if (yanked) |owned| allocator.free(owned);
-                if (yanking) {
-                    // Vim leaves the cursor at the start of what it yanked;
-                    // a line count never moves it.
-                    if (operation.movement != .lines and result.destination < buffer.cursor) {
-                        buffer.cursor = result.destination;
-                        goal.* = motion.screenColumn(buffer, buffer.cursor, false);
-                    }
-                    const owned = text orelse return;
-                    const lines = std.mem.count(u8, owned, "\n") + @intFromBool(!linewise);
-                    // Reported first, so a clipboard refusal replaces it.
-                    if (lines > 2) status.print("{d} lines yanked", .{lines});
-                    self.store(allocator, status, name, owned, linewise);
-                    if (yanked) |zero| self.store(allocator, status, '0', zero, linewise);
-                    return;
-                }
-                var range = selection.range;
-                const changing = operation.operator == .change;
-                // A linewise change keeps the last selected terminator, if
-                // present, so insertion stays on a blank logical line.
-                if (changing and selection.linewise and range.end > range.start and buffer.bytes()[range.end - 1] == '\n') {
-                    range.end -= 1;
-                    if (range.end > range.start and buffer.bytes()[range.end - 1] == '\r') range.end -= 1;
-                }
-                buffer.beginGroup();
-                try buffer.replace(allocator, range, "", range.start);
-                if (text) |owned| self.store(allocator, status, name, owned, linewise);
-                if (changing) {
-                    self.parser.enterInsert();
-                } else {
-                    buffer.cursor = motion.normal(buffer, buffer.cursor);
-                    // Linewise deletion lands at the first nonblank character.
-                    if (selection.linewise) buffer.cursor = motion.resolve(buffer, 0, .first, null, null).?.destination;
-                    buffer.endCommand();
-                }
-                goal.* = motion.screenColumn(buffer, buffer.cursor, changing);
+                const target = self.select(buffer, goal.*, status, operation) orelse return;
+                try self.operate(
+                    allocator,
+                    buffer,
+                    goal,
+                    status,
+                    operation.operator,
+                    operation.register,
+                    target,
+                );
             },
             .put => |put| {
                 if (!buffer.editable) return error.UnsupportedText;
@@ -448,6 +380,121 @@ pub const Editor = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// Resolves an operation's movement from the cursor to what its operator
+    /// acts on; null is a failed movement. Moves nothing and changes no text.
+    fn select(
+        self: *Editor,
+        buffer: *const Buffer,
+        goal: motion.Goal,
+        status: *Status,
+        operation: command.Operation,
+    ) ?Target {
+        const result = switch (operation.movement) {
+            .motion => |movement| motion.resolve(
+                buffer,
+                goal,
+                movement.motion,
+                movement.count,
+                operation.operator,
+            ) orelse return null,
+            .lines => |count| result: {
+                const row = buffer.rowAt(buffer.cursor);
+                const last = row + @min(count - 1, buffer.lineCount() - row - 1);
+                break :result motion.Result{
+                    .destination = buffer.lineStart(last),
+                    .shape = .linewise,
+                    .goal = 0,
+                };
+            },
+            .search => |movement| result: {
+                const destination = self.find(buffer, status, movement) orelse return null;
+                // Landing on the cursor is a failed motion, like finding nothing.
+                if (destination == buffer.cursor) return null;
+                break :result motion.Result{
+                    .destination = destination,
+                    .shape = .exclusive,
+                    .goal = null,
+                };
+            },
+        };
+        return .{
+            .selection = motion.operatorRange(buffer, buffer.cursor, result, operation.operator),
+            // A line count never moves a yank's cursor.
+            .destination = if (operation.movement == .lines) buffer.cursor else result.destination,
+        };
+    }
+
+    /// Applies `operator` to `target`, filling register `name`. Resolves no
+    /// motion: the target was taken from the cursor before any change.
+    fn operate(
+        self: *Editor,
+        allocator: Allocator,
+        buffer: *Buffer,
+        goal: *motion.Goal,
+        status: *Status,
+        operator: motion.Operator,
+        name: u8,
+        target: Target,
+    ) Error!void {
+        const yanking = operator == .yank;
+        const selection = target.selection;
+        const linewise = selection.linewise;
+        const copied = buffer.bytes()[selection.copied.start..selection.copied.end];
+        // Only a read-only buffer can hold text no register may.
+        if (yanking and !buffer.editable and !char.editable(copied))
+            return error.UnsupportedYank;
+        // As in Vim, a characterwise delete of nothing writes no register.
+        const removes_nothing = operator == .delete and !linewise and copied.len == 0;
+        // Prepared before the edit; stored only after it succeeds.
+        const text = if (name == '_' or removes_nothing)
+            null
+        else
+            try copy(allocator, copied, linewise);
+        errdefer if (text) |owned| allocator.free(owned);
+        // An unnamed yank also fills "0, which deletes leave alone.
+        const yanked = if (yanking and text != null and name == '"')
+            try allocator.dupe(u8, text.?)
+        else
+            null;
+        errdefer if (yanked) |owned| allocator.free(owned);
+        if (yanking) {
+            // Vim leaves the cursor at the start of what it yanked.
+            if (target.destination < buffer.cursor) {
+                buffer.cursor = target.destination;
+                goal.* = motion.screenColumn(buffer, buffer.cursor, false);
+            }
+            const owned = text orelse return;
+            const lines = std.mem.count(u8, owned, "\n") + @intFromBool(!linewise);
+            // Reported first, so a clipboard refusal replaces it.
+            if (lines > 2) status.print("{d} lines yanked", .{lines});
+            self.store(allocator, status, name, owned, linewise);
+            if (yanked) |zero| self.store(allocator, status, '0', zero, linewise);
+            return;
+        }
+        var range = selection.range;
+        const changing = operator == .change;
+        // A linewise change keeps the last selected terminator, if
+        // present, so insertion stays on a blank logical line.
+        const bytes = buffer.bytes();
+        if (changing and linewise and range.end > range.start and bytes[range.end - 1] == '\n') {
+            range.end -= 1;
+            if (range.end > range.start and bytes[range.end - 1] == '\r') range.end -= 1;
+        }
+        buffer.beginGroup();
+        try buffer.replace(allocator, range, "", range.start);
+        if (text) |owned| self.store(allocator, status, name, owned, linewise);
+        if (changing) {
+            self.parser.enterInsert();
+        } else {
+            buffer.cursor = motion.normal(buffer, buffer.cursor);
+            // Linewise deletion lands at the first nonblank character.
+            if (linewise)
+                buffer.cursor = motion.resolve(buffer, 0, .first, null, null).?.destination;
+            buffer.endCommand();
+        }
+        goal.* = motion.screenColumn(buffer, buffer.cursor, changing);
     }
 
     /// The match a search motion reaches from the cursor, recording a typed
