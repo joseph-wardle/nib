@@ -10,7 +10,7 @@ const jobs = @import("finder/jobs.zig");
 const match = @import("finder/match.zig");
 const Editor = @import("edit/editor.zig").Editor;
 const Status = @import("edit/editor.zig").Status;
-const External = @import("files/disk.zig").External;
+const Disk = @import("files/disk.zig").Disk;
 const session = @import("files/session.zig");
 const Session = session.Session;
 const Finder = @import("finder/finder.zig").Finder;
@@ -451,7 +451,7 @@ const App = struct {
 
     /// Says what reloading the active document did, naming it; nothing when
     /// no reload was attempted. `explicit` is `:e!`.
-    fn announce(self: *App, reload: ?External.Reload, explicit: bool) void {
+    fn announce(self: *App, reload: ?Disk.Reload, explicit: bool) void {
         const attempt = reload orelse return;
         // Named only now: a successful reload replaces the path.
         const name = self.named(self.documents.current().?);
@@ -465,7 +465,7 @@ const App = struct {
     /// Closing the last document exits. Otherwise `notice`, which says what
     /// was closed, goes on to name the next document if activating it
     /// reloaded it, and a focused finder lists what remains.
-    fn closed(self: *App, notice: *std.Io.Writer, activation: ?External.Reload) void {
+    fn closed(self: *App, notice: *std.Io.Writer, activation: ?Disk.Reload) void {
         const next = self.documents.current() orelse {
             self.exit = 0;
             return;
@@ -574,7 +574,7 @@ const NoticePath = struct {
 /// Writes what reloading `name` did, as a lowercase clause; `explicit` is `:e!`.
 fn reloaded(
     writer: *std.Io.Writer,
-    reload: External.Reload,
+    reload: Disk.Reload,
     explicit: bool,
     name: NoticePath,
 ) std.Io.Writer.Error!void {

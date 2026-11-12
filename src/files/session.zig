@@ -3,7 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const file = @import("file.zig");
 const view = @import("../text/viewport.zig");
-const External = @import("disk.zig").External;
+const Disk = @import("disk.zig").Disk;
 
 /// A document's identity for the whole session; never reused.
 pub const Id = enum(u64) { _ };
@@ -14,7 +14,7 @@ pub const Entry = struct {
     document: file.Document,
     viewport: view.Viewport = .{},
     /// Last known disk status. Only the active entry's watch is armed.
-    disk: External = .{},
+    disk: Disk = .{},
     /// Activation order; larger is more recent.
     used: u64 = 0,
 
@@ -28,7 +28,7 @@ pub const Entry = struct {
 /// reloaded it, if it did.
 pub const Opened = struct {
     id: Id,
-    activation: ?External.Reload,
+    activation: ?Disk.Reload,
 };
 
 /// What `saveAndClose` did. `activation` is how activating the next document
@@ -36,7 +36,7 @@ pub const Opened = struct {
 pub const Closing = struct {
     report: file.Report,
     closed: bool,
-    activation: ?External.Reload = null,
+    activation: ?Disk.Reload = null,
 };
 
 /// Owns every open document and the active selection. `open` and `close`
@@ -99,7 +99,7 @@ pub const Session = struct {
     /// Disarms the previous entry's watch, then rearms and revalidates `id`,
     /// reloading it if it is clean and changed on disk, and says how that
     /// reload went. Dirty documents keep their text, base and history.
-    pub fn activate(self: *Session, allocator: Allocator, io: std.Io, id: Id) ?External.Reload {
+    pub fn activate(self: *Session, allocator: Allocator, io: std.Io, id: Id) ?Disk.Reload {
         if (self.active == id) return null;
         if (self.current()) |previous| previous.disk.watch.deinit(allocator);
         const entry = self.get(id).?;
@@ -119,7 +119,7 @@ pub const Session = struct {
         io: std.Io,
         id: Id,
         discard: bool,
-    ) error{Unsaved}!?External.Reload {
+    ) error{Unsaved}!?Disk.Reload {
         const entry = self.get(id).?;
         if (!discard and entry.document.buffer.modified()) return error.Unsaved;
         entry.deinit(allocator);
@@ -349,7 +349,7 @@ test "inactive documents are revalidated on activation: clean ones reload, dirty
     // Reopening by path activates it and says how that reloaded it.
     const reopened = try session.open(testing.allocator, testing.io, temp.dir, "clean");
     try testing.expectEqual(clean, reopened.id);
-    try testing.expectEqual(External.Reload.reloaded, reopened.activation.?);
+    try testing.expectEqual(Disk.Reload.reloaded, reopened.activation.?);
     try testing.expectEqualStrings("after", session.get(clean).?.document.buffer.bytes());
     try testing.expect(!session.get(clean).?.disk.diverged);
     try testing.expectEqual(null, session.activate(testing.allocator, testing.io, dirty));

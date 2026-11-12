@@ -6,7 +6,7 @@ const Watch = @import("watch.zig").Watch;
 
 /// Disk status is independent of local modified state and transient notices.
 /// Owns notifications; replacement documents are prepared before any state swap.
-pub const External = struct {
+pub const Disk = struct {
     watch: Watch = .{},
     diverged: bool = false,
     missing: bool = false,
@@ -15,11 +15,11 @@ pub const External = struct {
     /// What a reload attempt did, for the caller to word.
     pub const Reload = enum { reloaded, failed, out_of_memory };
 
-    pub fn deinit(self: *External, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Disk, allocator: std.mem.Allocator) void {
         self.watch.deinit(allocator);
     }
 
-    pub fn inspect(self: *External, allocator: std.mem.Allocator, document: *const file.Document, rearm: bool) void {
+    pub fn inspect(self: *Disk, allocator: std.mem.Allocator, document: *const file.Document, rearm: bool) void {
         if (rearm) document.source.monitor(allocator, &self.watch);
         document.source.validate(document.buffer.base) catch |err| {
             self.diverged = true;
@@ -36,7 +36,7 @@ pub const External = struct {
     /// attempted. The caller calls it only between edits: a reload replaces
     /// the text under any edit in progress.
     pub fn automatic(
-        self: *External,
+        self: *Disk,
         allocator: std.mem.Allocator,
         io: std.Io,
         document: *file.Document,
@@ -51,7 +51,7 @@ pub const External = struct {
     /// Replaces the document only once its replacement has loaded, then resets
     /// the goal column for the clamped cursor.
     pub fn reload(
-        self: *External,
+        self: *Disk,
         allocator: std.mem.Allocator,
         io: std.Io,
         document: *file.Document,
@@ -68,7 +68,7 @@ pub const External = struct {
         return .reloaded;
     }
 
-    pub fn status(self: *const External) []const u8 {
+    pub fn status(self: *const Disk) []const u8 {
         if (self.missing) return if (self.watch.degraded) "SOURCE MISSING | MONITORING DEGRADED | " else "SOURCE MISSING | ";
         if (self.diverged) return if (self.watch.degraded) "DISK CONFLICT | MONITORING DEGRADED | " else "DISK CONFLICT | ";
         if (self.watch.degraded) return "MONITORING DEGRADED | ";
@@ -80,10 +80,10 @@ const testing = std.testing;
 const linux = std.os.linux;
 const posix = std.posix;
 
-fn changed(external: *External) !void {
-    var fds = [_]linux.pollfd{.{ .fd = external.watch.fd, .events = linux.POLL.IN, .revents = 0 }};
+fn changed(disk: *Disk) !void {
+    var fds = [_]linux.pollfd{.{ .fd = disk.watch.fd, .events = linux.POLL.IN, .revents = 0 }};
     try testing.expect(linux.poll(&fds, 1, 1000) > 0);
-    try testing.expect(external.watch.drain());
+    try testing.expect(disk.watch.drain());
 }
 
 test "explicit and automatic reload keep vertical movement aligned with a normal tab cursor" {
@@ -97,8 +97,8 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         var status: Status = .{};
         var viewport: view.Viewport = .{};
         defer editor.deinit(testing.allocator);
-        var external: External = .{};
-        defer external.deinit(testing.allocator);
+        var disk: Disk = .{};
+        defer disk.deinit(testing.allocator);
         for ("lh") |byte| _ = editor.feed(
             testing.allocator,
             &document.buffer,
@@ -109,7 +109,7 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
         try testing.expectEqual(@as(usize, 0), document.buffer.cursor);
         try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "\tother\n0123456789\n" });
         if (explicit) {
-            const outcome = external.reload(
+            const outcome = disk.reload(
                 testing.allocator,
                 testing.io,
                 &document,
@@ -117,8 +117,8 @@ test "explicit and automatic reload keep vertical movement aligned with a normal
             );
             try testing.expect(outcome == .reloaded);
         } else {
-            external.inspect(testing.allocator, &document, true);
-            const outcome = external.automatic(
+            disk.inspect(testing.allocator, &document, true);
+            const outcome = disk.automatic(
                 testing.allocator,
                 testing.io,
                 &document,
@@ -167,8 +167,8 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             var status: Status = .{};
             var viewport: view.Viewport = .{};
             defer editor.deinit(testing.allocator);
-            var external: External = .{};
-            defer external.deinit(testing.allocator);
+            var disk: Disk = .{};
+            defer disk.deinit(testing.allocator);
             _ = editor.feed(
                 testing.allocator,
                 &document.buffer,
@@ -178,7 +178,7 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
             );
             try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
             if (explicit) {
-                const outcome = external.reload(
+                const outcome = disk.reload(
                     testing.allocator,
                     testing.io,
                     &document,
@@ -186,8 +186,8 @@ test "reload recomputes the vertical goal after clamping to shorter or empty tex
                 );
                 try testing.expect(outcome == .reloaded);
             } else {
-                external.inspect(testing.allocator, &document, true);
-                const outcome = external.automatic(
+                disk.inspect(testing.allocator, &document, true);
+                const outcome = disk.automatic(
                     testing.allocator,
                     testing.io,
                     &document,
@@ -233,16 +233,16 @@ test "reload snaps a cursor inside shifted multi-byte text or a CRLF to a charac
         var status: Status = .{};
         var viewport: view.Viewport = .{};
         defer editor.deinit(testing.allocator);
-        var external: External = .{};
-        defer external.deinit(testing.allocator);
+        var disk: Disk = .{};
+        defer disk.deinit(testing.allocator);
         for ("llll") |byte| {
             const buffer = &document.buffer;
             _ = editor.feed(testing.allocator, buffer, &viewport, &status, .{ .key = byte });
         }
         try testing.expectEqual(@as(usize, 4), document.buffer.cursor);
         try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = case.text });
-        external.inspect(testing.allocator, &document, true);
-        const outcome = external.automatic(
+        disk.inspect(testing.allocator, &document, true);
+        const outcome = disk.automatic(
             testing.allocator,
             testing.io,
             &document,
@@ -264,16 +264,16 @@ test "notifications reload clean documents and keep dirty history until explicit
     var status: Status = .{};
     var viewport: view.Viewport = .{};
     defer editor.deinit(testing.allocator);
-    var external: External = .{};
-    defer external.deinit(testing.allocator);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(!external.watch.degraded);
+    var disk: Disk = .{};
+    defer disk.deinit(testing.allocator);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(!disk.watch.degraded);
     document.buffer.cursor = 10;
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "new" });
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.diverged);
-    try testing.expect(external.automatic(
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(disk.diverged);
+    try testing.expect(disk.automatic(
         testing.allocator,
         testing.io,
         &document,
@@ -282,7 +282,7 @@ test "notifications reload clean documents and keep dirty history until explicit
     try testing.expectEqualStrings("new", document.buffer.bytes());
     try testing.expectEqual(@as(usize, 2), document.buffer.cursor);
     try testing.expectEqual(@as(usize, 0), document.buffer.history.items.len);
-    try testing.expect(!external.diverged);
+    try testing.expect(!disk.diverged);
     _ = editor.feed(
         testing.allocator,
         &document.buffer,
@@ -298,16 +298,16 @@ test "notifications reload clean documents and keep dirty history until explicit
         .{ .key = 'X' },
     );
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "disk" });
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.automatic(
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(disk.automatic(
         testing.allocator,
         testing.io,
         &document,
         &viewport.goal,
     ) == null);
     _ = editor.feed(testing.allocator, &document.buffer, &viewport, &status, .{ .key = 3 });
-    try testing.expect(external.automatic(
+    try testing.expect(disk.automatic(
         testing.allocator,
         testing.io,
         &document,
@@ -319,15 +319,15 @@ test "notifications reload clean documents and keep dirty history until explicit
     try testing.expectEqual(error.SourceChanged, document.source.save(testing.allocator, &document.buffer, .{}).failure.?);
     // Failed explicit reload, including allocation failure, retains the document.
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const exhausted = external.reload(failing.allocator(), testing.io, &document, &viewport.goal);
+    const exhausted = disk.reload(failing.allocator(), testing.io, &document, &viewport.goal);
     try testing.expect(exhausted == .out_of_memory);
     try testing.expectEqualStrings("neXw", document.buffer.bytes());
     try testing.expectEqual(@as(usize, 1), document.buffer.position);
     try temp.dir.deleteFile(testing.io, "source");
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.missing);
-    try testing.expect(external.reload(
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(disk.missing);
+    try testing.expect(disk.reload(
         testing.allocator,
         testing.io,
         &document,
@@ -336,7 +336,7 @@ test "notifications reload clean documents and keep dirty history until explicit
     try testing.expectEqualStrings("new", document.buffer.base);
     try testing.expect(try document.buffer.undo(testing.allocator));
     try testing.expectEqualStrings("new", document.buffer.bytes());
-    try testing.expect(external.automatic(
+    try testing.expect(disk.automatic(
         testing.allocator,
         testing.io,
         &document,
@@ -344,14 +344,14 @@ test "notifications reload clean documents and keep dirty history until explicit
     ) == null);
     try testing.expect(try document.buffer.redo(testing.allocator));
     try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "recreated" });
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    const outcome = external.reload(testing.allocator, testing.io, &document, &viewport.goal);
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    const outcome = disk.reload(testing.allocator, testing.io, &document, &viewport.goal);
     try testing.expect(outcome == .reloaded);
     try testing.expectEqualStrings("recreated", document.buffer.bytes());
     try testing.expect(!document.buffer.modified());
     try testing.expectEqual(@as(usize, 0), document.buffer.history.items.len);
-    try testing.expectEqualStrings("", external.status());
+    try testing.expectEqualStrings("", disk.status());
     // An ordinary save's queued directory/inode events compare equal to its new base.
     _ = editor.feed(
         testing.allocator,
@@ -370,9 +370,9 @@ test "notifications reload clean documents and keep dirty history until explicit
     _ = editor.feed(testing.allocator, &document.buffer, &viewport, &status, .{ .key = 3 });
     const report = document.source.save(testing.allocator, &document.buffer, .{});
     try testing.expect(report.verified);
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(!external.diverged);
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(!disk.diverged);
     try testing.expectEqual(@as(usize, 1), document.buffer.history.items.len);
 }
 
@@ -387,47 +387,47 @@ test "watch paths cover intermediate symlinks, directory replacement, inode alia
     try temp.dir.symLink(testing.io, "middle/source", "outer", .{});
     var document = try file.Source.load(testing.allocator, testing.io, temp.dir, "outer");
     defer document.deinit(testing.allocator);
-    var external: External = .{};
+    var disk: Disk = .{};
     var goal: motion.Goal = 0;
-    defer external.deinit(testing.allocator);
-    external.inspect(testing.allocator, &document, true);
+    defer disk.deinit(testing.allocator);
+    disk.inspect(testing.allocator, &document, true);
     // Alias writes produce target-inode notifications, even outside watched parents.
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.linkat(temp.dir.handle, "a/source", temp.dir.handle, "alias", 0)));
-    _ = external.watch.drain();
+    _ = disk.watch.drain();
     try temp.dir.writeFile(testing.io, .{ .sub_path = "alias", .data = "after!" });
     const fd: posix.fd_t = @intCast(linux.openat(temp.dir.handle, "alias", .{ .ACCMODE = .RDWR }, 0));
     defer _ = linux.close(fd);
     const times = [2]linux.timespec{ .{ .sec = document.source.version.atime.sec, .nsec = document.source.version.atime.nsec }, .{ .sec = document.source.version.mtime.sec, .nsec = document.source.version.mtime.nsec } };
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.futimens(fd, &times)));
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) != null);
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(disk.automatic(testing.allocator, testing.io, &document, &goal) != null);
     try testing.expectEqualStrings("after!", document.buffer.bytes());
     try temp.dir.deleteFile(testing.io, "middle");
     try temp.dir.symLink(testing.io, "b", "middle", .{});
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) != null);
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(disk.automatic(testing.allocator, testing.io, &document, &goal) != null);
     try testing.expectEqualStrings("second", document.buffer.bytes());
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.renameat(temp.dir.handle, "b", temp.dir.handle, "moved")));
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(external.missing);
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) == null);
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(disk.missing);
+    try testing.expect(disk.automatic(testing.allocator, testing.io, &document, &goal) == null);
     try testing.expectEqualStrings("second", document.buffer.bytes());
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(linux.renameat(temp.dir.handle, "moved", temp.dir.handle, "b")));
-    try changed(&external);
-    external.inspect(testing.allocator, &document, true);
-    try testing.expect(!external.diverged);
+    try changed(&disk);
+    disk.inspect(testing.allocator, &document, true);
+    try testing.expect(!disk.diverged);
     // Failed watch bookkeeping is visible; independent source checks still work.
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    external.inspect(failing.allocator(), &document, true);
-    try testing.expect(external.watch.degraded);
-    try testing.expectEqualStrings("MONITORING DEGRADED | ", external.status());
+    disk.inspect(failing.allocator(), &document, true);
+    try testing.expect(disk.watch.degraded);
+    try testing.expectEqualStrings("MONITORING DEGRADED | ", disk.status());
     try temp.dir.writeFile(testing.io, .{ .sub_path = "b/source", .data = "latest" });
-    external.inspect(testing.allocator, &document, false);
-    try testing.expect(external.diverged);
-    try testing.expect(external.automatic(testing.allocator, testing.io, &document, &goal) != null);
+    disk.inspect(testing.allocator, &document, false);
+    try testing.expect(disk.diverged);
+    try testing.expect(disk.automatic(testing.allocator, testing.io, &document, &goal) != null);
     try testing.expectEqualStrings("latest", document.buffer.bytes());
-    try testing.expect(!external.watch.degraded);
+    try testing.expect(!disk.watch.degraded);
 }
