@@ -6,7 +6,6 @@ const discovery = @import("discovery.zig");
 /// Public for `tests/finder_bench.zig`, which drives the finder's jobs.
 pub const jobs = @import("jobs.zig");
 const match = @import("match.zig");
-const session = @import("session.zig");
 const Snapshot = @import("preview.zig").Snapshot;
 
 pub const Category = enum {
@@ -27,9 +26,13 @@ pub const Category = enum {
     }
 };
 
+/// The caller's handle for an open document. The finder only stores it and
+/// hands it back.
+pub const DocumentId = enum(u64) { _ };
+
 /// An open document as the caller describes it.
 pub const OpenFile = struct {
-    id: session.Id,
+    id: DocumentId,
     /// Absolute spelling, as `Source` records it. Borrowed for the call.
     path: []const u8,
     /// Activation order; larger is more recent.
@@ -40,7 +43,7 @@ pub const Choice = union(enum) {
     /// Raw bytes relative to the root directory. Borrowed until the finder
     /// next changes.
     path: []const u8,
-    document: session.Id,
+    document: DocumentId,
 };
 
 /// How one result is shown. Dimming never hides a match or changes ranking.
@@ -48,9 +51,9 @@ pub const Row = struct {
     /// Borrowed until the finder next changes.
     label: []const u8,
     ignore: match.Ignore,
-    /// The open document listed under this label, whose state the session
+    /// The open document listed under this label, whose state the caller
     /// holds; null when the file is not open.
-    document: ?session.Id,
+    document: ?DocumentId,
 };
 
 /// What one category last discovered.
@@ -85,15 +88,15 @@ pub const List = struct {
     }
 };
 
-pub const Document = struct { id: session.Id, used: u64 };
+pub const Document = struct { id: DocumentId, used: u64 };
 
 /// What the preview pane shows for the selection.
 pub const Preview = union(enum) {
     /// Nothing is selected.
     none,
     /// An open document: draw its current text, unsaved edits included,
-    /// from the session. Nothing is read or copied.
-    document: session.Id,
+    /// from the caller's copy. Nothing is read or copied.
+    document: DocumentId,
     /// The file is being read.
     loading,
     /// A bounded prefix of the file on disk. Borrowed until the finder next
@@ -628,7 +631,7 @@ fn settle(finder: *Finder, background: *jobs.Jobs) !void {
     }
 }
 
-fn id(value: u64) session.Id {
+fn id(value: u64) DocumentId {
     return @fromBackingInt(@intCast(value));
 }
 
