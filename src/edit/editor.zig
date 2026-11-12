@@ -131,9 +131,11 @@ pub const Editor = struct {
     }
 
     /// The query whose visible matches are drawn: the prompt's while it holds
-    /// a valid query, otherwise the last one while highlighting is on. Borrows
-    /// editor storage until the next feed.
+    /// a valid query, otherwise the last one while highlighting is on. None
+    /// while a selection is on, so the selection's end shows where a search
+    /// landed. Borrows editor storage until the next feed.
     pub fn highlighted(self: *const Editor) ?[]const u8 {
+        if (self.parser.visual != null) return null;
         if (self.searchPrompt()) |prompt| {
             if (prompt.text.len == 0 or self.parser.line.invalid) return null;
             return prompt.text;
@@ -1184,7 +1186,7 @@ test "a selection runs from where v or V was typed to the cursor, and o swaps it
     try std.testing.expect(!buffer.modified());
 }
 
-test "searching in visual mode moves the selection's end and keeps the selection" {
+test "searching in visual mode moves the selection's end and hides matches until it ends" {
     const allocator = std.testing.allocator;
     var buffer = try Buffer.fromBytes(allocator, "one two\nthree two\n");
     defer buffer.deinit(allocator);
@@ -1200,12 +1202,14 @@ test "searching in visual mode moves the selection's end and keeps the selection
     type_(&editor, &status, &buffer, &viewport, "/zz\r");
     try std.testing.expectEqualStrings("Not found: zz", status.text());
     try expectSelected(&editor, &buffer, 1, 15, false);
+    // No matches are drawn while selecting, not even the prompt's.
     type_(&editor, &status, &buffer, &viewport, "?one");
     try expectSelected(&editor, &buffer, 0, 2, false);
+    try std.testing.expectEqual(@as(?[]const u8, null), editor.highlighted());
     escape(&editor, &status, &buffer, &viewport);
     try expectSelected(&editor, &buffer, 1, 15, false);
-    // Escape that ends the selection keeps the matches; the next hides them.
-    try std.testing.expectEqualStrings("zz", editor.highlighted().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), editor.highlighted());
+    // Escape that ends the selection shows the matches; the next hides them.
     escape(&editor, &status, &buffer, &viewport);
     try std.testing.expectEqual(@as(?motion.Selection, null), editor.selection(&buffer));
     try std.testing.expectEqualStrings("zz", editor.highlighted().?);

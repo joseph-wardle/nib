@@ -62,6 +62,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "editingWorkflow", editingWorkflow },
         .{ "utf8Editing", utf8Editing },
         .{ "searchWorkflow", searchWorkflow },
+        .{ "visualWorkflow", visualWorkflow },
         .{ "pasteLifecycle", pasteLifecycle },
         .{ "clipboardWorkflow", clipboardWorkflow },
         .{ "clipboardSuspend", clipboardSuspend },
@@ -921,6 +922,37 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try expectFile(path, text[0..used]);
+}
+
+fn visualWorkflow(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-visual-{d}", .{pid}, 0);
+    defer _ = linux.unlink(path);
+    try putFile(path, "alpha beta\ngamma\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.until("alpha beta");
+    try process.ready();
+    // The selection is redrawn in reverse video, with the cursor at its end.
+    try editingKeys(&process, "wv");
+    try process.send("e");
+    try process.until("VISUAL | 1:10 | ");
+    try process.until("\x1b[1;7H\x1b[7mbeta\x1b[27m\x1b[1;10H");
+    try process.ready();
+    try process.send("Vj");
+    try process.until("VISUAL LINE | 2:");
+    try process.until("\x1b[1;1H\x1b[7malpha beta \x1b[27m\x1b[2;1H\x1b[7mgamma \x1b[27m");
+    try process.ready();
+    // Escape ends it, and the next frame draws nothing in reverse video.
+    try process.send("\x1b");
+    try process.until("NORMAL | 2:");
+    try plainFrame(&process);
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, "alpha beta\ngamma\n");
 }
 
 /// Consumes the rest of the frame, after the status row, and checks that it
