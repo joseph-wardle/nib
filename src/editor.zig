@@ -226,8 +226,8 @@ pub const Editor = struct {
                 status.clear();
                 buffer.beginGroup();
                 const row = buffer.rowAt(buffer.cursor);
-                const start = buffer.starts.items[row];
-                const end = start + buffer.line(row).len;
+                const start = buffer.lineStart(row);
+                const end = buffer.contentEnd(row);
                 switch (insertion) {
                     .before => {},
                     .after => buffer.cursor = @min(char.next(buffer.bytes(), buffer.cursor), end),
@@ -255,7 +255,7 @@ pub const Editor = struct {
                     .lines => |count| result: {
                         const row = buffer.rowAt(buffer.cursor);
                         const last = row + @min(count - 1, buffer.lineCount() - row - 1);
-                        break :result motion.Result{ .destination = buffer.starts.items[last], .shape = .linewise, .goal = 0 };
+                        break :result motion.Result{ .destination = buffer.lineStart(last), .shape = .linewise, .goal = 0 };
                     },
                     .search => |movement| result: {
                         const destination = self.find(buffer, status, movement) orelse return;
@@ -336,7 +336,7 @@ pub const Editor = struct {
                 }
                 const row = buffer.rowAt(buffer.cursor);
                 const range = buffer.lineRange(row);
-                const end = range.start + buffer.line(row).len;
+                const end = buffer.contentEnd(row);
                 const offset = if (held.linewise) switch (put.side) {
                     .after => range.end,
                     .before => range.start,
@@ -395,7 +395,7 @@ pub const Editor = struct {
             .end_insert => {
                 const row = buffer.rowAt(buffer.cursor);
                 // Stepping back one byte, then snapping, lands on a character start.
-                if (buffer.cursor > buffer.starts.items[row]) buffer.cursor -= 1;
+                if (buffer.cursor > buffer.lineStart(row)) buffer.cursor -= 1;
                 buffer.cursor = motion.normal(buffer, buffer.cursor);
                 buffer.endCommand();
                 goal.* = motion.screenColumn(buffer, buffer.cursor, false);

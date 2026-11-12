@@ -110,6 +110,12 @@ pub const Buffer = struct {
         };
     }
 
+    /// Where the row starts.
+    pub fn lineStart(self: *const Buffer, row: usize) usize {
+        return self.starts.items[row];
+    }
+
+    /// The row's text, without its line break.
     pub fn line(self: *const Buffer, row: usize) []const u8 {
         const range = self.lineRange(row);
         var end = range.end;
@@ -118,6 +124,11 @@ pub const Buffer = struct {
             if (end > range.start and self.text.items[end - 1] == '\r') end -= 1;
         }
         return self.text.items[range.start..end];
+    }
+
+    /// Where the row's text ends: before its CRLF or LF, if it has one.
+    pub fn contentEnd(self: *const Buffer, row: usize) usize {
+        return self.lineStart(row) + self.line(row).len;
     }
 
     /// Last line start at or before a validated offset, including trailing EOF.
@@ -504,22 +515,25 @@ test "byte and logical line limits include EOF transitions and reversible edits"
 }
 
 test "line boundaries preserve empty lines and strip only LF or CRLF" {
-    const Case = struct { text: []const u8, lines: []const []const u8 };
+    // `ends` covers every insertion row, including the empty one after a final LF.
+    const Case = struct { text: []const u8, lines: []const []const u8, ends: []const usize };
     const cases = [_]Case{
-        .{ .text = "", .lines = &.{""} },
-        .{ .text = "\n", .lines = &.{""} },
-        .{ .text = "\n\n", .lines = &.{ "", "" } },
-        .{ .text = "abc", .lines = &.{"abc"} },
-        .{ .text = "abc\n", .lines = &.{"abc"} },
-        .{ .text = "a\n\nb", .lines = &.{ "a", "", "b" } },
-        .{ .text = "a\r\n\r\nb\r", .lines = &.{ "a", "", "b\r" } },
-        .{ .text = "\r\r\n", .lines = &.{"\r"} },
+        .{ .text = "", .lines = &.{""}, .ends = &.{0} },
+        .{ .text = "\n", .lines = &.{""}, .ends = &.{ 0, 1 } },
+        .{ .text = "\n\n", .lines = &.{ "", "" }, .ends = &.{ 0, 1, 2 } },
+        .{ .text = "abc", .lines = &.{"abc"}, .ends = &.{3} },
+        .{ .text = "abc\n", .lines = &.{"abc"}, .ends = &.{ 3, 4 } },
+        .{ .text = "a\n\nb", .lines = &.{ "a", "", "b" }, .ends = &.{ 1, 2, 4 } },
+        .{ .text = "a\r\n\r\nb\r", .lines = &.{ "a", "", "b\r" }, .ends = &.{ 1, 3, 7 } },
+        .{ .text = "\r\r\n", .lines = &.{"\r"}, .ends = &.{ 1, 3 } },
     };
     for (cases) |case| {
         var buffer = try Buffer.fromBytes(std.testing.allocator, case.text);
         defer buffer.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.lines.len, buffer.lineCount());
         for (case.lines, 0..) |expected, row| try std.testing.expectEqualStrings(expected, buffer.line(row));
+        try std.testing.expectEqual(case.ends.len, buffer.insertionRows());
+        for (case.ends, 0..) |end, row| try std.testing.expectEqual(end, buffer.contentEnd(row));
     }
 }
 

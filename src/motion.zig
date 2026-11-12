@@ -17,7 +17,7 @@ pub const Selection = struct { range: Range, copied: Range, linewise: bool };
 /// Display cells from the line start to a character boundary `offset`.
 pub fn column(buffer: *const Buffer, offset: usize) usize {
     const bytes = buffer.bytes();
-    var position = buffer.starts.items[buffer.rowAt(offset)];
+    var position = buffer.lineStart(buffer.rowAt(offset));
     var result: usize = 0;
     while (position < offset) {
         const character = measure(bytes, position, result);
@@ -36,15 +36,15 @@ pub fn normal(buffer: *const Buffer, offset: usize) usize {
 }
 
 fn last(buffer: *const Buffer, row: usize) usize {
-    const start = buffer.starts.items[row];
-    const end = start + buffer.line(row).len;
+    const start = buffer.lineStart(row);
+    const end = buffer.contentEnd(row);
     return if (end == start) start else char.previous(buffer.bytes(), end);
 }
 
 fn first(buffer: *const Buffer, row: usize) usize {
     const text = buffer.line(row);
     for (text, 0..) |byte, index| {
-        if (byte != ' ' and byte != '\t') return buffer.starts.items[row] + index;
+        if (byte != ' ' and byte != '\t') return buffer.lineStart(row) + index;
     }
     return last(buffer, row);
 }
@@ -58,7 +58,7 @@ pub const Cells = struct { column: usize, width: usize };
 pub fn screenCells(buffer: *const Buffer, offset: usize, insert: bool) Cells {
     const start = column(buffer, offset);
     const row = buffer.rowAt(offset);
-    const end = buffer.starts.items[row] + buffer.line(row).len;
+    const end = buffer.contentEnd(row);
     if (insert or offset == end) return .{ .column = start, .width = 1 };
     const code = char.decode(buffer.bytes(), offset).code;
     const width = char.cells(code, start);
@@ -75,8 +75,8 @@ pub fn screenColumn(buffer: *const Buffer, offset: usize, insert: bool) usize {
 fn atColumn(buffer: *const Buffer, row: usize, goal: Goal) usize {
     const target = goal orelse return last(buffer, row);
     const bytes = buffer.bytes();
-    const end = buffer.starts.items[row] + buffer.line(row).len;
-    var position = buffer.starts.items[row];
+    const end = buffer.contentEnd(row);
+    var position = buffer.lineStart(row);
     var col: usize = 0;
     while (position < end) {
         const character = measure(bytes, position, col);
@@ -153,7 +153,7 @@ pub fn resolve(buffer: *const Buffer, goal: Goal, motion: Motion, count: ?usize,
     const origin = normal(buffer, buffer.cursor);
     std.debug.assert(origin == buffer.cursor);
     const row = buffer.rowAt(origin);
-    const start = buffer.starts.items[row];
+    const start = buffer.lineStart(row);
     var destination = origin;
     var shape: Shape = .exclusive;
     var new_goal = goal;
@@ -166,7 +166,7 @@ pub fn resolve(buffer: *const Buffer, goal: Goal, motion: Motion, count: ?usize,
             }
         },
         .right => {
-            const limit = if (operator == null) last(buffer, row) else start + buffer.line(row).len;
+            const limit = if (operator == null) last(buffer, row) else buffer.contentEnd(row);
             var remaining = amount;
             while (remaining != 0 and destination < limit) : (remaining -= 1) {
                 destination = next(buffer, destination);
@@ -206,11 +206,11 @@ pub fn resolve(buffer: *const Buffer, goal: Goal, motion: Motion, count: ?usize,
                 } else destination = word(buffer, destination, actual);
                 if (operator != null and actual == .word and remaining == 1 and buffer.rowAt(destination) > buffer.rowAt(before) and class(buffer, before) != .empty) {
                     // The final w step stops at this line's end for operators.
-                    destination = buffer.starts.items[buffer.rowAt(before)] + buffer.line(buffer.rowAt(before)).len;
+                    destination = buffer.contentEnd(buffer.rowAt(before));
                 }
                 if (operator != null and actual == .word and destination == buffer.bytes().len) {
                     const final_row = buffer.lineCount() - 1;
-                    destination = buffer.starts.items[final_row] + buffer.line(final_row).len;
+                    destination = buffer.contentEnd(final_row);
                 }
                 if (operator != null and actual == .back and destination == 0 and remaining > 1 and class(buffer, 0) == .empty) return null;
                 if ((destination == before and !first_change) or (destination == 0 and actual == .back) or destination == buffer.bytes().len) break;
@@ -234,23 +234,23 @@ pub fn operatorRange(buffer: *const Buffer, result: Result, operator: Operator) 
     var shape = result.shape;
     const low_row = buffer.rowAt(low);
     var high_row = buffer.rowAt(high);
-    if (shape == .exclusive and high_row > low_row and high == buffer.starts.items[high_row]) {
+    if (shape == .exclusive and high_row > low_row and high == buffer.lineStart(high_row)) {
         if (low <= first(buffer, low_row)) {
             shape = .linewise;
             high_row -= 1;
         } else {
-            high = buffer.starts.items[high_row - 1] + buffer.line(high_row - 1).len;
+            high = buffer.contentEnd(high_row - 1);
         }
     }
     // Vim's delete promotes a cross-line range when only indentation precedes
     // it and only whitespace follows it, avoiding a leftover blank line.
     if (operator == .delete and shape != .linewise and high_row > low_row and low <= first(buffer, low_row)) {
-        const content_end = buffer.starts.items[high_row] + buffer.line(high_row).len;
+        const content_end = buffer.contentEnd(high_row);
         const after = @min(content_end, high + @intFromBool(shape == .inclusive and high < content_end));
         if (std.mem.trim(u8, buffer.bytes()[after..content_end], " \t").len == 0) shape = .linewise;
     }
     if (shape == .linewise) {
-        low = buffer.starts.items[low_row];
+        low = buffer.lineStart(low_row);
         high = buffer.lineRange(high_row).end;
         const copied: Range = .{ .start = low, .end = high };
         const unterminated = high == 0 or buffer.bytes()[high - 1] != '\n';
@@ -259,7 +259,7 @@ pub fn operatorRange(buffer: *const Buffer, result: Result, operator: Operator) 
             low = previous(buffer, low);
         return .{ .range = .{ .start = low, .end = high }, .copied = copied, .linewise = true };
     }
-    if (shape == .inclusive and high < buffer.starts.items[high_row] + buffer.line(high_row).len) {
+    if (shape == .inclusive and high < buffer.contentEnd(high_row)) {
         high = next(buffer, high);
     }
     const range: Range = .{ .start = low, .end = high };
