@@ -337,8 +337,9 @@ pub const Parser = struct {
             };
             return searched(operating, register, repeat);
         }
-        // A put takes counts in visual mode too, so it is handled below.
-        if (self.visual) |kind| if (byte != 'p' and byte != 'P') {
+        if (self.visual) |kind| {
+            // A put takes counts in visual mode too.
+            if (byte == 'p' or byte == 'P') return self.put(byte, register, register_count, count);
             if (count != null or register_count != null) return .invalid;
             switch (byte) {
                 'o' => return .other_end,
@@ -365,7 +366,7 @@ pub const Parser = struct {
                 // under the selection; the selection stays.
                 else => return .invalid,
             }
-        };
+        }
         if (pending_operator) {
             if (byte == letter(operator)) {
                 const combined = multiply(operator_count, count) catch return .invalid;
@@ -397,19 +398,7 @@ pub const Parser = struct {
             self.register = register;
             return null;
         }
-        if (byte == 'p' or byte == 'P') {
-            // `"_` holds nothing to put.
-            if (register == '_') return .unsupported_register;
-            const combined = multiply(register_count, count) catch return .invalid;
-            const selection = self.visual;
-            self.visual = null;
-            return .{ .put = .{
-                .register = register,
-                .count = combined orelse 1,
-                .side = if (byte == 'p') .after else .before,
-                .selection = selection,
-            } };
-        }
+        if (byte == 'p' or byte == 'P') return self.put(byte, register, register_count, count);
         // This subset deliberately does not repeat insertions or Ex/undo keys.
         if (count != null) return .invalid;
         switch (byte) {
@@ -456,6 +445,22 @@ pub const Parser = struct {
         if (char.editable(text)) return .{ .text = text };
         self.discarded = true;
         return null;
+    }
+
+    /// `p` or `P` with its register and counts. In visual mode it replaces
+    /// the selection and ends visual mode.
+    fn put(self: *Parser, byte: u8, register: u8, register_count: ?usize, count: ?usize) Action {
+        // `"_` holds nothing to put; a selection stays.
+        if (register == '_') return .unsupported_register;
+        const combined = multiply(register_count, count) catch return .invalid;
+        const selection = self.visual;
+        self.visual = null;
+        return .{ .put = .{
+            .register = register,
+            .count = combined orelse 1,
+            .side = if (byte == 'p') .after else .before,
+            .selection = selection,
+        } };
     }
 
     /// Escape and Ctrl-C cancel whatever is pending. Outside the prompt

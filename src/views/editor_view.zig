@@ -113,10 +113,7 @@ fn highlight(
         const text = buffer.line(viewport.top + row);
         var highlights: Highlights = .init(text, query, viewport.left, width);
         while (highlights.next()) |part| {
-            var position: [32]u8 = undefined;
-            const move = "\x1b[{d};{d}H\x1b[7m";
-            const sequence = std.fmt.bufPrint(&position, move, .{ row + 1, part.cell + 1 });
-            try frame.append(sequence catch unreachable);
+            try reverse(frame, row, part.cell);
             try frame.append(part.bytes);
             try frame.append("\x1b[27m");
         }
@@ -147,14 +144,18 @@ fn select(
             viewport.left,
             width,
         ) orelse continue;
-        var position: [32]u8 = undefined;
-        const move = "\x1b[{d};{d}H\x1b[7m";
-        const row = number - viewport.top;
-        const sequence = std.fmt.bufPrint(&position, move, .{ row + 1, span.cell + 1 });
-        try frame.append(sequence catch unreachable);
+        try reverse(frame, number - viewport.top, span.cell);
         frame.commit(span.render(try frame.room(3 * width)));
         try frame.append("\x1b[27m");
     }
+}
+
+/// Moves to a zero-based content cell and starts reverse video, which the
+/// caller ends with `ESC [27m` after the cells it redraws.
+fn reverse(frame: *Frame, row: usize, cell: usize) terminal.Error!void {
+    var position: [32]u8 = undefined;
+    const sequence = std.fmt.bufPrint(&position, "\x1b[{d};{d}H\x1b[7m", .{ row + 1, cell + 1 });
+    try frame.append(sequence catch unreachable);
 }
 
 test "a whole row of matches at the widest terminal fits the frame unsplit" {
