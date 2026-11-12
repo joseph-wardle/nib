@@ -1329,16 +1329,29 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.until("pending");
     try process.until("Reloaded external changes");
     try process.ready();
+    // An open command line holds the reload until it closes.
+    try process.send(":");
+    try process.until("\x1b[7m:");
+    try process.ready();
+    try putFile(path, "command\n");
+    try process.until("pending");
+    try process.until("DISK CONFLICT | :");
+    try process.ready();
+    try equal(@as(usize, 0), try process.read(100));
+    try process.send("\x03");
+    try process.until("command");
+    try process.until("Reloaded external changes");
+    try process.ready();
     // Even a clean insert session postpones reloading; subsequent typing is local.
     try process.send("i");
     try process.until("INSERT");
     try process.ready();
     try putFile(path, "outside\n");
-    try process.until("pending");
+    try process.until("command");
     try process.until("DISK CONFLICT");
     try process.ready();
     try process.send("X\x03");
-    try process.until("Xpending");
+    try process.until("Xcommand");
     try process.ready();
     try process.send(":w\r");
     try process.until("save refused");
@@ -1348,7 +1361,7 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.send(try std.fmt.bufPrint(&copy_command, ":w {s}\r", .{replacement}));
     try process.until("Copy written");
     try process.ready();
-    try expectFile(replacement, "Xpending\n");
+    try expectFile(replacement, "Xcommand\n");
     try process.send(":q\r");
     try process.until("Unsaved changes");
     try process.ready();

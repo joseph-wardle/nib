@@ -148,36 +148,7 @@ const App = struct {
             }
             // One read can hold many keys or a large paste; they share a timestamp.
             const now = if (bytes.len != 0 or expired) try terminal.milliseconds() else 0;
-            var fed: usize = 0;
-            while (expired or fed < bytes.len) {
-                const events = if (expired) decoder.expire(now) else decoder.feed(bytes[fed], now);
-                if (expired) expired = false else fed += 1;
-                for (events.items[0..events.len]) |decoded| {
-                    if (decoded == .key and decoded.key == 26) {
-                        self.screen.requestSuspend();
-                        continue;
-                    }
-                    if (self.finding) self.finderEvent(decoded) else self.editorEvent(decoded);
-                    if (self.exit) |code| return code;
-                }
-            }
-            if (self.documents.current()) |entry| {
-                const reload = entry.disk.automatic(
-                    self.gpa,
-                    self.io,
-                    &entry.document,
-                    &entry.goal,
-                    &self.editor,
-                );
-                self.redraw = reload != null or self.redraw;
-                // The finder never scrolls the document behind it.
-                if (!self.finding) entry.viewport.follow(
-                    &entry.document.buffer,
-                    self.size.rows -| 1,
-                    self.size.columns -| 1,
-                    self.editor.inserting(),
-                );
-            }
+            if (self.step(&decoder, bytes, expired, now)) |code| return code;
             if (self.redraw) {
                 self.redraw = false;
                 self.draw() catch |err| {
@@ -185,6 +156,45 @@ const App = struct {
                 };
             }
         }
+    }
+
+    /// Feeds one read, or an expired Escape deadline, through `decoder`; then
+    /// reloads the active document if it is clean, changed on disk and at a
+    /// safe boundary, and keeps its viewport on the cursor. Sets `redraw` when
+    /// anything it changed is visible. Returns the exit code once a command quits.
+    fn step(self: *App, decoder: *input.Decoder, bytes: []const u8, expired: bool, now: i64) ?u8 {
+        var fed: usize = 0;
+        var pending = expired;
+        while (pending or fed < bytes.len) {
+            const events = if (pending) decoder.expire(now) else decoder.feed(bytes[fed], now);
+            if (pending) pending = false else fed += 1;
+            for (events.items[0..events.len]) |decoded| {
+                if (decoded == .key and decoded.key == 26) {
+                    self.screen.requestSuspend();
+                    continue;
+                }
+                if (self.finding) self.finderEvent(decoded) else self.editorEvent(decoded);
+                if (self.exit) |code| return code;
+            }
+        }
+        if (self.documents.current()) |entry| {
+            const reload = entry.disk.automatic(
+                self.gpa,
+                self.io,
+                &entry.document,
+                &entry.goal,
+                &self.editor,
+            );
+            self.redraw = reload != null or self.redraw;
+            // The finder never scrolls the document behind it.
+            if (!self.finding) entry.viewport.follow(
+                &entry.document.buffer,
+                self.size.rows -| 1,
+                self.size.columns -| 1,
+                self.editor.inserting(),
+            );
+        }
+        return null;
     }
 
     fn watched(self: *App) void {
@@ -1651,6 +1661,56 @@ test "a yank redraws even when nothing else on screen changes" {
     app.editorEvent(.{ .key = 'Y' });
     try testing.expect(app.redraw);
     try testing.expect(app.editor.clipboard);
+}
+
+test "a clean file changed on disk reloads only after every pending state ends" {
+    const testing = std.testing;
+    // Each case's keys leave one pending state and its closing keys end it.
+    const cases = [_]struct { keys: []const u8, close: []const u8 }{
+        .{ .keys = "2", .close = "\x03" }, // count
+        .{ .keys = "g", .close = "\x03" },
+        .{ .keys = "\"", .close = "\x03" }, // register name awaited
+        .{ .keys = "\"a", .close = "\x03" }, // register chosen
+        .{ .keys = "d", .close = "\x03" }, // operator
+        .{ .keys = "i", .close = "\x03" }, // insert
+        .{ .keys = "/x", .close = "\x03" }, // search prompt
+        .{ .keys = ":q", .close = "\x03" }, // command line
+        .{ .keys = "\x1b[200~x", .close = "\x1b[201~" }, // paste, ignored in normal mode
+    };
+    for (cases) |case| {
+        var temp = testing.tmpDir(.{});
+        defer temp.cleanup();
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+        var background: jobs.Jobs = try .init();
+        var finder: Finder = .{};
+        defer finder.deinit(testing.allocator, testing.io);
+        defer background.deinit(testing.allocator, testing.io);
+        var app: App = .{
+            .gpa = testing.allocator,
+            .io = testing.io,
+            .screen = undefined,
+            .background = &background,
+            .finder = &finder,
+            .size = .{ .rows = 4, .columns = 20 },
+        };
+        defer app.editor.deinit(testing.allocator);
+        defer app.documents.deinit(testing.allocator);
+        _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+        const entry = app.documents.current().?;
+        var decoder: input.Decoder = .{};
+        try testing.expect(app.step(&decoder, case.keys, false, 0) == null);
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "beta\n" });
+        app.watched();
+        try testing.expectEqualStrings("DISK CONFLICT | ", entry.disk.status());
+        try testing.expect(app.step(&decoder, "", false, 0) == null);
+        try testing.expectEqualStrings("alpha\n", entry.document.buffer.bytes());
+        try testing.expect(app.step(&decoder, case.close, false, 0) == null);
+        try testing.expectEqualStrings("beta\n", entry.document.buffer.bytes());
+        try testing.expectEqualStrings(
+            "Reloaded external changes; history cleared",
+            app.editor.notice,
+        );
+    }
 }
 
 /// Frame's output interface, flushing into `output` whenever `capacity`

@@ -94,30 +94,6 @@ pub const External = struct {
     }
 };
 
-test "reload waits for every pending modal state" {
-    var editor: Editor = .{};
-    try std.testing.expect(External.safe(&editor));
-    editor.parser.count = 2;
-    try std.testing.expect(!External.safe(&editor));
-    editor.parser.cancel();
-    editor.parser.pending_g = true;
-    try std.testing.expect(!External.safe(&editor));
-    editor.parser.cancel();
-    editor.parser.naming = true;
-    try std.testing.expect(!External.safe(&editor));
-    editor.parser.cancel();
-    editor.parser.register = 'a';
-    try std.testing.expect(!External.safe(&editor));
-    editor.parser.cancel();
-    editor.parser.pasting = true;
-    try std.testing.expect(!External.safe(&editor));
-    editor.parser.pasting = false;
-    for ([_]@import("command.zig").Mode{ .insert, .operator, .command_line, .search }) |mode| {
-        editor.parser.mode = mode;
-        try std.testing.expect(!External.safe(&editor));
-    }
-}
-
 const view = @import("view.zig");
 const testing = std.testing;
 const linux = std.os.linux;
