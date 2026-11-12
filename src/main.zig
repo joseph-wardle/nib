@@ -160,11 +160,13 @@ const App = struct {
 
     /// Feeds one read, or an expired Escape deadline, through `decoder`; then
     /// reloads the active document if it is clean, changed on disk and at a
-    /// safe boundary, and keeps its viewport on the cursor. Sets `redraw` when
-    /// anything it changed is visible. Returns the exit code once a command quits.
+    /// safe boundary, and keeps its viewport on the cursor. Any delivered
+    /// event sets `redraw`, unless a bracketed paste is still arriving. Returns
+    /// the exit code once a command quits.
     fn step(self: *App, decoder: *input.Decoder, bytes: []const u8, expired: bool, now: i64) ?u8 {
         var fed: usize = 0;
         var pending = expired;
+        var delivered = false;
         while (pending or fed < bytes.len) {
             const events = if (pending) decoder.expire(now) else decoder.feed(bytes[fed], now);
             if (pending) pending = false else fed += 1;
@@ -173,10 +175,12 @@ const App = struct {
                     self.screen.requestSuspend();
                     continue;
                 }
+                delivered = true;
                 if (self.finding) self.finderEvent(decoded) else self.editorEvent(decoded);
                 if (self.exit) |code| return code;
             }
         }
+        if (delivered and decoder.state != .paste) self.redraw = true;
         if (self.documents.current()) |entry| {
             const reload = entry.disk.automatic(
                 self.gpa,
@@ -219,32 +223,8 @@ const App = struct {
     fn editorEvent(self: *App, event: input.Event) void {
         const entry = self.documents.current().?;
         const buffer = &entry.document.buffer;
-        const old_mode = self.editor.parser.mode;
-        const old_length = self.editor.parser.line_len;
-        const old_invalid = self.editor.parser.line_invalid;
-        const old_cursor = buffer.cursor;
-        const old_position = buffer.position;
-        const old_text_length = buffer.bytes().len;
-        const old_notice = self.editor.notice;
-        const old_highlight = self.editor.highlight;
-        const old_viewport = entry.viewport;
-        const old_clipboard = self.editor.clipboard;
-        if (self.editor.feed(self.gpa, buffer, &entry.goal, &entry.viewport, event)) |action| {
-            self.fileAction(action);
-            self.redraw = true;
-            return;
-        }
-        const changed = old_mode != self.editor.parser.mode or
-            old_length != self.editor.parser.line_len or
-            old_invalid != self.editor.parser.line_invalid or
-            old_cursor != buffer.cursor or
-            old_position != buffer.position or
-            old_text_length != buffer.bytes().len or
-            old_highlight != self.editor.highlight or
-            old_clipboard != self.editor.clipboard or
-            !std.meta.eql(old_viewport, entry.viewport) or
-            !std.mem.eql(u8, old_notice, self.editor.notice);
-        if (changed) self.redraw = true;
+        const action = self.editor.feed(self.gpa, buffer, &entry.goal, &entry.viewport, event);
+        if (action) |requested| self.fileAction(requested);
     }
 
     fn finderEvent(self: *App, event: input.Event) void {
@@ -252,7 +232,6 @@ const App = struct {
         if (parser.mode == .command_line) {
             // Command entry borrows the editor's idle command line, so the
             // same commands mean the same thing on either screen.
-            self.redraw = true;
             const action = parser.feed(event) orelse return;
             switch (action) {
                 .file => |requested| self.fileAction(requested),
@@ -268,7 +247,6 @@ const App = struct {
             else => {},
         }
         self.editor.notice = "";
-        self.redraw = true;
         const pending_g = self.pending_g;
         self.pending_g = false;
         // Keys that mean the same while searching and browsing.
@@ -1633,36 +1611,6 @@ test "the clipboard gets one OSC 52 of the text's base64 however the frame split
     }
 }
 
-test "a yank redraws even when nothing else on screen changes" {
-    const testing = std.testing;
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "one\n" });
-    var background: jobs.Jobs = try .init();
-    var finder: Finder = .{};
-    defer finder.deinit(testing.allocator, testing.io);
-    defer background.deinit(testing.allocator, testing.io);
-    var app: App = .{
-        .gpa = testing.allocator,
-        .io = testing.io,
-        .screen = undefined,
-        .background = &background,
-        .finder = &finder,
-        .size = .{ .rows = 4, .columns = 11 },
-    };
-    defer app.editor.deinit(testing.allocator);
-    defer app.documents.deinit(testing.allocator);
-    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
-    // `Y` in the first column moves nothing. Into a register the clipboard
-    // never sees, it changes nothing on screen.
-    for ("\"_Y\"aY") |byte| app.editorEvent(.{ .key = byte });
-    try testing.expect(!app.redraw);
-    try testing.expect(!app.editor.clipboard);
-    app.editorEvent(.{ .key = 'Y' });
-    try testing.expect(app.redraw);
-    try testing.expect(app.editor.clipboard);
-}
-
 test "a clean file changed on disk reloads only after every pending state ends" {
     const testing = std.testing;
     // Each case's keys leave one pending state and its closing keys end it.
@@ -1711,6 +1659,51 @@ test "a clean file changed on disk reloads only after every pending state ends" 
             app.editor.notice,
         );
     }
+}
+
+test "every read that delivers an event draws, except while a paste is arriving" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "one\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .screen = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 4, .columns = 20 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a", &app.editor);
+    var decoder: input.Decoder = .{};
+    // A count digit, a register prefix and an unknown sequence change nothing
+    // visible, yet each read draws.
+    for ([_][]const u8{ "2", "\"a", "\x1b[99~" }) |read| {
+        app.redraw = false;
+        try testing.expect(app.step(&decoder, read, false, 0) == null);
+        try testing.expect(app.redraw);
+    }
+    // The first byte of an Escape sequence delivers nothing yet.
+    app.redraw = false;
+    try testing.expect(app.step(&decoder, "\x1b", false, 0) == null);
+    try testing.expect(!app.redraw);
+    try testing.expect(app.step(&decoder, "", true, 1000) == null);
+    try testing.expect(app.redraw);
+    // A paste draws only once its end arrives, even when keys preceded it.
+    app.redraw = false;
+    try testing.expect(app.step(&decoder, "i\x1b[200~ab", false, 0) == null);
+    try testing.expect(!app.redraw);
+    try testing.expect(app.step(&decoder, "c", false, 0) == null);
+    try testing.expect(!app.redraw);
+    try testing.expect(app.step(&decoder, "\x1b[201~", false, 0) == null);
+    try testing.expect(app.redraw);
+    try testing.expectEqualStrings("abcone\n", app.documents.current().?.document.buffer.bytes());
 }
 
 /// Frame's output interface, flushing into `output` whenever `capacity`

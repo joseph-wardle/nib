@@ -527,10 +527,22 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.send("2j3l");
     try process.until("3:4 | ");
     try process.until("\x1b[0m");
-    // Fragmented CSI, SS3 and pasted commands are ignored.
-    for ([_][]const u8{ "\x1b[", "999q", "\x1bO", "q", "\x1b[200~qhjkl\x1b[201~" }) |part| {
+    // Fragmented CSI, SS3 and pasted commands are ignored. A sequence's
+    // prefix draws an unchanged frame; the rest of an unknown one, nothing.
+    const parts = [_]struct { []const u8, bool }{
+        .{ "\x1b[", true },
+        .{ "999q", false },
+        .{ "\x1bO", true },
+        .{ "q", false },
+        .{ "\x1b[200~qhjkl\x1b[201~", true },
+    };
+    for (parts) |case| {
+        const part, const draws = case;
         try process.send(part);
-        try equal(@as(usize, 0), try process.read(20));
+        if (draws) {
+            try process.until("3:4 | ");
+            try process.ready();
+        } else try equal(@as(usize, 0), try process.read(20));
     }
     try process.send("\x1a");
     _ = try process.wait(true);
@@ -766,12 +778,24 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.until("2:1 | ");
     try process.ready();
     // Recognized prefixes have no lone-Escape deadline. A payload arriving
-    // later than 100 ms stays shielded.
-    for ([_][2][]const u8{ .{ "\x1bO", "A" }, .{ "\x1b[", "999q" } }) |parts| {
-        try process.send(parts[0]);
+    // later than 100 ms stays shielded: the prefix draws an unchanged frame
+    // and nothing follows it. An arrow draws, moving nothing; the rest of an
+    // unknown sequence draws nothing.
+    const parts = [_]struct { []const u8, []const u8, bool }{
+        .{ "\x1bO", "A", true },
+        .{ "\x1b[", "999q", false },
+    };
+    for (parts) |case| {
+        const prefix, const payload, const draws = case;
+        try process.send(prefix);
+        try process.until("2:1 | ");
+        try process.ready();
         try equal(@as(usize, 0), try process.read(150));
-        try process.send(parts[1]);
-        try equal(@as(usize, 0), try process.read(20));
+        try process.send(payload);
+        if (draws) {
+            try process.until("2:1 | ");
+            try process.ready();
+        } else try equal(@as(usize, 0), try process.read(20));
     }
     try process.send("\x0320g\x03j");
     try process.until("3:1 | ");
@@ -780,7 +804,8 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.send(":");
     try process.ready();
     try process.send("\x1b[200~q!\r\x03\x1b[201~");
-    try equal(@as(usize, 0), try process.read(150));
+    try process.until("\x1b[7m: ");
+    try process.ready();
     try process.send("\x03^");
     try process.until("3:1 | ");
     try process.ready();
@@ -790,6 +815,8 @@ fn modalCommands(executable: [:0]const u8) !void {
     // Ctrl-C ends an unfinished sequence, and Escape then `]` (Alt+] in
     // Konsole) is two keys, so the quit command still gets through.
     try process.send("\x1b[");
+    try process.until("NORMAL [+]");
+    try process.ready();
     try equal(@as(usize, 0), try process.read(150));
     try process.send("\x03\x1b]:qa!\r");
     try equal(@as(u8, 0), try process.wait(false));
@@ -1025,26 +1052,32 @@ fn utf8Editing(executable: [:0]const u8) !void {
         try process.ready();
     }
     // Each byte of é and ✅ arrives in its own read. Until a character is
-    // complete there is nothing to draw.
+    // complete each read draws the cursor where it was.
     try editingKeys(&process, "i");
     const typed = [_]struct { []const u8, []const u8 }{
         .{ "\u{e9}", "\x1b[1;2H" },
         .{ "\u{2705}", "\x1b[1;4H" },
     };
+    var previous: []const u8 = "\x1b[1;1H";
     for (typed) |case| {
         const character, const position = case;
         for (character, 1..) |byte, count| {
             try process.send(&.{byte});
-            if (count < character.len) try equal(@as(usize, 0), try process.read(30));
+            if (count < character.len) {
+                try process.until(previous);
+                try process.ready();
+            }
         }
         try process.until(position);
         try process.ready();
+        previous = position;
     }
     // A character cut short by Tab inserts nothing; the Tab still inserts.
-    try process.send("\xe2");
-    try equal(@as(usize, 0), try process.read(30));
-    try process.send("\x9c");
-    try equal(@as(usize, 0), try process.read(30));
+    for ([_][]const u8{ "\xe2", "\x9c" }) |byte| {
+        try process.send(byte);
+        try process.until("\x1b[1;4H");
+        try process.ready();
+    }
     try process.send("\t");
     try process.until("Invalid or interrupted character; nothing inserted");
     try process.ready();
@@ -1113,8 +1146,9 @@ fn pasteLifecycle(executable: [:0]const u8) !void {
         try process.ready();
     }
     // Real suspension during collection discards the entire pending paste.
+    // Nothing is drawn until the paste ends.
     try process.send("\x1b[200~");
-    try process.ready();
+    try equal(@as(usize, 0), try process.read(30));
     try process.send("partial");
     try equal(@as(usize, 0), try process.read(30));
     try process.signal(.TSTP);
@@ -1125,7 +1159,8 @@ fn pasteLifecycle(executable: [:0]const u8) !void {
     try process.until("Paste interrupted");
     try process.ready();
     try process.send("remaining\x1b[201~");
-    try equal(@as(usize, 0), try process.read(30));
+    try process.until("Paste interrupted");
+    try process.ready();
     // A following valid paste is part of the original insertion group.
     try process.send("\x1b[200~A\nB\r\nC\rD\t\x1b[201~");
     try process.until("XA");
@@ -1211,7 +1246,7 @@ fn clipboardWorkflow(executable: [:0]const u8) !void {
     try withoutClipboard(&process, "NORMAL | 1:1 | ");
     // Paste outside insert mode is still ignored, and copies nothing.
     try process.send("\x1b[200~three\x1b[201~");
-    try equal(@as(usize, 0), try process.read(150));
+    try withoutClipboard(&process, "NORMAL | 1:1 | ");
     // A delete writes the clipboard too ("one\n").
     try process.send("dd");
     try process.until(clipboard ++ "b25lCg==\x07");
