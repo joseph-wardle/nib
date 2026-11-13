@@ -205,7 +205,22 @@ const App = struct {
                 self.find(self.finder.category);
             },
             .command_line => self.command_line.begin(),
+            .travel => |requested| self.travel(switch (requested.direction) {
+                .older => .older,
+                .newer => .newer,
+            }, requested.count),
         }
+    }
+
+    /// Ctrl-O or Ctrl-I, from an idle editor, so activation may reload.
+    fn travel(self: *App, direction: session.Direction, count: usize) void {
+        std.debug.assert(self.editor.idle());
+        const travelled = self.documents.travel(self.gpa, self.io, direction, count) orelse {
+            self.status.set(if (direction == .older) "No older jump" else "No newer jump");
+            return;
+        };
+        self.status.clear();
+        self.announce(travelled.activation, false);
     }
 
     fn commandLineEvent(self: *App, event: input.Event) void {
@@ -1209,4 +1224,45 @@ fn expectNotice(app: *const App, comptime text: []const u8, arguments: anytype) 
 /// The session's id for the document the finder's selection names.
 fn chosen(finder: *const Finder) session.Id {
     return @fromBackingInt(@backingInt(finder.choice().?.document));
+}
+
+test "Ctrl-O and Tab say when there is no jump and name a file they reload" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "beta\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .terminal = undefined,
+        .background = &background,
+        .finder = &finder,
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    var a_path: [std.fs.max_path_bytes]u8 = undefined;
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    const a_name = copyPath(&a_path, &app, a);
+    app.editorEvent(.{ .key = 0x0f });
+    try testing.expectEqualStrings("No older jump", app.status.text());
+    app.editorEvent(.{ .key = '\t' });
+    try testing.expectEqualStrings("No newer jump", app.status.text());
+    app.documents.recordJump(0);
+    const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "changed\n" });
+    app.editorEvent(.{ .key = '2' });
+    app.editorEvent(.{ .key = 0x0f });
+    try testing.expectEqualStrings("No older jump", app.status.text());
+    try testing.expectEqual(b, app.documents.active.?);
+    app.editorEvent(.{ .key = 0x0f });
+    try testing.expectEqual(a, app.documents.active.?);
+    try expectNotice(&app, "Reloaded external changes to {s}; history cleared", .{a_name});
+    app.editorEvent(.{ .key = '\t' });
+    try testing.expectEqual(b, app.documents.active.?);
+    try testing.expectEqualStrings("", app.status.text());
 }

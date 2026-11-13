@@ -2,6 +2,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const file = @import("file.zig");
+const motion = @import("../text/motion.zig");
 const Viewport = @import("../text/viewport.zig").Viewport;
 const Disk = @import("disk.zig").Disk;
 
@@ -31,6 +32,10 @@ pub const Opened = struct {
     activation: ?Disk.Reload,
 };
 
+/// What `travel` did: how activating the entry's document reloaded it, if
+/// it did.
+pub const Travelled = struct { activation: ?Disk.Reload };
+
 /// What `saveAndClose` did. `activation` is how activating the next document
 /// reloaded it, if it did.
 pub const Closing = struct {
@@ -38,6 +43,85 @@ pub const Closing = struct {
     closed: bool,
     activation: ?Disk.Reload = null,
 };
+
+/// A place jumped from: a document and a line, with the byte column in it.
+pub const Jump = struct { id: Id, line: usize, column: usize };
+
+/// The jump list, as Neovim's `jumpoptions=stack` keeps it. `index` is the
+/// entry Ctrl-O or Ctrl-I last reached, or `len` while not travelling.
+pub const Jumps = struct {
+    items: [capacity]Jump = undefined,
+    len: usize = 0,
+    index: usize = 0,
+
+    pub const capacity = 100;
+
+    /// Records a departure. Travelling part way back keeps the entry reached
+    /// and drops the ones after it.
+    pub fn record(self: *Jumps, departure: Jump) void {
+        if (self.index < self.len) self.len = self.index + 1;
+        self.add(departure);
+        self.index = self.len;
+    }
+
+    /// Ctrl-O: the entry `count` older, or null when there is none. Leaving
+    /// the newest end first records `current`, so Ctrl-I returns to it; a
+    /// null then has at most moved the newest entry's column, as in Neovim.
+    pub fn back(self: *Jumps, current: Jump, count: usize) ?Jump {
+        if (count > self.index) return null;
+        if (self.index == self.len) {
+            self.add(current);
+            self.index = self.len - 1;
+            if (count > self.index) return null;
+        }
+        self.index -= count;
+        return self.items[self.index];
+    }
+
+    /// Ctrl-I: the entry `count` newer, or null, changing nothing.
+    pub fn forward(self: *Jumps, count: usize) ?Jump {
+        if (self.index == self.len or count >= self.len - self.index) return null;
+        self.index += count;
+        return self.items[self.index];
+    }
+
+    /// Drops every entry in document `id`, keeping `index` on the same entry
+    /// or, if that one went, on the next.
+    pub fn remove(self: *Jumps, id: Id) void {
+        var kept: usize = 0;
+        var index = self.index;
+        for (self.items[0..self.len], 0..) |jump, position| {
+            if (jump.id == id) {
+                if (position < self.index) index -= 1;
+                continue;
+            }
+            self.items[kept] = jump;
+            kept += 1;
+        }
+        self.len = kept;
+        self.index = @min(index, kept);
+    }
+
+    /// Appends, replacing the newest entry when it is the same line, and
+    /// dropping the oldest when full.
+    fn add(self: *Jumps, jump: Jump) void {
+        if (self.len != 0) {
+            const newest = &self.items[self.len - 1];
+            if (newest.id == jump.id and newest.line == jump.line) {
+                newest.* = jump;
+                return;
+            }
+        }
+        if (self.len == capacity) {
+            std.mem.copyForwards(Jump, self.items[0 .. capacity - 1], self.items[1..]);
+            self.len -= 1;
+        }
+        self.items[self.len] = jump;
+        self.len += 1;
+    }
+};
+
+pub const Direction = enum { older, newer };
 
 /// Owns every open document and the active selection. `open` and `close`
 /// move entries, so hold an `Id` across them, never an `*Entry`. Activation
@@ -47,6 +131,7 @@ pub const Session = struct {
     active: ?Id = null,
     next_id: u64 = 0,
     clock: u64 = 0,
+    jumps: Jumps = .{},
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         for (self.entries.items) |*entry| entry.deinit(allocator);
@@ -110,6 +195,43 @@ pub const Session = struct {
         return entry.disk.automatic(allocator, io, &entry.document, &entry.viewport.goal);
     }
 
+    /// Records the active document's `cursor` as a place jumped from.
+    pub fn recordJump(self: *Session, cursor: usize) void {
+        self.jumps.record(self.place(cursor));
+    }
+
+    /// Ctrl-O or Ctrl-I: activates the entry `count` away, which may reload
+    /// it as `activate` does, then puts the cursor on the entry's line and
+    /// column, clamped to the text as it is now. Null, changing nothing, when
+    /// there is no such entry. Call only between edits.
+    pub fn travel(
+        self: *Session,
+        allocator: Allocator,
+        io: std.Io,
+        direction: Direction,
+        count: usize,
+    ) ?Travelled {
+        const target = switch (direction) {
+            .older => self.jumps.back(self.place(self.current().?.document.buffer.cursor), count),
+            .newer => self.jumps.forward(count),
+        } orelse return null;
+        const activation = self.activate(allocator, io, target.id);
+        const entry = self.current().?;
+        const buffer = &entry.document.buffer;
+        const row = @min(target.line, buffer.lineCount() - 1);
+        const offset = @min(buffer.lineStart(row) + target.column, buffer.contentEnd(row));
+        buffer.cursor = motion.normal(buffer, offset);
+        entry.viewport.goal = motion.screenColumn(buffer, buffer.cursor, false);
+        return .{ .activation = activation };
+    }
+
+    fn place(self: *const Session, cursor: usize) Jump {
+        const entry = self.current().?;
+        const buffer = &entry.document.buffer;
+        const line = @min(buffer.rowAt(cursor), buffer.lineCount() - 1);
+        return .{ .id = entry.id, .line = line, .column = cursor - buffer.lineStart(line) };
+    }
+
     /// Refuses unsaved edits unless `discard`. Closing the active document
     /// activates the most recently used one left, if any, and returns how
     /// activating it reloaded it, as `activate` does.
@@ -124,6 +246,7 @@ pub const Session = struct {
         if (!discard and entry.document.buffer.modified()) return error.Unsaved;
         entry.deinit(allocator);
         _ = self.entries.orderedRemove(entry - self.entries.items.ptr);
+        self.jumps.remove(id);
         if (self.active != id) return null;
         self.active = null;
         var recent: ?*Entry = null;
@@ -223,7 +346,6 @@ test "switching keeps each document's text, history, cursor, goal and viewport e
 
 const Editor = @import("../edit/editor.zig").Editor;
 const Status = @import("../edit/editor.zig").Status;
-const motion = @import("../text/motion.zig");
 
 fn keys(session: *Session, editor: *Editor, status: *Status, bytes: []const u8) void {
     const entry = session.current().?;
@@ -490,4 +612,169 @@ test "an open path that no longer reaches a file never blocks opening another" {
     const b = (try session.open(testing.allocator, testing.io, temp.dir, "B")).id;
     try testing.expect(b != m and b != a and b != l);
     try testing.expectEqual(@as(usize, 4), session.entries.items.len);
+}
+
+fn at(line: usize) Jump {
+    return .{ .id = @fromBackingInt(@intCast(0)), .line = line, .column = 0 };
+}
+
+fn expectJumps(jumps: *const Jumps, lines: []const usize, index: usize) !void {
+    var actual: [Jumps.capacity]usize = undefined;
+    for (jumps.items[0..jumps.len], 0..) |jump, position| actual[position] = jump.line;
+    try testing.expectEqualSlices(usize, lines, actual[0..jumps.len]);
+    try testing.expectEqual(index, jumps.index);
+}
+
+// Each case matches Neovim 0.12.6 with `jumpoptions=stack`, lines as there.
+test "the jump list travels, truncates and replaces as Neovim's stack option does" {
+    var jumps: Jumps = .{};
+    // 1G, 10G, 20G, 30G: three departures; Ctrl-O first records line 30.
+    for ([_]usize{ 1, 10, 20 }) |line| jumps.record(at(line));
+    try expectJumps(&jumps, &.{ 1, 10, 20 }, 3);
+    try testing.expectEqual(@as(usize, 20), jumps.back(at(30), 1).?.line);
+    try expectJumps(&jumps, &.{ 1, 10, 20, 30 }, 2);
+    try testing.expectEqual(@as(usize, 30), jumps.forward(1).?.line);
+    // A count past either end moves nowhere, and so does Ctrl-I at the end.
+    try testing.expectEqual(@as(?Jump, null), jumps.back(at(30), 9));
+    try testing.expectEqual(@as(?Jump, null), jumps.forward(9));
+    try testing.expectEqual(@as(?Jump, null), jumps.forward(1));
+    try expectJumps(&jumps, &.{ 1, 10, 20, 30 }, 3);
+    // A jump part way back keeps the entry reached and drops the rest; the
+    // departure from that same line replaces it.
+    try testing.expectEqual(@as(usize, 10), jumps.back(at(30), 2).?.line);
+    jumps.record(at(10));
+    try expectJumps(&jumps, &.{ 1, 10 }, 2);
+    // From the newest end, a current line equal to the newest entry
+    // replaces it, and Ctrl-O goes to the one before.
+    try testing.expectEqual(@as(usize, 1), jumps.back(at(10), 1).?.line);
+    try expectJumps(&jumps, &.{ 1, 10 }, 0);
+    // Moving away and pressing Ctrl-I records nothing.
+    try testing.expectEqual(@as(usize, 10), jumps.forward(1).?.line);
+    try expectJumps(&jumps, &.{ 1, 10 }, 1);
+    // Moving away from an entry, then jumping, keeps it and adds the new one.
+    _ = jumps.back(at(10), 1);
+    jumps.record(at(6));
+    try expectJumps(&jumps, &.{ 1, 6 }, 2);
+}
+
+test "only adjacent entries on one line merge, and Ctrl-O from the end keeps the current line" {
+    var jumps: Jumps = .{};
+    // 1G, 10G, 1G, 10G, then Ctrl-O twice.
+    for ([_]usize{ 1, 10, 1 }) |line| jumps.record(at(line));
+    try testing.expectEqual(@as(usize, 1), jumps.back(at(10), 1).?.line);
+    try expectJumps(&jumps, &.{ 1, 10, 1, 10 }, 2);
+    try testing.expectEqual(@as(usize, 10), jumps.back(at(1), 1).?.line);
+    try expectJumps(&jumps, &.{ 1, 10, 1, 10 }, 1);
+    // An empty list has nowhere to go and records nothing.
+    var empty: Jumps = .{};
+    try testing.expectEqual(@as(?Jump, null), empty.back(at(3), 1));
+    try testing.expectEqual(@as(?Jump, null), empty.forward(1));
+    try expectJumps(&empty, &.{}, 0);
+    // A lone entry on the current line becomes it, then there is nothing older.
+    empty.record(at(3));
+    try testing.expectEqual(@as(?Jump, null), empty.back(at(3), 1));
+    try expectJumps(&empty, &.{3}, 0);
+}
+
+test "a full jump list drops its oldest entry and a closed document's entries go" {
+    var jumps: Jumps = .{};
+    for (0..Jumps.capacity + 5) |line| jumps.record(at(line));
+    try testing.expectEqual(Jumps.capacity, jumps.len);
+    try testing.expectEqual(@as(usize, 5), jumps.items[0].line);
+    try testing.expectEqual(@as(usize, Jumps.capacity + 4), jumps.items[Jumps.capacity - 1].line);
+    const a: Id = @fromBackingInt(@intCast(0));
+    const b: Id = @fromBackingInt(@intCast(1));
+    var mixed: Jumps = .{};
+    for ([_]Id{ a, b, a, b, a }, 0..) |id, line| {
+        mixed.record(.{ .id = id, .line = line, .column = 0 });
+    }
+    // Standing on entry 3 (b), removing a keeps it.
+    _ = mixed.back(.{ .id = b, .line = 9, .column = 0 }, 2);
+    try expectJumps(&mixed, &.{ 0, 1, 2, 3, 4, 9 }, 3);
+    mixed.remove(a);
+    try expectJumps(&mixed, &.{ 1, 3, 9 }, 1);
+    // Removing the entry stood on leaves the next one.
+    mixed.remove(b);
+    try expectJumps(&mixed, &.{}, 0);
+}
+
+test "travelling activates the entry's document and clamps its line and column to the text now" {
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try put(temp.dir, "a", "first\nsecond line\nthird\n");
+    try put(temp.dir, "b", "b\n");
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(testing.allocator);
+    var session: Session = .{};
+    defer session.deinit(testing.allocator);
+    const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    keys(&session, &editor, &status, "j$");
+    session.recordJump(session.current().?.document.buffer.cursor);
+    try testing.expectEqual(Jump{ .id = a, .line = 1, .column = 10 }, session.jumps.items[0]);
+    // The line shrinks to `sé`, its last character two bytes wide.
+    keys(&session, &editor, &status, "0d$isé\x03");
+    const shrunk = session.current().?.document.buffer.bytes();
+    try testing.expectEqualStrings("first\nsé\nthird\n", shrunk);
+    const b = (try session.open(testing.allocator, testing.io, temp.dir, "b")).id;
+    const travelled = session.travel(testing.allocator, testing.io, .older, 1).?;
+    try testing.expectEqual(@as(?Disk.Reload, null), travelled.activation);
+    try testing.expectEqual(a, session.active.?);
+    const buffer = &session.current().?.document.buffer;
+    try testing.expectEqual(@as(usize, 7), buffer.cursor);
+    try testing.expectEqual(@as(motion.Goal, 1), session.current().?.viewport.goal);
+    // Back to b, where Ctrl-O recorded its cursor.
+    _ = session.travel(testing.allocator, testing.io, .newer, 1).?;
+    try testing.expectEqual(b, session.active.?);
+    const past_end = session.travel(testing.allocator, testing.io, .newer, 1);
+    try testing.expectEqual(@as(?Travelled, null), past_end);
+    // An entry past the last line lands on the last line; an empty one on 0.
+    session.jumps = .{};
+    session.jumps.record(.{ .id = a, .line = 7, .column = 3 });
+    _ = session.travel(testing.allocator, testing.io, .older, 1).?;
+    try testing.expectEqual(@as(usize, 13), session.current().?.document.buffer.cursor);
+    keys(&session, &editor, &status, "ggdG");
+    try testing.expectEqualStrings("", session.current().?.document.buffer.bytes());
+    session.jumps = .{};
+    session.jumps.record(.{ .id = a, .line = 1, .column = 4 });
+    _ = session.activate(testing.allocator, testing.io, b);
+    _ = session.travel(testing.allocator, testing.io, .older, 1).?;
+    try testing.expectEqual(@as(usize, 0), session.current().?.document.buffer.cursor);
+}
+
+test "travelling reloads a clean changed target, keeps a dirty one, and skips closed files" {
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try put(temp.dir, "a", "one\ntwo\nthree\n");
+    try put(temp.dir, "b", "bee\n");
+    try put(temp.dir, "c", "sea\n");
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(testing.allocator);
+    var session: Session = .{};
+    defer session.deinit(testing.allocator);
+    const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    keys(&session, &editor, &status, "G");
+    session.recordJump(session.current().?.document.buffer.cursor);
+    const b = (try session.open(testing.allocator, testing.io, temp.dir, "b")).id;
+    keys(&session, &editor, &status, "iB\x03");
+    session.recordJump(session.current().?.document.buffer.cursor);
+    const c = (try session.open(testing.allocator, testing.io, temp.dir, "c")).id;
+    try put(temp.dir, "a", "only\n");
+    try put(temp.dir, "b", "changed\n");
+    // The dirty b keeps its edit.
+    const to_b = session.travel(testing.allocator, testing.io, .older, 1).?;
+    try testing.expectEqual(b, session.active.?);
+    try testing.expect(to_b.activation == null or to_b.activation.? != .reloaded);
+    try testing.expectEqualStrings("Bbee\n", session.current().?.document.buffer.bytes());
+    // The clean a reloads, and its line 2 entry clamps to the one line left.
+    const to_a = session.travel(testing.allocator, testing.io, .older, 1).?;
+    try testing.expectEqual(a, session.active.?);
+    try testing.expect(to_a.activation != null);
+    try testing.expectEqualStrings("only\n", session.current().?.document.buffer.bytes());
+    try testing.expectEqual(@as(usize, 0), session.current().?.document.buffer.cursor);
+    // Closing b drops its entry: forward goes straight to c.
+    _ = try session.close(testing.allocator, testing.io, b, true);
+    _ = session.travel(testing.allocator, testing.io, .newer, 1).?;
+    try testing.expectEqual(c, session.active.?);
 }

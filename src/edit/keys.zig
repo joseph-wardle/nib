@@ -52,11 +52,13 @@ pub const Operation = struct {
     },
 };
 /// Keys the application handles rather than the editor.
-pub const Request = enum {
+pub const Request = union(enum) {
     /// Ctrl-P
     find,
     /// `:`
     command_line,
+    /// Ctrl-O (`older`) or Ctrl-I, which is Tab (`newer`), with its count.
+    travel: struct { direction: enum { older, newer }, count: usize },
 };
 pub const Action = union(enum) {
     move: Movement,
@@ -399,6 +401,10 @@ pub const Parser = struct {
             return null;
         }
         if (byte == 'p' or byte == 'P') return self.put(byte, register, register_count, count);
+        if (byte == 0x0f or byte == '\t') return .{ .request = .{ .travel = .{
+            .direction = if (byte == 0x0f) .older else .newer,
+            .count = count orelse 1,
+        } } };
         // This subset deliberately does not repeat insertions or Ex/undo keys.
         if (count != null) return .invalid;
         switch (byte) {
@@ -1037,4 +1043,29 @@ test "an unknown or read-only register, or a prefix on another command, is refus
         try std.testing.expect(parser.feed(.escape) == null);
         try expectAction(next_word, keys(&parser, "w"));
     }
+}
+
+fn travel(direction: @FieldType(@FieldType(Request, "travel"), "direction"), count: usize) Action {
+    return .{ .request = .{ .travel = .{ .direction = direction, .count = count } } };
+}
+
+test "Ctrl-O and Tab ask to travel the jump list with a count, only from plain normal mode" {
+    var parser: Parser = .{};
+    try expectAction(travel(.older, 1), keys(&parser, "\x0f"));
+    try expectAction(travel(.newer, 1), keys(&parser, "\t"));
+    try expectAction(travel(.older, 12), keys(&parser, "12\x0f"));
+    try expectAction(travel(.newer, 3), keys(&parser, "3\t"));
+    // A register, a pending operator or `g`, or a selection refuses them.
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "\"a\x0f").?);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "d\x0f").?);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "g\t").?);
+    try std.testing.expectEqual(Action.begin_selection, keys(&parser, "v").?);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "\x0f").?);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "2\t").?);
+    try std.testing.expectEqual(@as(?motion.Visual, .characterwise), parser.visual);
+    // Insert mode keeps Tab as text and refuses Ctrl-O.
+    _ = parser.feed(.escape);
+    try std.testing.expectEqual(Action{ .insert = .before }, keys(&parser, "i").?);
+    try std.testing.expectEqual(Action.tab, keys(&parser, "\t").?);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "\x0f").?);
 }
