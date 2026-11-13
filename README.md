@@ -10,7 +10,7 @@ Goals:
 
 ## Status
 
-Very early. Think Vim, but worse in every way. Nib can open a project, find and switch between files, edit UTF-8 text with a core set of Vim motions and operators, search the current file, yank and put with registers (copying to the system clipboard), undo, and save safely while watching for changes on disk. Next come visual mode and repeat, then language-server navigation, formatting and project-wide search.
+Very early. Think Vim, but worse in every way. Nib can open a project, find and switch between files, edit UTF-8 text with a core set of Vim motions and operators, search the current file, select with visual mode, yank and put with registers (copying to the system clipboard), undo, and save safely while watching for changes on disk. Next come repeat and small commands, then language-server navigation, formatting and project-wide search.
 
 ## Try it
 
@@ -21,7 +21,7 @@ zig build
 zig build run -- README.md
 ```
 
-`nib <file>` opens a file; `nib` or `nib <directory>` starts in the file finder. Editing follows Vim (`hjkl`, `w`, `b`, `d`, `c` and `y` with motions, `p`, `i`, `a`, `o`, `u`, `/` and `n` to search, `:w`, `:q`), and Ctrl-P opens the finder.
+`nib <file>` opens a file; `nib` or `nib <directory>` starts in the file finder. Editing follows Vim (`hjkl`, `w`, `b`, `d`, `c` and `y` with motions, `p`, `v` and `V` to select, `i`, `a`, `o`, `u`, `/` and `n` to search, `:w`, `:q`), and Ctrl-P opens the finder.
 
 ## Development
 

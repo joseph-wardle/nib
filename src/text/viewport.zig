@@ -146,6 +146,69 @@ pub const Highlights = struct {
     }
 };
 
+/// The visible part of a selected span of one line, as `renderText` places
+/// that line from display column `left` in `columns` cells: the cells of
+/// `text[start..end]`, and one blank cell after them when the selection
+/// takes the line's break. The span runs between character boundaries.
+/// Borrows `text`.
+pub const Span = struct {
+    /// The first visible cell, relative to `left`.
+    cell: usize,
+    /// The line up to the span's end, and the display columns of it drawn.
+    text: []const u8,
+    first: usize,
+    cells: usize,
+    line_break: bool,
+
+    /// Null when no cell of the span is visible. `text` excludes the line
+    /// break. Scans it from the start to the span's end or the right edge,
+    /// as rendering the row does.
+    pub fn init(
+        text: []const u8,
+        start: usize,
+        end: usize,
+        line_break: bool,
+        left: usize,
+        columns: usize,
+    ) ?Span {
+        const right = left +| columns;
+        var column: usize = 0;
+        var position: usize = 0;
+        var start_column: usize = 0;
+        // Past the right edge nothing more is visible.
+        while (position < end and column < right) {
+            if (position == start) start_column = column;
+            const character = char.decode(text, position);
+            column += char.cells(character.code, column);
+            position += character.len;
+        }
+        if (position <= start) start_column = column;
+        const first = @max(start_column, left);
+        const last = @min(column + @intFromBool(line_break), right);
+        if (first >= last) return null;
+        const text_last = @min(column, last);
+        return .{
+            .cell = first - left,
+            .text = text[0..end],
+            .first = first,
+            .cells = text_last -| first,
+            .line_break = last > column,
+        };
+    }
+
+    /// Draws the span's cells into `output`, which holds at least
+    /// `3 * columns` bytes. Returns the bytes used.
+    pub fn render(self: Span, output: []u8) usize {
+        var used: usize = 0;
+        if (self.cells != 0) used = renderText(self.text, self.first, self.cells, output);
+        if (self.line_break) {
+            output[used] = ' ';
+            used += 1;
+        }
+        return used;
+    }
+};
+
 test "rendering clips inside tabs and pads short rows" {
     var text = try Buffer.fromBytes(std.testing.allocator, "a\tb\tc\nshort\n");
     defer text.deinit(std.testing.allocator);
@@ -411,4 +474,37 @@ fn expectText(expected: []const u8, text: []const u8, left: usize, columns: usiz
     var storage: [3 * 64]u8 = undefined;
     const used = renderText(text, left, columns, &storage);
     try std.testing.expectEqualStrings(expected, storage[0..used]);
+}
+
+test "a selected span draws its cells as the row does, and one cell for a line break" {
+    // a, tab to 8, 材 at 8-9, b at 10.
+    const text = "a\t\u{6750}b";
+    var storage: [64]u8 = undefined;
+    // Start, end, line break, left, columns; the first visible cell and what
+    // is drawn there.
+    const Case = struct { usize, usize, bool, usize, usize, usize, []const u8 };
+    const cases = [_]Case{
+        .{ 1, 5, false, 0, 20, 1, "       \u{6750}" },
+        .{ 0, 6, true, 0, 20, 0, "a       \u{6750}b " },
+        // Scrolled into the tab, and into the wide character, as the row is.
+        .{ 0, 6, false, 5, 20, 0, "   \u{6750}b" },
+        .{ 2, 6, true, 9, 20, 0, " b " },
+        // Clipped on the right, the line break is out of view.
+        .{ 2, 6, true, 0, 11, 8, "\u{6750}b" },
+        // Only the line break is visible, or selected.
+        .{ 0, 6, true, 11, 4, 0, " " },
+        .{ 6, 6, true, 0, 20, 11, " " },
+    };
+    for (cases) |case| {
+        const span = Span.init(text, case[0], case[1], case[2], case[3], case[4]).?;
+        try std.testing.expectEqual(case[5], span.cell);
+        try std.testing.expectEqualStrings(case[6], storage[0..span.render(&storage)]);
+    }
+    // Nothing visible: left of the view, right of it, or an empty span.
+    try std.testing.expect(Span.init(text, 0, 1, false, 4, 10) == null);
+    try std.testing.expect(Span.init(text, 5, 6, true, 0, 10) == null);
+    try std.testing.expect(Span.init(text, 6, 6, false, 0, 20) == null);
+    try std.testing.expect(Span.init("", 0, 0, true, 0, 0) == null);
+    const blank = Span.init("", 0, 0, true, 0, 1).?;
+    try std.testing.expectEqualStrings(" ", storage[0..blank.render(&storage)]);
 }

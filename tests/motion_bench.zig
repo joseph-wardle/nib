@@ -6,13 +6,15 @@ const motion = nib.motion;
 const search = nib.search;
 const Viewport = nib.viewport.Viewport;
 const Highlights = nib.viewport.Highlights;
+const Span = nib.viewport.Span;
 
 // Per-key motion work as the event loop does it, without a terminal: resolve
 // the motion, move the cursor, follow it, place the terminal cursor and compute
 // the status column. Each sample starts from the same cursor, 90% of the way
 // along the middle line, where column scans are longest. Rendering and output
 // are not timed with the motions; a separate sample renders every content row
-// once the view follows the cursor. Search samples time one incremental query
+// once the view follows the cursor, and again with every row selected by `V`
+// redrawn over it, as the editor view does. Search samples time one incremental query
 // change, for a query that is found and one that is not, and again on an
 // 8 MiB file with no match. Output is not written. No timing threshold is a
 // test.
@@ -94,6 +96,31 @@ pub fn main(init: std.process.Init) !void {
                 elapsed.* = before.durationTo(after).toNanoseconds();
             }
             summary("render 50x200", &times);
+            const selected = motion.visualRange(&buffer, 0, text.len - 1, .linewise, null).range;
+            for (&times) |*elapsed| {
+                const before = std.Io.Timestamp.now(init.io, .awake);
+                for (0..rows) |content| {
+                    const used = viewport.renderRow(&buffer, content, columns, &output);
+                    std.mem.doNotOptimizeAway(output[0..used]);
+                }
+                const last = @min(buffer.lineCount(), viewport.top + rows);
+                for (viewport.top..last) |number| {
+                    const line_start = buffer.lineStart(number);
+                    const line_end = buffer.contentEnd(number);
+                    const span = Span.init(
+                        buffer.line(number),
+                        @max(selected.start, line_start) - line_start,
+                        @min(selected.end, line_end) - line_start,
+                        selected.end > line_end,
+                        viewport.left,
+                        columns,
+                    ) orelse continue;
+                    std.mem.doNotOptimizeAway(output[0..span.render(&output)]);
+                }
+                const after = std.Io.Timestamp.now(init.io, .awake);
+                elapsed.* = before.durationTo(after).toNanoseconds();
+            }
+            summary("render 50x200, all selected", &times);
             for ([_][]const u8{ line.found, line.missing }) |query| {
                 incremental(init.io, &buffer, origin, query);
             }

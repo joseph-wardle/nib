@@ -13,6 +13,8 @@ pub const Result = struct { destination: usize, shape: Shape, goal: Goal };
 /// `copied` is what a register receives. It differs from `range` only when a
 /// linewise delete at EOF also takes the preceding terminator.
 pub const Selection = struct { range: Range, copied: Range, linewise: bool };
+/// A visual selection's kind: `v` selects characters, `V` whole lines.
+pub const Visual = enum { characterwise, linewise };
 
 /// Display cells from the line start to a character boundary `offset`.
 pub fn column(buffer: *const Buffer, offset: usize) usize {
@@ -235,7 +237,7 @@ pub fn operatorRange(
     result: Result,
     operator: Operator,
 ) Selection {
-    var low = @min(origin, result.destination);
+    const low = @min(origin, result.destination);
     var high = @max(origin, result.destination);
     var shape = result.shape;
     const low_row = buffer.rowAt(low);
@@ -255,21 +257,49 @@ pub fn operatorRange(
         const after = @min(content_end, high + @intFromBool(shape == .inclusive and high < content_end));
         if (std.mem.trim(u8, buffer.bytes()[after..content_end], " \t").len == 0) shape = .linewise;
     }
-    if (shape == .linewise) {
-        low = buffer.lineStart(low_row);
-        high = buffer.lineRange(high_row).end;
-        const copied: Range = .{ .start = low, .end = high };
-        const unterminated = high == 0 or buffer.bytes()[high - 1] != '\n';
-        const final = high == buffer.bytes().len and high_row == buffer.lineCount() - 1;
-        if (operator == .delete and final and low != 0 and unterminated)
-            low = previous(buffer, low);
-        return .{ .range = .{ .start = low, .end = high }, .copied = copied, .linewise = true };
-    }
+    if (shape == .linewise) return lines(buffer, low_row, high_row, operator);
     if (shape == .inclusive and high < buffer.contentEnd(high_row)) {
         high = next(buffer, high);
     }
     const range: Range = .{ .start = low, .end = high };
     return .{ .range = range, .copied = range, .linewise = false };
+}
+
+/// The byte selection of a visual selection between `anchor` and `cursor`,
+/// both normal-mode offsets, for `operator`, or for drawing when null. A
+/// characterwise selection includes both ends; an end on an empty line
+/// selects its line break, CRLF as a unit. None of the motion rules of
+/// `operatorRange` apply.
+pub fn visualRange(
+    buffer: *const Buffer,
+    anchor: usize,
+    cursor: usize,
+    kind: Visual,
+    operator: ?Operator,
+) Selection {
+    const low = @min(anchor, cursor);
+    const high = @max(anchor, cursor);
+    switch (kind) {
+        .linewise => return lines(buffer, buffer.rowAt(low), buffer.rowAt(high), operator),
+        .characterwise => {
+            const range: Range = .{ .start = low, .end = next(buffer, high) };
+            return .{ .range = range, .copied = range, .linewise = false };
+        },
+    }
+}
+
+/// Rows `low_row` to `high_row` with their terminators. A delete reaching
+/// an unterminated last line also takes the preceding terminator, so no
+/// empty line is left behind.
+fn lines(buffer: *const Buffer, low_row: usize, high_row: usize, operator: ?Operator) Selection {
+    var low = buffer.lineStart(low_row);
+    const high = buffer.lineRange(high_row).end;
+    const copied: Range = .{ .start = low, .end = high };
+    const unterminated = high == 0 or buffer.bytes()[high - 1] != '\n';
+    const final = high == buffer.bytes().len and high_row == buffer.lineCount() - 1;
+    if (operator == .delete and final and low != 0 and unterminated)
+        low = previous(buffer, low);
+    return .{ .range = .{ .start = low, .end = high }, .copied = copied, .linewise = true };
 }
 
 const expect = std.testing.expectEqual;
@@ -531,4 +561,45 @@ test "read-only invalid bytes step and occupy one cell each" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 4, 5 }, &destinations);
     try expect(@as(usize, 4), column(&buffer, 5));
     try expect(@as(usize, 5), resolve(&buffer, 0, .end, null, null).?.destination);
+}
+
+test "a visual selection includes both ends, or whole lines, whichever end leads" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "ab\r\n\r\nc\u{20ac}\nlast");
+    defer buffer.deinit(std.testing.allocator);
+    const Case = struct { anchor: usize, cursor: usize, kind: Visual, start: usize, end: usize };
+    const cases = [_]Case{
+        // The last character's line break stays unselected.
+        .{ .anchor = 0, .cursor = 1, .kind = .characterwise, .start = 0, .end = 2 },
+        .{ .anchor = 1, .cursor = 0, .kind = .characterwise, .start = 0, .end = 2 },
+        // An empty line's character is its line break, CRLF as one.
+        .{ .anchor = 4, .cursor = 4, .kind = .characterwise, .start = 4, .end = 6 },
+        .{ .anchor = 1, .cursor = 4, .kind = .characterwise, .start = 1, .end = 6 },
+        // A multi-byte last character is taken whole.
+        .{ .anchor = 6, .cursor = 7, .kind = .characterwise, .start = 6, .end = 10 },
+        .{ .anchor = 7, .cursor = 1, .kind = .linewise, .start = 0, .end = 11 },
+        .{ .anchor = 4, .cursor = 4, .kind = .linewise, .start = 4, .end = 6 },
+    };
+    for (cases) |case| {
+        for ([_]?Operator{ null, .delete, .change, .yank }) |operator| {
+            const selected = visualRange(&buffer, case.anchor, case.cursor, case.kind, operator);
+            const expected: Range = .{ .start = case.start, .end = case.end };
+            try expect(expected, selected.range);
+            try expect(expected, selected.copied);
+            try expect(case.kind == .linewise, selected.linewise);
+        }
+    }
+}
+
+test "a visual line delete of an unterminated last line takes the terminator before it" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "one\r\ntwo");
+    defer buffer.deinit(std.testing.allocator);
+    const deleted = visualRange(&buffer, 5, 6, .linewise, .delete);
+    try expect(Range{ .start = 3, .end = 8 }, deleted.range);
+    try expect(Range{ .start = 5, .end = 8 }, deleted.copied);
+    for ([_]?Operator{ null, .change, .yank }) |operator| {
+        const selected = visualRange(&buffer, 5, 6, .linewise, operator);
+        try expect(Range{ .start = 5, .end = 8 }, selected.range);
+    }
+    // The whole file leaves nothing before it to take.
+    try expect(Range{ .start = 0, .end = 8 }, visualRange(&buffer, 0, 7, .linewise, .delete).range);
 }

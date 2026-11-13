@@ -717,6 +717,51 @@ test "the search prompt and its matches are drawn until Escape in normal mode hi
     try testing.expect(std.mem.endsWith(u8, long, "\x1b[4;10H\x1b[?25h"));
 }
 
+test "a selection is drawn with its label instead of search matches until Escape" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "ab x\nab\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .terminal = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 4, .columns = 21 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
+    var frame: Frame = .{ .screen = undefined };
+    for ("/ab\rlv") |byte| app.editorEvent(.{ .key = byte });
+    try app.compose(&frame);
+    const characters = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.indexOf(u8, characters, "\x1b[7mVISUAL | 2:2 | ") != null);
+    const character = "\x1b[2;2H\x1b[7mb\x1b[27m";
+    try testing.expect(std.mem.endsWith(u8, characters, character ++ "\x1b[2;2H\x1b[?25h"));
+    // Lines, each with its line break cell; the matches stay hidden.
+    for ("Vk") |byte| app.editorEvent(.{ .key = byte });
+    frame.len = 0;
+    try app.compose(&frame);
+    const lines = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.indexOf(u8, lines, "\x1b[7mVISUAL LINE | 1:2 | ") != null);
+    const selected = "\x1b[1;1H\x1b[7mab x \x1b[27m\x1b[2;1H\x1b[7mab \x1b[27m";
+    try testing.expect(std.mem.endsWith(u8, lines, selected ++ "\x1b[1;2H\x1b[?25h"));
+    // Escape ends the selection and the matches return.
+    app.editorEvent(.escape);
+    frame.len = 0;
+    try app.compose(&frame);
+    const matches = "\x1b[1;1H\x1b[7mab\x1b[27m\x1b[2;1H\x1b[7mab\x1b[27m";
+    const ended = frame.bytes[0..frame.len];
+    try testing.expect(std.mem.endsWith(u8, ended, matches ++ "\x1b[1;2H\x1b[?25h"));
+    try testing.expect(std.mem.indexOf(u8, ended, "NORMAL | 1:2") != null);
+}
+
 test "closing names the closed file and the next file when activating it reloads" {
     const testing = std.testing;
     var temp = testing.tmpDir(.{});
@@ -1022,6 +1067,8 @@ test "a clean file changed on disk reloads only after every pending state ends" 
         .{ .keys = "d", .close = "\x03" }, // operator
         .{ .keys = "i", .close = "\x03" }, // insert
         .{ .keys = "/x", .close = "\x03" }, // search prompt
+        .{ .keys = "v", .close = "\x03" }, // selection
+        .{ .keys = "Vl/x\x03", .close = "\x03" }, // selection after its prompt
         .{ .keys = ":q", .close = "\x03" }, // command line
         .{ .keys = "\x1b[200~x", .close = "\x1b[201~" }, // paste, ignored in normal mode
     };
