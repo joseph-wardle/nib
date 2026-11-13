@@ -200,6 +200,12 @@ pub const Session = struct {
         self.jumps.record(self.place(cursor));
     }
 
+    /// The active document's cursor as a jump entry, if one is active.
+    pub fn here(self: *const Session) ?Jump {
+        const entry = self.current() orelse return null;
+        return self.place(entry.document.buffer.cursor);
+    }
+
     /// Ctrl-O or Ctrl-I: activates the entry `count` away, which may reload
     /// it as `activate` does, then puts the cursor on the entry's line and
     /// column, clamped to the text as it is now. Null, changing nothing, when
@@ -212,7 +218,7 @@ pub const Session = struct {
         count: usize,
     ) ?Travelled {
         const target = switch (direction) {
-            .older => self.jumps.back(self.place(self.current().?.document.buffer.cursor), count),
+            .older => self.jumps.back(self.here().?, count),
             .newer => self.jumps.forward(count),
         } orelse return null;
         const activation = self.activate(allocator, io, target.id);

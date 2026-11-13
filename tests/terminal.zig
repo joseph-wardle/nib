@@ -73,6 +73,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "stalledOutputSuspend", stalledOutputSuspend },
         .{ "finderSwitching", finderSwitching },
         .{ "finderSafety", finderSafety },
+        .{ "jumpWorkflow", jumpWorkflow },
         .{ "finderQuit", finderQuit },
     };
     inline for (checks) |check| {
@@ -1772,6 +1773,58 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.restored();
     var alpha: [192]u8 = undefined;
     try expectFile(try project.path(&alpha, "alpha.txt"), "alpha one\nalpha two\n");
+}
+
+// Covers Ctrl-O and Tab retracing G and a finder switch across two files,
+// naming the file after each move, and the notice at the newest end.
+fn jumpWorkflow(executable: [:0]const u8) !void {
+    var base: [128]u8 = undefined;
+    const project = try Project.create(&base, "jumps");
+    defer project.remove();
+    var beta: [192]u8 = undefined;
+    try putFile(try project.path(&beta, "beta.txt"), "beta one\nbeta two\nbeta three\n");
+    var alpha: [192]u8 = undefined;
+    var process = try Process.start(executable, .{ .path = try project.path(&alpha, "alpha.txt") });
+    defer process.close();
+    try process.until("alpha one");
+    try process.ready();
+    try process.send("G");
+    try process.until("NORMAL | 2:1 | ");
+    try process.ready();
+    try process.send("\x10");
+    try settled(&process, "7/7 files", "");
+    try process.ready();
+    try process.send("beta");
+    try settled(&process, "1/7 files", "beta");
+    try process.ready();
+    try process.send("\r");
+    try landed(&process, "1:1", "beta.txt");
+    try process.send("G");
+    try landed(&process, "3:1", "beta.txt");
+    try process.send("\x0f");
+    try landed(&process, "1:1", "beta.txt");
+    try process.send("\x0f");
+    try landed(&process, "2:1", "alpha.txt");
+    try process.send("\t");
+    try landed(&process, "1:1", "beta.txt");
+    try process.send("\t");
+    try landed(&process, "3:1", "beta.txt");
+    try process.send("\t");
+    try process.until("No newer jump");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+}
+
+/// Waits for a normal-mode status row at `position` in a file whose path
+/// ends with `name`.
+fn landed(process: *Process, position: []const u8, name: []const u8) !void {
+    var marker: [64]u8 = undefined;
+    try process.until(try std.fmt.bufPrint(&marker, "NORMAL | {s} | ", .{position}));
+    try process.until(try std.fmt.bufPrint(&marker, "/{s} | Ctrl-P files", .{name}));
+    try process.ready();
 }
 
 // Covers aliases, special-file previews and refusals, refresh, resize and

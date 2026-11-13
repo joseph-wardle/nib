@@ -199,6 +199,7 @@ const App = struct {
             &self.status,
             event,
         );
+        if (self.editor.departure) |cursor| self.documents.recordJump(cursor);
         switch (request orelse return) {
             .find => {
                 self.browsing = false;
@@ -360,6 +361,11 @@ const App = struct {
     fn choose(self: *App) void {
         std.debug.assert(self.editor.idle());
         const choice = self.finder.choice() orelse return;
+        // Recorded only once another document is active.
+        const departure = self.documents.here();
+        defer if (departure) |jump| if (self.documents.active.? != jump.id) {
+            self.documents.jumps.record(jump);
+        };
         switch (choice) {
             .document => |listed| {
                 const id: session.Id = @fromBackingInt(@backingInt(listed));
@@ -1265,4 +1271,53 @@ test "Ctrl-O and Tab say when there is no jump and name a file they reload" {
     app.editorEvent(.{ .key = '\t' });
     try testing.expectEqual(b, app.documents.active.?);
     try testing.expectEqualStrings("", app.status.text());
+}
+
+test "G and switching files in the finder record jumps that Ctrl-O and Tab retrace" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "alpha\n" });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "beta\nbeta two\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .terminal = undefined,
+        .background = &background,
+        .finder = &finder,
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    const a = (try app.documents.open(testing.allocator, testing.io, temp.dir, "a")).id;
+    const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
+    const jumps = &app.documents.jumps;
+    app.editorEvent(.{ .key = 'G' });
+    try testing.expectEqual(@as(usize, 1), jumps.len);
+    // Choosing the document already shown is no switch.
+    app.find(.open);
+    try testing.expectEqual(b, chosen(&finder));
+    app.choose();
+    try testing.expectEqual(@as(usize, 1), jumps.len);
+    app.find(.open);
+    app.move(1);
+    app.choose();
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(session.Jump{ .id = b, .line = 1, .column = 0 }, jumps.items[1]);
+    app.editorEvent(.{ .key = 0x0f });
+    try testing.expectEqual(b, app.documents.active.?);
+    try testing.expectEqual(@as(usize, 5), app.documents.current().?.document.buffer.cursor);
+    app.editorEvent(.{ .key = 0x0f });
+    try testing.expectEqual(@as(usize, 0), app.documents.current().?.document.buffer.cursor);
+    app.editorEvent(.{ .key = 0x0f });
+    try testing.expectEqualStrings("No older jump", app.status.text());
+    // Forward to b's last line, then to a, where the first Ctrl-O left.
+    app.editorEvent(.{ .key = '2' });
+    app.editorEvent(.{ .key = '\t' });
+    try testing.expectEqual(a, app.documents.active.?);
+    app.editorEvent(.{ .key = '\t' });
+    try testing.expectEqualStrings("No newer jump", app.status.text());
 }

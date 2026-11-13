@@ -87,6 +87,9 @@ pub const Editor = struct {
     /// The unnamed register changed and fits the clipboard, so the next frame
     /// sends it. Whoever draws clears this once that frame was written whole.
     clipboard: bool = false,
+    /// Where the cursor was when this feed's `G`, `gg` or search took it to
+    /// another line, for the caller to record as a jump. Operators set none.
+    departure: ?usize = null,
 
     const Origin = struct { cursor: usize, viewport: Viewport };
     /// What an operator acts on, where a yank of it leaves the cursor when
@@ -162,6 +165,7 @@ pub const Editor = struct {
         event: input.Event,
     ) ?keys.Request {
         const goal = &viewport.goal;
+        self.departure = null;
         if (event == .escape or (event == .key and event.key == 3)) {
             status.clear();
             // Escape that ends a selection or a prompt keeps the matches.
@@ -205,6 +209,7 @@ pub const Editor = struct {
                 goal.* = motion.screenColumn(buffer, buffer.cursor, false);
             },
             .jump => |movement| if (self.find(buffer, status, movement)) |destination| {
+                self.depart(buffer, destination);
                 buffer.cursor = destination;
                 goal.* = motion.screenColumn(buffer, destination, false);
             },
@@ -239,6 +244,8 @@ pub const Editor = struct {
                     movement.count,
                     null,
                 )) |result| {
+                    const jumped = movement.motion == .first_line or movement.motion == .last_line;
+                    if (jumped) self.depart(buffer, result.destination);
                     buffer.cursor = result.destination;
                     goal.* = result.goal;
                 }
@@ -562,6 +569,13 @@ pub const Editor = struct {
             buffer.endCommand();
         }
         goal.* = motion.screenColumn(buffer, buffer.cursor, changing);
+    }
+
+    /// Notes the cursor as the departure of a jump to `destination`, unless
+    /// the jump stays on the cursor's line.
+    fn depart(self: *Editor, buffer: *const Buffer, destination: usize) void {
+        if (buffer.rowAt(destination) == buffer.rowAt(buffer.cursor)) return;
+        self.departure = buffer.cursor;
     }
 
     /// The match a search motion reaches from the cursor, recording a typed
@@ -2373,4 +2387,63 @@ test "the clipboard takes unnamed writes up to 1 MiB and refuses larger ones wit
     try std.testing.expect(!editor.clipboard);
     try std.testing.expectEqualStrings("Not copied to the clipboard: over 1 MiB", status.text());
     try std.testing.expectEqualStrings("", buffer.bytes());
+}
+
+test "G, gg and searches note where they left, unless they stay on the line or only operate" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "one\ntwo\nthree\nfour\n");
+    defer buffer.deinit(allocator);
+    var editor: Editor = .{};
+    var status: Status = .{};
+    defer editor.deinit(allocator);
+    var viewport: Viewport = .{ .goal = null };
+    const expectDeparture = struct {
+        fn check(from: *const Editor, expected: ?usize) !void {
+            try std.testing.expectEqual(expected, from.departure);
+        }
+    }.check;
+    buffer.cursor = 1;
+    type_(&editor, &status, &buffer, &viewport, "G");
+    try expectDeparture(&editor, 1);
+    try std.testing.expectEqual(@as(usize, 14), buffer.cursor);
+    // Each feed starts without one, and a plain motion notes none.
+    type_(&editor, &status, &buffer, &viewport, "k");
+    try expectDeparture(&editor, null);
+    type_(&editor, &status, &buffer, &viewport, "gg");
+    try expectDeparture(&editor, 8);
+    // Landing on the same line is no jump.
+    type_(&editor, &status, &buffer, &viewport, "1G");
+    try expectDeparture(&editor, null);
+    // Previews note nothing; Enter notes the prompt's origin.
+    type_(&editor, &status, &buffer, &viewport, "/thr");
+    try std.testing.expectEqual(@as(usize, 8), buffer.cursor);
+    try expectDeparture(&editor, null);
+    type_(&editor, &status, &buffer, &viewport, "\r");
+    try expectDeparture(&editor, 0);
+    // A search that wraps back to the cursor's match, or finds nothing.
+    type_(&editor, &status, &buffer, &viewport, "n");
+    try std.testing.expectEqualStrings("Search wrapped to top", status.text());
+    try expectDeparture(&editor, null);
+    type_(&editor, &status, &buffer, &viewport, "/zz\r");
+    try expectDeparture(&editor, null);
+    type_(&editor, &status, &buffer, &viewport, "/one");
+    escape(&editor, &status, &buffer, &viewport);
+    try expectDeparture(&editor, null);
+    try std.testing.expectEqual(@as(usize, 8), buffer.cursor);
+    type_(&editor, &status, &buffer, &viewport, "?o\rN");
+    try expectDeparture(&editor, 6);
+    try std.testing.expectEqual(@as(usize, 15), buffer.cursor);
+    type_(&editor, &status, &buffer, &viewport, "gg");
+    // Operators move the cursor or the text, never noting a jump.
+    for ([_][]const u8{ "yG", "y/fo\r", "dgg" }) |operation| {
+        type_(&editor, &status, &buffer, &viewport, operation);
+        try expectDeparture(&editor, null);
+    }
+    try std.testing.expectEqualStrings("two\nthree\nfour\n", buffer.bytes());
+    // Selecting jumps as normal mode does.
+    type_(&editor, &status, &buffer, &viewport, "vG");
+    try expectDeparture(&editor, 0);
+    type_(&editor, &status, &buffer, &viewport, "?two\r");
+    try expectDeparture(&editor, 10);
+    try std.testing.expect(editor.selection(&buffer) != null);
 }
