@@ -195,9 +195,19 @@ pub const Session = struct {
         return entry.disk.automatic(allocator, io, &entry.document, &entry.viewport.goal);
     }
 
-    /// Records the active document's `cursor` as a place jumped from.
-    pub fn recordJump(self: *Session, cursor: usize) void {
-        self.jumps.record(self.place(cursor));
+    /// Records `departure` as a place jumped from; every jump source records
+    /// through here.
+    pub fn recordJump(self: *Session, departure: Jump) void {
+        self.jumps.record(departure);
+    }
+
+    /// The active document's `cursor` as a jump entry. Requires an active
+    /// document.
+    pub fn place(self: *const Session, cursor: usize) Jump {
+        const entry = self.current().?;
+        const buffer = &entry.document.buffer;
+        const line = @min(buffer.rowAt(cursor), buffer.lineCount() - 1);
+        return .{ .id = entry.id, .line = line, .column = cursor - buffer.lineStart(line) };
     }
 
     /// The active document's cursor as a jump entry, if one is active.
@@ -229,13 +239,6 @@ pub const Session = struct {
         buffer.cursor = motion.normal(buffer, offset);
         entry.viewport.goal = motion.screenColumn(buffer, buffer.cursor, false);
         return .{ .activation = activation };
-    }
-
-    fn place(self: *const Session, cursor: usize) Jump {
-        const entry = self.current().?;
-        const buffer = &entry.document.buffer;
-        const line = @min(buffer.rowAt(cursor), buffer.lineCount() - 1);
-        return .{ .id = entry.id, .line = line, .column = cursor - buffer.lineStart(line) };
     }
 
     /// Refuses unsaved edits unless `discard`. Closing the active document
@@ -716,7 +719,7 @@ test "travelling activates the entry's document and clamps its line and column t
     defer session.deinit(testing.allocator);
     const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
     keys(&session, &editor, &status, "j$");
-    session.recordJump(session.current().?.document.buffer.cursor);
+    session.recordJump(session.here().?);
     try testing.expectEqual(Jump{ .id = a, .line = 1, .column = 10 }, session.jumps.items[0]);
     // The line shrinks to `sé`, its last character two bytes wide.
     keys(&session, &editor, &status, "0d$isé\x03");
@@ -736,13 +739,13 @@ test "travelling activates the entry's document and clamps its line and column t
     try testing.expectEqual(@as(?Travelled, null), past_end);
     // An entry past the last line lands on the last line; an empty one on 0.
     session.jumps = .{};
-    session.jumps.record(.{ .id = a, .line = 7, .column = 3 });
+    session.recordJump(.{ .id = a, .line = 7, .column = 3 });
     _ = session.travel(testing.allocator, testing.io, .older, 1).?;
     try testing.expectEqual(@as(usize, 13), session.current().?.document.buffer.cursor);
     keys(&session, &editor, &status, "ggdG");
     try testing.expectEqualStrings("", session.current().?.document.buffer.bytes());
     session.jumps = .{};
-    session.jumps.record(.{ .id = a, .line = 1, .column = 4 });
+    session.recordJump(.{ .id = a, .line = 1, .column = 4 });
     _ = session.activate(testing.allocator, testing.io, b);
     _ = session.travel(testing.allocator, testing.io, .older, 1).?;
     try testing.expectEqual(@as(usize, 0), session.current().?.document.buffer.cursor);
@@ -761,10 +764,10 @@ test "travelling reloads a clean changed target, keeps a dirty one, and skips cl
     defer session.deinit(testing.allocator);
     const a = (try session.open(testing.allocator, testing.io, temp.dir, "a")).id;
     keys(&session, &editor, &status, "G");
-    session.recordJump(session.current().?.document.buffer.cursor);
+    session.recordJump(session.here().?);
     const b = (try session.open(testing.allocator, testing.io, temp.dir, "b")).id;
     keys(&session, &editor, &status, "iB\x03");
-    session.recordJump(session.current().?.document.buffer.cursor);
+    session.recordJump(session.here().?);
     const c = (try session.open(testing.allocator, testing.io, temp.dir, "c")).id;
     try put(temp.dir, "a", "only\n");
     try put(temp.dir, "b", "changed\n");

@@ -199,7 +199,9 @@ const App = struct {
             &self.status,
             event,
         );
-        if (self.editor.departure) |cursor| self.documents.recordJump(cursor);
+        if (self.editor.departure) |cursor| {
+            self.documents.recordJump(self.documents.place(cursor));
+        }
         switch (request orelse return) {
             .find => {
                 self.browsing = false;
@@ -364,7 +366,7 @@ const App = struct {
         // Recorded only once another document is active.
         const departure = self.documents.here();
         defer if (departure) |jump| if (self.documents.active.? != jump.id) {
-            self.documents.jumps.record(jump);
+            self.documents.recordJump(jump);
         };
         switch (choice) {
             .document => |listed| {
@@ -1258,7 +1260,7 @@ test "Ctrl-O and Tab say when there is no jump and name a file they reload" {
     try testing.expectEqualStrings("No older jump", app.status.text());
     app.editorEvent(.{ .key = '\t' });
     try testing.expectEqualStrings("No newer jump", app.status.text());
-    app.documents.recordJump(0);
+    app.documents.recordJump(app.documents.place(0));
     const b = (try app.documents.open(testing.allocator, testing.io, temp.dir, "b")).id;
     try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "changed\n" });
     app.editorEvent(.{ .key = '2' });
