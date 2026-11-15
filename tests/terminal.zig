@@ -12,6 +12,11 @@ const leave = "\x1b\\\x1b[0m\x1b[?2004r\x1b[?1049l\x1b[?25r";
 const prompt = "NIBTEST> ";
 // Borrows main's path buffer for the lifetime of all checks.
 var fixture: [:0]const u8 = undefined;
+// The harness's own `PATH`, as a `PATH=` entry every child inherits: Nib finds
+// Git through it. Borrows main's buffer for the lifetime of all checks.
+var search_path: [:0]const u8 = undefined;
+// Absolute paths, found on `search_path` before any check runs.
+var helpers: struct { git: [:0]const u8, zsh: [:0]const u8, rm: [:0]const u8 } = undefined;
 
 // Keep startup single-threaded: child setup after fork must not inherit runtime
 // worker threads or allocator locks. The harness uses fixed owned buffers.
@@ -28,6 +33,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const rest = executable_buffer[cwd.len..];
         const suffix = try std.fmt.bufPrintSentinel(rest, "/{s}", .{named}, 0);
         break :executable executable_buffer[0 .. cwd.len + suffix.len :0];
+    };
+    const directories = init.environ.getPosix("PATH") orelse {
+        std.debug.print("terminal checks need PATH to find git, zsh and rm\n", .{});
+        return error.MissingPath;
+    };
+    var search_path_buffer: [8192]u8 = undefined;
+    search_path = try std.fmt.bufPrintSentinel(&search_path_buffer, "PATH={s}", .{directories}, 0);
+    var helper_buffers: [3][4096]u8 = undefined;
+    helpers = .{
+        .git = try find(&helper_buffers[0], directories, "git"),
+        .zsh = try find(&helper_buffers[1], directories, "zsh"),
+        .rm = try find(&helper_buffers[2], directories, "rm"),
     };
     var directory_buffer: [128]u8 = undefined;
     const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/nib-viewer-{d}", .{linux.getpid()}, 0);
@@ -92,6 +109,25 @@ fn checked(result: usize) !usize {
         return error.SystemCallFailed;
     }
     return result;
+}
+
+/// The first executable `name` in the colon-separated `directories`, written
+/// into `buffer`.
+fn find(buffer: []u8, directories: []const u8, name: []const u8) ![:0]const u8 {
+    var entries = std.mem.splitScalar(u8, directories, ':');
+    while (entries.next()) |directory| {
+        if (directory.len == 0) continue;
+        const parts = .{ directory, name };
+        const candidate = std.fmt.bufPrintSentinel(buffer, "{s}/{s}", parts, 0) catch continue;
+        if (posix.errno(linux.access(candidate, linux.X_OK)) == .SUCCESS) return candidate;
+    }
+    std.debug.print("terminal checks need {s} on PATH\n", .{name});
+    return error.MissingHelper;
+}
+
+/// Sleeps about 10 ms; waking early only shortens one turn of a deadline loop.
+fn pause() void {
+    _ = linux.nanosleep(&.{ .sec = 0, .nsec = 10 * std.time.ns_per_ms }, null);
 }
 
 fn now() !i64 {
@@ -181,10 +217,11 @@ const Process = struct {
             const limit: linux.rlimit = .{ .cur = 3, .max = 3 };
             _ = try checked(linux.setrlimit(.NOFILE, &limit));
         }
-        const env = [_:null]?[*:0]const u8{ "PS1=" ++ prompt, "PATH=/usr/bin:/bin", "TERM=xterm-256color" };
+        const env = [_:null]?[*:0]const u8{ "PS1=" ++ prompt, search_path, "TERM=xterm-256color" };
         const argv = [_:null]?[*:0]const u8{ executable.ptr, if (options.missing_argument) null else (options.path orelse fixture).ptr, if (options.extra_argument) "extra" else null };
-        const shell_argv = [_:null]?[*:0]const u8{ "/bin/zsh", "-dfi" };
-        _ = try checked(linux.execve(if (options.shell) "/bin/zsh" else executable.ptr, if (options.shell) &shell_argv else &argv, &env));
+        const shell_argv = [_:null]?[*:0]const u8{ helpers.zsh, "-dfi" };
+        const program = if (options.shell) helpers.zsh else executable;
+        _ = try checked(linux.execve(program, if (options.shell) &shell_argv else &argv, &env));
     }
 
     fn close(self: *Process) void {
@@ -272,7 +309,7 @@ const Process = struct {
                 if (linux.W.IFEXITED(status)) return linux.W.EXITSTATUS(status);
                 return error.ChildKilled;
             }
-            _ = try checked(linux.poll(&.{}, 0, 10));
+            pause();
         }
         return error.ChildTimeout;
     }
@@ -322,7 +359,7 @@ const Process = struct {
                 // wait. Do not race a signal against still-running rendering.
                 if (name_end + 2 < count and buffer[name_end + 2] == 'S') return;
             }
-            _ = try checked(linux.poll(&.{}, 0, 10));
+            pause();
         }
         return error.OutputDidNotStall;
     }
@@ -1546,7 +1583,7 @@ fn spawn(argv: []const ?[*:0]const u8) !void {
         if (posix.errno(null_fd) == .SUCCESS) {
             for (0..3) |fd| _ = linux.dup2(@intCast(null_fd), @intCast(fd));
         }
-        const env = [_:null]?[*:0]const u8{"PATH=/usr/bin:/bin"};
+        const env = [_:null]?[*:0]const u8{search_path};
         const program = argv[0].?;
         _ = linux.execve(program, @ptrCast(argv.ptr), &env);
         linux.exit_group(127);
@@ -1576,7 +1613,7 @@ const Project = struct {
         _ = try checked(linux.mkdir(base, 0o700));
         errdefer project.remove();
         const repo = project.repo;
-        try spawn(&.{ "/usr/bin/git", "init", "-q", repo, null });
+        try spawn(&.{ helpers.git, "init", "-q", repo, null });
         var sub_buffer: [192]u8 = undefined;
         _ = try checked(linux.mkdir(try project.path(&sub_buffer, "sub"), 0o700));
         const files = [_][2][]const u8{
@@ -1603,8 +1640,8 @@ const Project = struct {
         var pipe_buffer: [192]u8 = undefined;
         _ = try checked(linux.symlink(fifo, try project.path(&pipe_buffer, "pipe")));
         const tracked = [_:null]?[*:0]const u8{
-            "/usr/bin/git", "-C",        repo,       "add",           "--",
-            ".gitignore",   "alpha.txt", "beta.txt", "sub/gamma.txt",
+            helpers.git,  "-C",        repo,       "add",           "--",
+            ".gitignore", "alpha.txt", "beta.txt", "sub/gamma.txt",
         };
         try spawn(&tracked);
         return project;
@@ -1615,7 +1652,7 @@ const Project = struct {
     }
 
     fn remove(self: *const Project) void {
-        spawn(&.{ "/usr/bin/rm", "-rf", self.base, null }) catch {};
+        spawn(&.{ helpers.rm, "-rf", self.base, null }) catch {};
     }
 };
 
