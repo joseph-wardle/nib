@@ -21,6 +21,9 @@ const setClipboard = @import("terminal/frame.zig").setClipboard;
 const editor_view = @import("views/editor_view.zig");
 const finder_view = @import("views/finder_view.zig");
 const client = @import("lsp/client.zig");
+const protocol = @import("lsp/protocol.zig");
+const position = @import("lsp/position.zig");
+const motion = @import("text/motion.zig");
 const linux = std.os.linux;
 
 /// Runs Nib on `device` until a command quits, opening a named file first.
@@ -80,6 +83,8 @@ const App = struct {
         for (&all, &client.servers) |*one, *server| one.* = .{ .server = server };
         break :clients all;
     },
+    /// The navigation key awaiting its server's answer.
+    waiting: ?Waiting = null,
 
     fn loop(self: *App) !u8 {
         var suspension_count = self.terminal.suspension_count;
@@ -105,7 +110,7 @@ const App = struct {
                     for (&self.servers, 0..) |*server, index| {
                         const polled = descriptors[2 + 2 * index ..][0..2].*;
                         if (polled[0].revents | polled[1].revents == 0) continue;
-                        self.serverReady(server, polled);
+                        self.serverChanged(index, server.ready(self.gpa, self.io, polled));
                     }
                 },
                 .redraw => |size| {
@@ -141,32 +146,57 @@ const App = struct {
 
     /// Starts the active document's server the first time a file of its
     /// language is active, once its frame is on screen: spawning blocks for
-    /// about 0.6 ms. Waits for the finder's root, else uses the file's
-    /// directory. A server that exited starts again only on request.
+    /// about 0.6 ms. Waits for the finder's root. A server that exited starts
+    /// again only on a navigation key.
     fn startServer(self: *App) void {
         const entry = self.documents.current() orelse return;
         const path = entry.document.source.path;
         const server = &self.servers[client.serverFor(path) orelse return];
         if (server.state != .idle) return;
-        const root = if (self.finder.root) |root|
-            root.path
-        else if (self.finder.root_failure != null)
-            std.fs.path.dirname(path) orelse "/"
-        else
-            return;
-        server.start(self.gpa, self.io, root);
+        server.start(self.gpa, self.io, self.serverRoot(path) orelse return);
     }
 
-    /// Lets a server read and write; reports once, by name, a server that
-    /// exited or refused to start.
-    fn serverReady(self: *App, server: *client.Client, polled: [2]linux.pollfd) void {
-        const change = server.ready(self.gpa, self.io, polled);
-        if (!change.exited) return;
+    /// Where a server for `path` runs: the finder's root, else the file's
+    /// directory once the root is known to have failed; null until then.
+    fn serverRoot(self: *const App, path: []const u8) ?[]const u8 {
+        if (self.finder.root) |root| return root.path;
+        if (self.finder.root_failure == null) return null;
+        return std.fs.path.dirname(path) orelse "/";
+    }
+
+    /// Acts on what server `index` just did: reports once, by name, a server
+    /// that exited or refused to start, sends a request that waited for
+    /// initialization, and applies an answer. Nothing else is drawn.
+    fn serverChanged(self: *App, index: usize, change: client.Change) void {
+        const server = &self.servers[index];
+        const asked = if (self.waiting) |waiting| waiting.server == index else false;
+        if (change.exited) {
+            if (asked) self.waiting = null;
+            self.unavailable(server);
+            self.redraw = true;
+            return;
+        }
+        if (!asked) return;
+        if (change.initialized and !self.waiting.?.sent) {
+            self.send();
+            self.redraw = true;
+        }
+        if (change.answered) {
+            self.arrive(server);
+            self.redraw = true;
+        }
+    }
+
+    /// Says why `server` can't be asked: gone, never found or refused.
+    fn unavailable(self: *App, server: *const client.Client) void {
         const name = server.server.name;
-        if (server.state == .unavailable) {
-            self.status.print("{s} failed to start", .{name});
-        } else self.status.print("{s} exited", .{name});
-        self.redraw = true;
+        switch (server.state) {
+            .unavailable => |err| if (err == error.FileNotFound)
+                self.status.print("{s} not found", .{name})
+            else
+                self.status.print("{s} failed to start", .{name}),
+            else => self.status.print("{s} exited", .{name}),
+        }
     }
 
     /// Feeds one read, or an expired Escape deadline, through `decoder`; then
@@ -240,6 +270,8 @@ const App = struct {
     }
 
     fn editorEvent(self: *App, event: input.Event) void {
+        // Whatever else they do, Escape and Ctrl-C cancel a waiting request.
+        if (event == .escape or (event == .key and event.key == 3)) self.cancel();
         const entry = self.documents.current().?;
         const buffer = &entry.document.buffer;
         const request = self.editor.feed(
@@ -262,7 +294,190 @@ const App = struct {
                 .older => .older,
                 .newer => .newer,
             }, requested.count),
+            .navigate => |navigation| self.navigate(switch (navigation) {
+                .definition => .definition,
+                .declaration => .declaration,
+                .type_definition => .type_definition,
+                .implementation => .implementation,
+                .references => .references,
+            }),
         }
+    }
+
+    /// `gd` and the `gr` keys: asks the active document's server, replacing
+    /// a waiting request. A server that exited starts again; until one is
+    /// initialized the request waits. The answer applies in `arrive`.
+    fn navigate(self: *App, navigation: protocol.Navigation) void {
+        self.cancel();
+        const entry = self.documents.current().?;
+        const path = entry.document.source.path;
+        const index = client.serverFor(path) orelse {
+            return self.status.set("No language server for this file");
+        };
+        const server = &self.servers[index];
+        const name = server.server.name;
+        // A server sees only editable text (see `syncDocuments`).
+        if (!entry.document.buffer.editable) {
+            return self.status.print("Read-only file not sent to {s}", .{name});
+        }
+        if (server.state == .exited) {
+            const root = self.serverRoot(path) orelse std.fs.path.dirname(path) orelse "/";
+            server.start(self.gpa, self.io, root);
+        }
+        if (server.state == .unavailable or server.state == .exited) {
+            return self.unavailable(server);
+        }
+        self.waiting = .{
+            .server = index,
+            .navigation = navigation,
+            .document = entry.id,
+            .cursor = entry.document.buffer.cursor,
+            .changes = entry.document.buffer.changes,
+        };
+        self.status.print("Asking {s}...", .{name});
+        if (server.capabilities != null) self.send();
+    }
+
+    /// Escape, Ctrl-C or another navigation key: forgets the waiting
+    /// request, asking its server to drop it if it was sent.
+    fn cancel(self: *App) void {
+        const waiting = self.waiting orelse return;
+        self.waiting = null;
+        if (waiting.sent) self.servers[waiting.server].cancel(self.gpa, self.io);
+    }
+
+    /// Sends the waiting request to its initialized server, after bringing
+    /// the server's documents up to date. A missing provider, a stale request
+    /// or a server that dies on the write gets a notice instead.
+    fn send(self: *App) void {
+        const waiting = &self.waiting.?;
+        const server = &self.servers[waiting.server];
+        const name = server.server.name;
+        const capabilities = server.capabilities.?;
+        if (!capabilities.offers.contains(waiting.navigation)) {
+            const sought = noun(waiting.navigation, 2);
+            self.waiting = null;
+            return self.status.print("{s} has no {s}", .{ name, sought });
+        }
+        const entry = self.fresh() orelse return self.stale();
+        const buffer = &entry.document.buffer;
+        const at = position.position(buffer, buffer.cursor, capabilities.encoding);
+        const path = entry.document.source.path;
+        var sent = self.syncDocuments(waiting.server);
+        if (sent and server.state != .exited) {
+            server.navigate(self.gpa, self.io, waiting.navigation, path, at) catch {
+                sent = false;
+            };
+        }
+        if (server.state == .exited) {
+            self.waiting = null;
+            return self.unavailable(server);
+        }
+        if (!sent) {
+            self.waiting = null;
+            return self.status.print("Not enough memory; {s} not asked", .{name});
+        }
+        waiting.sent = true;
+    }
+
+    /// Brings server `index` up to date with the open editable documents of
+    /// its language: closes those closed, replaced or made read-only since,
+    /// then opens or resends the rest. False when memory ran out; stops early
+    /// if the server dies.
+    fn syncDocuments(self: *App, index: usize) bool {
+        const server = &self.servers[index];
+        var kept: usize = 0;
+        while (kept < server.documents.items.len and server.state != .exited) {
+            const synced = server.documents.items[kept];
+            if (self.documents.get(@fromBackingInt(synced.key))) |entry| {
+                const document = &entry.document;
+                const same = std.mem.eql(u8, document.source.path, synced.path);
+                if (document.buffer.editable and same) {
+                    kept += 1;
+                    continue;
+                }
+            }
+            server.forget(self.gpa, self.io, kept) catch return false;
+        }
+        for (self.documents.entries.items) |*entry| {
+            if (server.state == .exited) return true;
+            const document = &entry.document;
+            const path = document.source.path;
+            if (!document.buffer.editable or client.serverFor(path) != index) continue;
+            const buffer = &document.buffer;
+            const key = @backingInt(entry.id);
+            server.sync(self.gpa, self.io, key, path, buffer.changes, buffer.bytes()) catch {
+                return false;
+            };
+        }
+        return true;
+    }
+
+    /// The waiting request's document while its answer may still apply: the
+    /// same document is active with the same cursor and text, and the editor
+    /// is idle on it, so a jump may switch and reload documents.
+    fn fresh(self: *App) ?*session.Entry {
+        const waiting = self.waiting.?;
+        if (self.finding or self.command_line.open or !self.editor.idle()) return null;
+        const entry = self.documents.current() orelse return null;
+        const buffer = &entry.document.buffer;
+        if (entry.id != waiting.document or buffer.cursor != waiting.cursor) return null;
+        if (buffer.changes != waiting.changes) return null;
+        return entry;
+    }
+
+    fn stale(self: *App) void {
+        const name = self.servers[self.waiting.?.server].server.name;
+        self.waiting = null;
+        self.status.print("Dropped {s} request; the cursor, text or file changed", .{name});
+    }
+
+    /// Applies the answer to the waiting request: one location jumps there,
+    /// recording the departure, and several jump to the first and say how
+    /// many there were.
+    fn arrive(self: *App, server: *const client.Client) void {
+        const name = server.server.name;
+        const departed = self.fresh() orelse return self.stale();
+        const waiting = self.waiting.?;
+        self.waiting = null;
+        const locations = switch (server.answer.?) {
+            .failed => |message| return self.status.print("{s} failed: {s}", .{ name, message }),
+            .locations => |locations| locations,
+        };
+        if (locations.len == 0) {
+            return self.status.print("No {s} found", .{noun(waiting.navigation, 1)});
+        }
+        const target = locations[0];
+        const path = target.path orelse {
+            return self.status.print("{s} answered with a location outside local files", .{name});
+        };
+        const departure = self.documents.place(departed.document.buffer.cursor);
+        const opened = self.documents.open(self.gpa, self.io, .cwd(), path) catch |err| {
+            return self.status.print("Cannot open: {s}", .{openFailure(err)});
+        };
+        const entry = self.documents.current().?;
+        const buffer = &entry.document.buffer;
+        const offset = position.offset(buffer, target.at, server.capabilities.?.encoding);
+        buffer.cursor = motion.normal(buffer, offset);
+        entry.viewport.goal = motion.screenColumn(buffer, buffer.cursor, false);
+        const moved = opened.id != departure.id or buffer.cursor != waiting.cursor;
+        if (moved) self.documents.recordJump(departure);
+        var text: [Status.capacity]u8 = undefined;
+        var notice: std.Io.Writer = .fixed(&text);
+        const sought = noun(waiting.navigation, locations.len);
+        // The count matters more than where the first one is.
+        if (locations.len > 1) {
+            notice.print("1 of {d} {s}; list not built yet", .{ locations.len, sought }) catch
+                unreachable;
+        } else if (!moved) {
+            notice.print("Already at the {s}", .{noun(waiting.navigation, 1)}) catch unreachable;
+        }
+        if (opened.activation) |reload| {
+            if (notice.end != 0) notice.writeAll("; ") catch unreachable;
+            reloaded(&notice, reload, false, self.named(entry)) catch unreachable;
+        }
+        if (notice.end != 0) text[0] = std.ascii.toUpper(text[0]);
+        self.status.set(notice.buffered());
     }
 
     /// Ctrl-O or Ctrl-I, from an idle editor, so activation may reload.
@@ -625,6 +840,32 @@ const App = struct {
         try editor_view.draw(frame, self.size, entry, &self.editor, status, line);
     }
 };
+
+/// A navigation key's request, and what must be unchanged for its answer to
+/// apply.
+const Waiting = struct {
+    /// Index in `App.servers`.
+    server: usize,
+    navigation: protocol.Navigation,
+    document: session.Id,
+    cursor: usize,
+    /// The document's `Buffer.changes` when asked.
+    changes: u64,
+    /// Sent to the server; until then it waits for initialization.
+    sent: bool = false,
+};
+
+/// What `navigation` looks for, as a lowercase noun for `count` of them.
+fn noun(navigation: protocol.Navigation, count: usize) []const u8 {
+    const one = count == 1;
+    return switch (navigation) {
+        .definition => if (one) "definition" else "definitions",
+        .declaration => if (one) "declaration" else "declarations",
+        .type_definition => if (one) "type definition" else "type definitions",
+        .implementation => if (one) "implementation" else "implementations",
+        .references => if (one) "reference" else "references",
+    };
+}
 
 /// A path in a notice, keeping its end when longer than `limit` bytes. Two
 /// paths and the longest close and reload text fit in a `Status`.
@@ -1134,6 +1375,7 @@ test "a clean file changed on disk reloads only after every pending state ends" 
     const cases = [_]struct { keys: []const u8, close: []const u8 }{
         .{ .keys = "2", .close = "\x03" }, // count
         .{ .keys = "g", .close = "\x03" },
+        .{ .keys = "gr", .close = "\x03" },
         .{ .keys = "\"", .close = "\x03" }, // register name awaited
         .{ .keys = "\"a", .close = "\x03" }, // register chosen
         .{ .keys = "d", .close = "\x03" }, // operator
@@ -1371,4 +1613,439 @@ test "G and switching files in the finder record jumps that Ctrl-O and Tab retra
     try testing.expectEqual(a, app.documents.active.?);
     app.editorEvent(.{ .key = '\t' });
     try testing.expectEqualStrings("No newer jump", app.status.text());
+}
+
+/// An app on a temporary directory holding `a.zig` and `b.zig`, with `a.zig`
+/// open and the cursor on the call to `target`. Its zls has no process: it
+/// is initialized by assignment, what Nib sends stays queued, and replies
+/// are fed to `reply`. Initialize in place; the app points into it.
+const Navigating = struct {
+    temp: std.testing.TmpDir,
+    background: jobs.Jobs,
+    finder: Finder,
+    app: App,
+    storage: [std.fs.max_path_bytes]u8,
+    root: []const u8,
+
+    const a = "const b = @import(\"b.zig\");\npub fn main() void {\n    b.target();\n}\n";
+    const b = "pub fn target() void {}\n";
+    /// Line 2, column 6.
+    const call = 55;
+
+    fn init(self: *Navigating) !void {
+        const testing = std.testing;
+        self.temp = testing.tmpDir(.{});
+        errdefer self.temp.cleanup();
+        try self.temp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = a });
+        try self.temp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = b });
+        self.root = self.storage[0..try self.temp.dir.realPath(testing.io, &self.storage)];
+        self.background = try .init();
+        self.finder = .{};
+        self.app = .{
+            .gpa = testing.allocator,
+            .io = testing.io,
+            .terminal = undefined,
+            .background = &self.background,
+            .finder = &self.finder,
+            .size = .{ .rows = 10, .columns = 40 },
+        };
+        self.app.servers[0].capabilities = .{ .encoding = .utf8, .offers = .full };
+        _ = try self.open("a.zig");
+        self.buffer().cursor = call;
+    }
+
+    fn deinit(self: *Navigating) void {
+        const testing = std.testing;
+        self.app.editor.deinit(testing.allocator);
+        self.app.documents.deinit(testing.allocator);
+        for (&self.app.servers) |*server| server.deinit(testing.allocator, testing.io);
+        self.finder.deinit(testing.allocator, testing.io);
+        self.background.deinit(testing.allocator, testing.io);
+        self.temp.cleanup();
+    }
+
+    fn open(self: *Navigating, name: []const u8) !session.Id {
+        const testing = std.testing;
+        return (try self.app.documents.open(testing.allocator, testing.io, self.temp.dir, name)).id;
+    }
+
+    fn buffer(self: *Navigating) *@import("text/buffer.zig").Buffer {
+        return &self.app.documents.current().?.document.buffer;
+    }
+
+    fn keys(self: *Navigating, bytes: []const u8) void {
+        for (bytes) |byte| self.app.editorEvent(.{ .key = byte });
+    }
+
+    /// Bytes Nib has queued for zls.
+    fn sent(self: *Navigating) []const u8 {
+        return self.app.servers[0].queue.items;
+    }
+
+    /// A location in `name` as JSON, in `storage`.
+    fn location(
+        self: *const Navigating,
+        storage: []u8,
+        name: []const u8,
+        line: u32,
+        character: u32,
+    ) ![]const u8 {
+        const range = "\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}}," ++
+            "\"end\":{{\"line\":{d},\"character\":{d}}}}}";
+        return std.fmt.bufPrint(storage, "{{\"uri\":\"file://{s}/{s}\"," ++ range ++ "}}", .{
+            self.root, name, line, character, line, character,
+        });
+    }
+
+    /// Answers the pending request with `result`, JSON.
+    fn reply(self: *Navigating, result: []const u8) !void {
+        try self.replyTo(self.app.servers[0].pending.?, result);
+    }
+
+    fn replyTo(self: *Navigating, id: u32, result: []const u8) !void {
+        var body: [4096]u8 = undefined;
+        const text = "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}";
+        try self.feed(try std.fmt.bufPrint(&body, text, .{ id, result }));
+    }
+
+    /// Delivers one message from zls, as `serverChanged` gets it from a read.
+    fn feed(self: *Navigating, body: []const u8) !void {
+        var message: [4200]u8 = undefined;
+        const framed = try std.fmt.bufPrint(&message, "Content-Length: {d}\r\n\r\n{s}", .{
+            body.len,
+            body,
+        });
+        const change = try self.app.servers[0].receive(std.testing.allocator, framed);
+        self.app.serverChanged(0, change);
+    }
+};
+
+test "one location jumps to another file, recording the departure Ctrl-O returns to" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    fixture.keys("gd");
+    try testing.expectEqualStrings("Asking zls...", app.status.text());
+    // The text goes first, then the request at the cursor.
+    const sent = fixture.sent();
+    const opened = std.mem.indexOf(u8, sent, "\"method\":\"textDocument/didOpen\"").?;
+    const asked = std.mem.indexOf(u8, sent, "\"method\":\"textDocument/definition\"").?;
+    try testing.expect(opened < asked);
+    const at = "\"position\":{\"line\":2,\"character\":6}";
+    try testing.expect(std.mem.indexOf(u8, sent, at) != null);
+    var storage: [4096]u8 = undefined;
+    app.redraw = false;
+    try fixture.reply(try fixture.location(&storage, "b.zig", 0, 7));
+    try testing.expect(app.redraw);
+    try testing.expect(app.documents.active.? != a);
+    try testing.expectEqual(@as(usize, 7), fixture.buffer().cursor);
+    try testing.expectEqualStrings("", app.status.text());
+    const departure: session.Jump = .{ .id = a, .line = 2, .column = 6 };
+    try testing.expectEqual(departure, app.documents.jumps.items[0]);
+    fixture.keys("\x0f");
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+}
+
+test "several locations jump to the first and say how many; none or here says so" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    var storage: [3][1024]u8 = undefined;
+    fixture.keys("grr");
+    // References leave out the declaration.
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "\"includeDeclaration\":false") != null);
+    var several: [4096]u8 = undefined;
+    try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s},{s}]", .{
+        try fixture.location(&storage[0], "a.zig", 1, 4),
+        try fixture.location(&storage[1], "a.zig", 2, 6),
+        try fixture.location(&storage[2], "b.zig", 0, 7),
+    }));
+    try testing.expectEqual(@as(usize, 32), fixture.buffer().cursor);
+    try testing.expectEqualStrings("1 of 3 references; list not built yet", app.status.text());
+    try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
+    fixture.keys("gd");
+    try fixture.reply("null");
+    try testing.expectEqualStrings("No definition found", app.status.text());
+    fixture.keys("grt");
+    try fixture.reply("[]");
+    try testing.expectEqualStrings("No type definition found", app.status.text());
+    // The only reference is where the cursor is: no jump is recorded.
+    fixture.keys("grr");
+    try fixture.reply(try fixture.location(&storage[0], "a.zig", 1, 4));
+    try testing.expectEqualStrings("Already at the reference", app.status.text());
+    try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
+    // Several, the first here: the count still shows, and no jump is recorded.
+    fixture.keys("grr");
+    try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s}]", .{
+        try fixture.location(&storage[0], "a.zig", 1, 4),
+        try fixture.location(&storage[1], "a.zig", 2, 6),
+    }));
+    try testing.expectEqualStrings("1 of 2 references; list not built yet", app.status.text());
+    try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
+    // A location outside local files, or an error, changes nothing.
+    fixture.keys("gri");
+    try fixture.reply(
+        \\{"uri":"untitled:x","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}
+    );
+    const outside = "zls answered with a location outside local files";
+    try testing.expectEqualStrings(outside, app.status.text());
+    fixture.keys("grD");
+    var failure: [256]u8 = undefined;
+    const id = app.servers[0].pending.?;
+    const refused = "{{\"jsonrpc\":\"2.0\",\"id\":{d}," ++
+        "\"error\":{{\"code\":-32603,\"message\":\"no index\"}}}}";
+    try fixture.feed(try std.fmt.bufPrint(&failure, refused, .{id}));
+    try testing.expectEqualStrings("zls failed: no index", app.status.text());
+    try testing.expectEqual(@as(usize, 32), fixture.buffer().cursor);
+}
+
+test "an answer after the cursor, the text or the document changed is dropped" {
+    const testing = std.testing;
+    const Disturbance = enum { cursor, edit, undo, redo, paste, reload, other_document };
+    for (std.enums.values(Disturbance)) |disturbance| {
+        var fixture: Navigating = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const app = &fixture.app;
+        // Undo and redo need an edit to replay, made before asking.
+        switch (disturbance) {
+            .undo => fixture.keys("dl"),
+            .redo => fixture.keys("dlu"),
+            else => {},
+        }
+        fixture.buffer().cursor = Navigating.call;
+        const before = fixture.buffer().changes;
+        fixture.keys("gd");
+        switch (disturbance) {
+            .cursor => fixture.keys("l"),
+            .edit => fixture.keys("dl"),
+            .undo => fixture.keys("u"),
+            .redo => fixture.keys("\x12"),
+            .paste => {
+                fixture.keys("i");
+                for ([_]input.Event{ .paste_begin, .{ .paste_byte = 'x' }, .paste_end }) |event| {
+                    app.editorEvent(event);
+                }
+            },
+            .reload => {
+                const changed = Navigating.a ++ "// more\n";
+                const dir = fixture.temp.dir;
+                try dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = changed });
+                app.watched();
+                var decoder: input.Decoder = .{};
+                _ = app.step(&decoder, "", false, 0);
+                try testing.expect(fixture.buffer().changes != before);
+            },
+            .other_document => _ = try fixture.open("b.zig"),
+        }
+        const active = app.documents.active.?;
+        const cursor = fixture.buffer().cursor;
+        var storage: [1024]u8 = undefined;
+        try fixture.reply(try fixture.location(&storage, "b.zig", 0, 7));
+        const dropped = "Dropped zls request; the cursor, text or file changed";
+        try testing.expectEqualStrings(dropped, app.status.text());
+        try testing.expectEqual(active, app.documents.active.?);
+        try testing.expectEqual(cursor, fixture.buffer().cursor);
+        try testing.expectEqual(@as(usize, 0), app.documents.jumps.len);
+    }
+}
+
+test "Escape and Ctrl-C cancel a request, a second key replaces it, and late answers are ignored" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    var storage: [1024]u8 = undefined;
+    const target = try fixture.location(&storage, "b.zig", 0, 7);
+    for ([_]input.Event{ .escape, .{ .key = 3 } }) |cancel| {
+        fixture.keys("gd");
+        const id = app.servers[0].pending.?;
+        app.editorEvent(cancel);
+        try testing.expectEqualStrings("", app.status.text());
+        var cancelled: [128]u8 = undefined;
+        const sent = "\"method\":\"$/cancelRequest\",\"params\":{{\"id\":{d}}}}}";
+        const message = try std.fmt.bufPrint(&cancelled, sent, .{id});
+        try testing.expect(std.mem.endsWith(u8, fixture.sent(), message));
+        app.redraw = false;
+        try fixture.replyTo(id, target);
+        try testing.expect(!app.redraw);
+        try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    }
+    fixture.keys("gd");
+    const first = app.servers[0].pending.?;
+    fixture.keys("grr");
+    const second = app.servers[0].pending.?;
+    const replaced = "\"$/cancelRequest\",\"params\":{\"id\":";
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), replaced) != null);
+    try fixture.replyTo(first, target);
+    try testing.expectEqualStrings("Asking zls...", app.status.text());
+    try fixture.replyTo(second, "[]");
+    try testing.expectEqualStrings("No reference found", app.status.text());
+    // A server that exits while asked ends the wait.
+    fixture.keys("gd");
+    app.servers[0].state = .exited;
+    app.serverChanged(0, .{ .exited = true });
+    try testing.expectEqualStrings("zls exited", app.status.text());
+    try testing.expectEqual(null, app.waiting);
+}
+
+test "a request from the server is refused and draws nothing" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    fixture.keys("gd");
+    app.redraw = false;
+    try fixture.feed(
+        \\{"jsonrpc":"2.0","id":5,"method":"workspace/configuration","params":{}}
+    );
+    try fixture.feed(
+        \\{"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"hi"}}
+    );
+    try testing.expect(!app.redraw);
+    try testing.expectEqualStrings("Asking zls...", app.status.text());
+    const refusal =
+        \\{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"Method not found"}}
+    ;
+    try testing.expect(std.mem.endsWith(u8, fixture.sent(), refusal));
+}
+
+test "a key before initialization waits, then is sent, refused or cancelled unsent" {
+    const testing = std.testing;
+    const initialize = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":" ++
+        "{\"positionEncoding\":\"utf-8\",\"definitionProvider\":true}}}";
+    const Case = struct {
+        keys: []const u8,
+        notice: []const u8,
+        method: ?[]const u8,
+        cancel: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .keys = "gd", .notice = "Asking zls...", .method = "textDocument/definition" },
+        .{ .keys = "grr", .notice = "zls has no references", .method = null },
+        .{ .keys = "gd", .notice = "", .method = null, .cancel = true },
+    };
+    for (cases) |case| {
+        var fixture: Navigating = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const app = &fixture.app;
+        app.servers[0].capabilities = null;
+        fixture.keys(case.keys);
+        if (case.cancel) app.editorEvent(.escape);
+        // Nothing is sent before the reply.
+        try testing.expectEqualStrings("", fixture.sent());
+        try fixture.feed(initialize);
+        try testing.expectEqualStrings(case.notice, app.status.text());
+        const sent = fixture.sent();
+        try testing.expect(std.mem.indexOf(u8, sent, "\"method\":\"initialized\"") != null);
+        try testing.expect(std.mem.indexOf(u8, sent, "cancelRequest") == null);
+        if (case.method) |method| {
+            try testing.expect(std.mem.indexOf(u8, sent, "textDocument/didOpen") != null);
+            try testing.expect(std.mem.indexOf(u8, sent, method) != null);
+            app.cancel();
+        } else {
+            try testing.expect(std.mem.indexOf(u8, sent, "textDocument/didOpen") == null);
+            try testing.expectEqual(null, app.waiting);
+        }
+    }
+}
+
+test "only editable documents reach the server, and one made read-only is closed" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "c.zig", .data = "\x01\n" });
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "notes.md", .data = "notes\n" });
+    _ = try fixture.open("notes.md");
+    fixture.keys("gd");
+    try testing.expectEqualStrings("No language server for this file", app.status.text());
+    _ = try fixture.open("c.zig");
+    fixture.keys("gd");
+    try testing.expectEqualStrings("Read-only file not sent to zls", app.status.text());
+    try testing.expectEqualStrings("", fixture.sent());
+    // a is sent with b's request; c, read-only, is not.
+    const a = try fixture.open("a.zig");
+    _ = try fixture.open("b.zig");
+    fixture.keys("gd");
+    try fixture.reply("null");
+    const opens = std.mem.count(u8, fixture.sent(), "textDocument/didOpen");
+    try testing.expectEqual(@as(usize, 2), opens);
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "c.zig") == null);
+    // A reload makes a read-only; the next request closes it first.
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "\x01\n" });
+    _ = app.documents.activate(testing.allocator, testing.io, a);
+    try testing.expect(!fixture.buffer().editable);
+    _ = try fixture.open("b.zig");
+    app.servers[0].queue.clearRetainingCapacity();
+    fixture.keys("gd");
+    const sent = fixture.sent();
+    const closed = std.mem.indexOf(u8, sent, "textDocument/didClose").?;
+    try testing.expect(closed < std.mem.indexOf(u8, sent, "textDocument/definition").?);
+    try testing.expect(std.mem.indexOf(u8, sent, "a.zig") != null);
+    // b is already open and unchanged, so only those two are sent.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, sent, "\"jsonrpc\""));
+}
+
+test "a missing command or provider is reported only at a key, with no request" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const server = &app.servers[0];
+    server.capabilities.?.offers.remove(.implementation);
+    fixture.keys("gri");
+    try testing.expectEqualStrings("zls has no implementations", app.status.text());
+    try testing.expectEqualStrings("", fixture.sent());
+    server.state = .{ .unavailable = error.FileNotFound };
+    fixture.keys("gd");
+    try testing.expectEqualStrings("zls not found", app.status.text());
+    // Never spawned again.
+    app.startServer();
+    try testing.expectEqual(error.FileNotFound, server.state.unavailable);
+    server.state = .{ .unavailable = error.InitializeRefused };
+    fixture.keys("gd");
+    try testing.expectEqualStrings("zls failed to start", app.status.text());
+    server.state = .idle;
+}
+
+test "a dirty target activates without reloading, and a target that fails to open changes nothing" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    const b = try fixture.open("b.zig");
+    fixture.keys("dl");
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "b.zig", .data = "changed\n" });
+    _ = app.documents.activate(testing.allocator, testing.io, a);
+    fixture.buffer().cursor = Navigating.call;
+    var storage: [1024]u8 = undefined;
+    fixture.keys("gd");
+    try fixture.reply(try fixture.location(&storage, "b.zig", 0, 7));
+    try testing.expectEqual(b, app.documents.active.?);
+    try testing.expectEqualStrings("ub fn target() void {}\n", fixture.buffer().bytes());
+    try testing.expectEqualStrings("DISK CONFLICT | ", app.documents.current().?.disk.status());
+    _ = app.documents.activate(testing.allocator, testing.io, a);
+    fixture.buffer().cursor = Navigating.call;
+    const jumps = app.documents.jumps.len;
+    fixture.keys("gd");
+    try fixture.reply(try fixture.location(&storage, "missing.zig", 0, 0));
+    const missing = "Cannot open: file not found; check the path";
+    try testing.expectEqualStrings(missing, app.status.text());
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    try testing.expectEqual(jumps, app.documents.jumps.len);
 }

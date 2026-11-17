@@ -59,6 +59,15 @@ pub const Request = union(enum) {
     command_line,
     /// Ctrl-O (`older`) or Ctrl-I, which is Tab (`newer`), with its count.
     travel: struct { direction: enum { older, newer }, count: usize },
+    /// `gd`, `grD`, `grt`, `gri` or `grr`, asked of the file's language server.
+    navigate: Navigation,
+};
+pub const Navigation = enum {
+    definition,
+    declaration,
+    type_definition,
+    implementation,
+    references,
 };
 pub const Action = union(enum) {
     move: Movement,
@@ -141,7 +150,8 @@ pub const Parser = struct {
     mode: Mode = .normal,
     count: ?usize = null,
     overflow: bool = false,
-    pending_g: bool = false,
+    /// `g` or `gr` awaits the rest of its command.
+    prefix: enum { none, g, gr } = .none,
     operator: motion.Operator = .delete,
     operator_count: ?usize = null,
     /// The search prompt's query.
@@ -180,7 +190,7 @@ pub const Parser = struct {
         self.mode = .normal;
         self.count = null;
         self.overflow = false;
-        self.pending_g = false;
+        self.prefix = .none;
         self.operator_count = null;
         self.line.clear();
         self.prompt_count = null;
@@ -261,7 +271,8 @@ pub const Parser = struct {
                 },
             }
         }
-        if (!self.pending_g and byte >= '0' and byte <= '9' and (byte != '0' or self.count != null)) {
+        const digit = byte >= '0' and byte <= '9' and (byte != '0' or self.count != null);
+        if (self.prefix == .none and digit) {
             const value = std.math.mul(usize, self.count orelse 0, 10) catch {
                 self.overflow = true;
                 return null;
@@ -273,7 +284,7 @@ pub const Parser = struct {
             return null;
         }
         if (self.overflow) return self.reject();
-        if (self.mode == .normal and !self.pending_g) {
+        if (self.mode == .normal and self.prefix == .none) {
             if (byte == '"' and self.register == null) {
                 self.naming = true;
                 return null;
@@ -285,31 +296,40 @@ pub const Parser = struct {
             };
             if (self.register != null and !takes_register) return self.reject();
         }
-        if (byte == 'g' and !self.pending_g) {
-            self.pending_g = true;
+        if (byte == 'g' and self.prefix == .none) {
+            self.prefix = .g;
+            return null;
+        }
+        // The count, operator and selection stay, for the last key to refuse.
+        if (byte == 'r' and self.prefix == .g) {
+            self.prefix = .gr;
             return null;
         }
         const count = self.count;
         const operator_count = self.operator_count;
         const pending_operator = self.mode == .operator;
         const operator = self.operator;
-        const pending_g = self.pending_g;
+        const prefix = self.prefix;
         const register = self.register orelse '"';
         const register_count = self.register_count;
         self.cancel();
-        const selected: ?motion.Motion = if (pending_g) (if (byte == 'g') .first_line else null) else switch (byte) {
-            'h' => .left,
-            'j' => .down,
-            'k' => .up,
-            'l' => .right,
-            '0' => .start,
-            '^' => .first,
-            '$' => .end,
-            'w' => .word,
-            'b' => .back,
-            'e' => .word_end,
-            'G' => .last_line,
-            else => null,
+        const selected: ?motion.Motion = switch (prefix) {
+            .g => if (byte == 'g') .first_line else null,
+            .gr => null,
+            .none => switch (byte) {
+                'h' => .left,
+                'j' => .down,
+                'k' => .up,
+                'l' => .right,
+                '0' => .start,
+                '^' => .first,
+                '$' => .end,
+                'w' => .word,
+                'b' => .back,
+                'e' => .word_end,
+                'G' => .last_line,
+                else => null,
+            },
         };
         if (selected) |selected_motion| {
             const combined = multiply(operator_count, count) catch return .invalid;
@@ -321,7 +341,21 @@ pub const Parser = struct {
                 .movement = .{ .motion = movement },
             } };
         }
-        if (pending_g) return .invalid;
+        if (prefix != .none) {
+            const navigation: Navigation = switch (prefix) {
+                .g => if (byte == 'd') .definition else return .invalid,
+                else => switch (byte) {
+                    'D' => .declaration,
+                    't' => .type_definition,
+                    'i' => .implementation,
+                    'r' => .references,
+                    else => return .invalid,
+                },
+            };
+            // Only from plain normal mode: none takes a count or a range.
+            if (count != null or pending_operator or self.visual != null) return .invalid;
+            return .{ .request = .{ .navigate = navigation } };
+        }
         if (byte == 'n' or byte == 'N' or byte == '/' or byte == '?') {
             const combined = multiply(operator_count, count) catch return .invalid;
             const operating: ?motion.Operator = if (pending_operator) operator else null;
@@ -1068,4 +1102,41 @@ test "Ctrl-O and Tab ask to travel the jump list with a count, only from plain n
     try std.testing.expectEqual(Action{ .insert = .before }, keys(&parser, "i").?);
     try std.testing.expectEqual(Action.tab, keys(&parser, "\t").?);
     try std.testing.expectEqual(Action.invalid, keys(&parser, "\x0f").?);
+}
+
+test "gd, grD, grt, gri and grr ask to navigate, only from plain normal mode" {
+    var parser: Parser = .{};
+    const cases = [_]struct { keys: []const u8, navigation: Navigation }{
+        .{ .keys = "gd", .navigation = .definition },
+        .{ .keys = "grD", .navigation = .declaration },
+        .{ .keys = "grt", .navigation = .type_definition },
+        .{ .keys = "gri", .navigation = .implementation },
+        .{ .keys = "grr", .navigation = .references },
+    };
+    for (cases) |case| {
+        const navigate: Action = .{ .request = .{ .navigate = case.navigation } };
+        try expectAction(navigate, keys(&parser, case.keys));
+        // A count, an operator or a selection refuses each, and the whole
+        // command is consumed: `gri` never starts an insertion.
+        for ([_][]const u8{ "2", "d", "v" }) |before| {
+            _ = keys(&parser, before);
+            try std.testing.expectEqual(Action.invalid, keys(&parser, case.keys).?);
+            try std.testing.expectEqual(Mode.normal, parser.mode);
+        }
+        try std.testing.expectEqual(@as(?motion.Visual, .characterwise), parser.visual);
+        _ = parser.feed(.escape);
+    }
+    // A register prefix refuses `g` itself, as it does any key but an
+    // operator or a put.
+    try std.testing.expectEqual(null, keys(&parser, "\"a"));
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "g").?);
+    // `g` and `gr` alone stay pending, until another key ends them.
+    try std.testing.expectEqual(null, keys(&parser, "g"));
+    try std.testing.expectEqual(null, keys(&parser, "r"));
+    try std.testing.expect(parser.prefix == .gr);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "x").?);
+    try std.testing.expectEqual(Action.invalid, keys(&parser, "grg").?);
+    try std.testing.expectEqual(null, keys(&parser, "gr\x03"));
+    try std.testing.expect(parser.prefix == .none);
+    try expectAction(.{ .move = .{ .motion = .first_line } }, keys(&parser, "gg"));
 }

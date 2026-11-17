@@ -131,7 +131,8 @@ pub const Editor = struct {
     pub fn idle(self: *const Editor) bool {
         const parser = &self.parser;
         return parser.mode == .normal and parser.visual == null and parser.count == null and
-            !parser.pending_g and !parser.naming and parser.register == null and !parser.pasting;
+            parser.prefix == .none and !parser.naming and parser.register == null and
+            !parser.pasting;
     }
 
     /// The query whose visible matches are drawn: the prompt's while it holds

@@ -54,6 +54,15 @@ pub const State = union(enum) {
     unavailable: anyerror,
 };
 
+/// A document the server has open, as Nib last sent it.
+pub const Document = struct {
+    /// The caller's name for the document.
+    key: u64,
+    /// Owned: the path it was opened with, for closing it.
+    path: []const u8,
+    version: u64,
+};
+
 /// Owns its process and buffers. Call `deinit`, which kills the server.
 pub const Client = struct {
     server: *const Server,
@@ -70,12 +79,16 @@ pub const Client = struct {
     /// The last answer to a pending request
     answer: ?protocol.Answer = null,
     answer_memory: std.heap.ArenaAllocator.State = .init,
+    /// What the running server has open; empty until initialized.
+    documents: std.ArrayList(Document) = .empty,
 
     pub fn deinit(self: *Client, gpa: Allocator, io: std.Io) void {
         if (self.state == .running) self.stop(io);
         self.queue.deinit(gpa);
         self.reader.deinit(gpa);
         self.answer_memory.promote(gpa).deinit();
+        self.forgetAll(gpa);
+        self.documents.deinit(gpa);
         self.* = undefined;
     }
 
@@ -211,39 +224,47 @@ pub const Client = struct {
         return result;
     }
 
-    // The writers below need a running, initialized server. Each queues a
-    // message and writes what the server takes now; on running out of memory
-    // the queue is unchanged and the error is returned.
+    // The writers below need an initialized server. Each queues a message
+    // and writes what the server takes now; on running out of memory the
+    // queue is unchanged and the error is returned. A server that dies on
+    // the write is stopped, so the caller checks `state` afterwards.
 
-    pub fn open(
+    /// Opens the document `key` names, or sends its text again when
+    /// `version` differs from what the server has. On running out of memory
+    /// nothing is sent or recorded.
+    pub fn sync(
         self: *Client,
         gpa: Allocator,
         io: std.Io,
+        key: u64,
         path: []const u8,
         version: u64,
         text: []const u8,
     ) Allocator.Error!void {
         std.debug.assert(self.capabilities != null);
+        for (self.documents.items) |*document| {
+            if (document.key != key) continue;
+            if (document.version == version) return;
+            try protocol.didChange(gpa, &self.queue, path, version, text);
+            document.version = version;
+            return self.flush(gpa, io);
+        }
+        try self.documents.ensureUnusedCapacity(gpa, 1);
+        const owned = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned);
         try protocol.didOpen(gpa, &self.queue, path, self.server.language, version, text);
+        self.documents.appendAssumeCapacity(.{ .key = key, .path = owned, .version = version });
         self.flush(gpa, io);
     }
 
-    pub fn change(
-        self: *Client,
-        gpa: Allocator,
-        io: std.Io,
-        path: []const u8,
-        version: u64,
-        text: []const u8,
-    ) Allocator.Error!void {
+    /// Closes `documents[index]` on the server and forgets it. On running out
+    /// of memory nothing changes.
+    pub fn forget(self: *Client, gpa: Allocator, io: std.Io, index: usize) Allocator.Error!void {
         std.debug.assert(self.capabilities != null);
-        try protocol.didChange(gpa, &self.queue, path, version, text);
-        self.flush(gpa, io);
-    }
-
-    pub fn close(self: *Client, gpa: Allocator, io: std.Io, path: []const u8) Allocator.Error!void {
-        std.debug.assert(self.capabilities != null);
-        try protocol.didClose(gpa, &self.queue, path);
+        const document = self.documents.items[index];
+        try protocol.didClose(gpa, &self.queue, document.path);
+        gpa.free(document.path);
+        _ = self.documents.swapRemove(index);
         self.flush(gpa, io);
     }
 
@@ -325,6 +346,12 @@ pub const Client = struct {
         self.next_id = initialize_id + 1;
         self.pending = null;
         self.answer = null;
+        self.forgetAll(gpa);
+    }
+
+    fn forgetAll(self: *Client, gpa: Allocator) void {
+        for (self.documents.items) |document| gpa.free(document.path);
+        self.documents.clearRetainingCapacity();
     }
 };
 
@@ -422,6 +449,50 @@ test "a server that refuses to initialize is reported" {
     )));
 }
 
+test "sync opens a document once, resends it only at a new version, and forget closes it" {
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(testing.allocator, testing.io);
+    client.capabilities = .{ .encoding = .utf8, .offers = .empty };
+    var storage: [4096]u8 = undefined;
+    try client.sync(testing.allocator, testing.io, 7, "/p/a.zig", 0, "a");
+    try client.sync(testing.allocator, testing.io, 7, "/p/a.zig", 0, "a");
+    try client.sync(testing.allocator, testing.io, 7, "/p/a.zig", 2, "ab");
+    try client.forget(testing.allocator, testing.io, 0);
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///p/a.zig","languageId":"zig","version":0,"text":"a"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///p/a.zig","version":2},"contentChanges":[{"text":"ab"}]}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///p/a.zig"}}}
+        \\
+    , try queued(&client, &storage));
+    try testing.expectEqual(@as(usize, 0), client.documents.items.len);
+}
+
+test "a sync that runs out of memory sends and records nothing" {
+    const Case = struct {
+        fn run(gpa: Allocator) !void {
+            var client: Client = .{ .server = &servers[0] };
+            defer client.deinit(gpa, testing.io);
+            client.capabilities = .{ .encoding = .utf8, .offers = .empty };
+            try client.sync(gpa, testing.io, 1, "/p/a.zig", 0, "a");
+            const before = client.queue.items.len;
+            client.sync(gpa, testing.io, 2, "/p/b.zig", 0, "b") catch |err| {
+                try testing.expectEqual(before, client.queue.items.len);
+                try testing.expectEqual(@as(usize, 1), client.documents.items.len);
+                return err;
+            };
+            client.sync(gpa, testing.io, 1, "/p/a.zig", 1, "aa") catch |err| {
+                try testing.expectEqual(@as(u64, 0), client.documents.items[0].version);
+                return err;
+            };
+            client.forget(gpa, testing.io, 0) catch |err| {
+                try testing.expectEqual(@as(usize, 2), client.documents.items.len);
+                return err;
+            };
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
+}
+
 /// Polls `client` until `wanted` holds of everything that changed, failing
 /// after ten seconds.
 fn settle(client: *Client, wanted: *const fn (Change) bool) !Change {
@@ -512,7 +583,7 @@ test "zls initializes with UTF-8 and answers definitions and references" {
     var b_storage: [4096]u8 = undefined;
     const a = try project.path("a.zig", &a_storage);
     const b = try project.path("b.zig", &b_storage);
-    try client.open(testing.allocator, testing.io, a, 0, Project.a);
+    try client.sync(testing.allocator, testing.io, 0, a, 0, Project.a);
     // On `target` in the first call.
     const call: Position = .{ .line = 2, .character = 6 };
     try client.navigate(testing.allocator, testing.io, .definition, a, call);
@@ -541,7 +612,7 @@ test "a server killed mid-request is reported, and starts again" {
     try startZls(&client, &project);
     var storage: [4096]u8 = undefined;
     const a = try project.path("a.zig", &storage);
-    try client.open(testing.allocator, testing.io, a, 0, Project.a);
+    try client.sync(testing.allocator, testing.io, 0, a, 0, Project.a);
     const call: Position = .{ .line = 2, .character = 6 };
     try client.navigate(testing.allocator, testing.io, .definition, a, call);
     _ = linux.kill(-client.state.running.id.?, .KILL);
@@ -567,7 +638,7 @@ test "a write to a server that has died stops it instead of killing Nib" {
     while (output[0].revents & linux.POLL.HUP == 0) _ = linux.poll(&output, 1, 10_000);
     // Larger than a pipe holds, so the write reaches the closed end.
     const text: [256 * 1024]u8 = @splat('x');
-    try client.open(testing.allocator, testing.io, "/p/a.zig", 0, &text);
+    try client.sync(testing.allocator, testing.io, 0, "/p/a.zig", 0, &text);
     try testing.expect(client.state == .exited);
 }
 
