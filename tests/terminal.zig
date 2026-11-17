@@ -13,10 +13,16 @@ const prompt = "NIBTEST> ";
 // Borrows main's path buffer for the lifetime of all checks.
 var fixture: [:0]const u8 = undefined;
 // The harness's own `PATH`, as a `PATH=` entry every child inherits: Nib finds
-// Git through it. Borrows main's buffer for the lifetime of all checks.
+// Git and zls through it. Borrows main's buffer for the lifetime of all checks.
 var search_path: [:0]const u8 = undefined;
-// Absolute paths, found on `search_path` before any check runs.
-var helpers: struct { git: [:0]const u8, zsh: [:0]const u8, rm: [:0]const u8 } = undefined;
+// Absolute paths, found on `search_path` before any check runs, so a missing
+// helper fails by name.
+var helpers: struct {
+    git: [:0]const u8,
+    zsh: [:0]const u8,
+    rm: [:0]const u8,
+    zls: [:0]const u8,
+} = undefined;
 
 // Keep startup single-threaded: child setup after fork must not inherit runtime
 // worker threads or allocator locks. The harness uses fixed owned buffers.
@@ -35,16 +41,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         break :executable executable_buffer[0 .. cwd.len + suffix.len :0];
     };
     const directories = init.environ.getPosix("PATH") orelse {
-        std.debug.print("terminal checks need PATH to find git, zsh and rm\n", .{});
+        std.debug.print("terminal checks need PATH to find git, zsh, rm and zls\n", .{});
         return error.MissingPath;
     };
     var search_path_buffer: [8192]u8 = undefined;
     search_path = try std.fmt.bufPrintSentinel(&search_path_buffer, "PATH={s}", .{directories}, 0);
-    var helper_buffers: [3][4096]u8 = undefined;
+    var helper_buffers: [4][4096]u8 = undefined;
     helpers = .{
         .git = try find(&helper_buffers[0], directories, "git"),
         .zsh = try find(&helper_buffers[1], directories, "zsh"),
         .rm = try find(&helper_buffers[2], directories, "rm"),
+        .zls = try find(&helper_buffers[3], directories, "zls"),
     };
     var directory_buffer: [128]u8 = undefined;
     const directory = try std.fmt.bufPrintSentinel(&directory_buffer, "/tmp/nib-viewer-{d}", .{linux.getpid()}, 0);
@@ -92,6 +99,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "finderSafety", finderSafety },
         .{ "jumpWorkflow", jumpWorkflow },
         .{ "finderQuit", finderQuit },
+        .{ "navigationWorkflow", navigationWorkflow },
+        .{ "navigationWaiting", navigationWaiting },
     };
     inline for (checks) |check| {
         check[1](executable) catch |err| {
@@ -2016,4 +2025,145 @@ fn finderQuit(executable: [:0]const u8) !void {
     try equal(@as(u8, 0), try process.wait(false));
     try process.until(leave);
     try process.restored();
+}
+
+/// A two-file Zig project at `/tmp/nib-<name>-<pid>`, outside any Git
+/// worktree, so its language server is rooted at the directory: `a.zig` calls
+/// `b.zig`'s `target` on lines 3 and 4, at column 7.
+const ZigProject = struct {
+    storage: [128]u8 = undefined,
+    directory: [:0]const u8 = undefined,
+    a_storage: [160]u8 = undefined,
+    a: [:0]const u8 = undefined,
+
+    fn create(self: *ZigProject, name: []const u8) !void {
+        const format = "/tmp/nib-{s}-{d}";
+        self.directory = try std.fmt.bufPrintSentinel(&self.storage, format, .{ name, linux.getpid() }, 0);
+        _ = try checked(linux.mkdir(self.directory, 0o700));
+        errdefer self.remove();
+        self.a = try std.fmt.bufPrintSentinel(&self.a_storage, "{s}/a.zig", .{self.directory}, 0);
+        try putFile(self.a,
+            \\const b = @import("b.zig");
+            \\pub fn main() void {
+            \\    b.target();
+            \\    b.target();
+            \\}
+            \\
+        );
+        var b: [160]u8 = undefined;
+        const b_path = try std.fmt.bufPrintSentinel(&b, "{s}/b.zig", .{self.directory}, 0);
+        try putFile(b_path, "pub fn target() void {}\n");
+    }
+
+    fn remove(self: *const ZigProject) void {
+        spawn(&.{ helpers.rm, "-rf", self.directory, null }) catch {};
+    }
+};
+
+/// The one child of Nib's main thread, its language server, once started.
+/// Git helpers belong to the finder's worker threads.
+fn server(process: *const Process) !posix.pid_t {
+    var path_buffer: [128]u8 = undefined;
+    const format = "/proc/{d}/task/{d}/children";
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, format, .{ process.pid, process.pid }, 0);
+    const deadline = try now() + 5000;
+    while (try now() < deadline) {
+        const fd: posix.fd_t = @intCast(try checked(linux.open(path, .{ .ACCMODE = .RDONLY }, 0)));
+        defer _ = linux.close(fd);
+        var buffer: [64]u8 = undefined;
+        const count = try checked(linux.read(fd, &buffer, buffer.len));
+        var ids = std.mem.tokenizeScalar(u8, buffer[0..count], ' ');
+        if (ids.next()) |id| return std.fmt.parseInt(posix.pid_t, id, 10);
+        pause();
+    }
+    return error.ServerNotStarted;
+}
+
+fn gone(pid: posix.pid_t) !void {
+    try equal(linux.E.SRCH, posix.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
+}
+
+// Covers gd landing in another file through real zls, Ctrl-O returning, and
+// grr with two references landing on the first with the count.
+fn navigationWorkflow(executable: [:0]const u8) !void {
+    var project: ZigProject = .{};
+    try project.create("navigation");
+    defer project.remove();
+    var process = try Process.start(executable, .{ .path = project.a, .cwd = project.directory });
+    defer process.close();
+    try process.until("b.target();");
+    try process.ready();
+    try editingKeys(&process, "jjww");
+    try process.send("w");
+    try landed(&process, "3:7", "a.zig");
+    try process.send("gd");
+    try process.until("Asking zls...");
+    try process.ready();
+    try landed(&process, "1:8", "b.zig");
+    try process.send("\x0f");
+    try landed(&process, "3:7", "a.zig");
+    try process.send("j");
+    try landed(&process, "4:7", "a.zig");
+    try process.send("grr");
+    try process.until("1 of 2 references; list not built yet");
+    try process.ready();
+    try process.send("l");
+    try landed(&process, "3:8", "a.zig");
+    try process.send("\x0f");
+    try landed(&process, "4:7", "a.zig");
+    const pid = try server(&process);
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try gone(pid);
+}
+
+// Covers a request kept through Ctrl-Z and resume, and SIGTERM while one
+// waits. Stopping zls holds each request unanswered for as long as needed.
+fn navigationWaiting(executable: [:0]const u8) !void {
+    var project: ZigProject = .{};
+    try project.create("waiting");
+    defer project.remove();
+    {
+        var process = try Process.start(executable, .{ .path = project.a, .cwd = project.directory });
+        defer process.close();
+        try process.until("b.target();");
+        try process.ready();
+        const pid = try server(&process);
+        _ = try checked(linux.kill(pid, .STOP));
+        try editingKeys(&process, "jjww");
+        try process.send("w");
+        try landed(&process, "3:7", "a.zig");
+        try process.send("gd");
+        try process.until("Asking zls...");
+        try process.ready();
+        try process.send("\x1a");
+        try equal(@as(u8, @backingInt(posix.SIG.STOP)), try process.wait(true));
+        try process.until(leave);
+        try process.restored();
+        try process.signal(.CONT);
+        try process.until("Asking zls...");
+        try process.ready();
+        _ = try checked(linux.kill(pid, .CONT));
+        try landed(&process, "1:8", "b.zig");
+        try process.send(":qa\r");
+        try equal(@as(u8, 0), try process.wait(false));
+        try process.until(leave);
+        try gone(pid);
+    }
+    var process = try Process.start(executable, .{ .path = project.a, .cwd = project.directory });
+    defer process.close();
+    try process.until("b.target();");
+    try process.ready();
+    const pid = try server(&process);
+    _ = try checked(linux.kill(pid, .STOP));
+    try process.send("gd");
+    try process.until("Asking zls...");
+    try process.ready();
+    try process.signal(.TERM);
+    try equal(@as(u8, 128 + @backingInt(posix.SIG.TERM)), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try gone(pid);
 }
