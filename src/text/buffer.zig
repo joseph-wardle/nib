@@ -55,6 +55,7 @@ pub const Buffer = struct {
     base: []const u8,
     cursor: usize = 0,
     editable: bool,
+    changes: u64 = 0,
     history: std.ArrayList(Group) = .empty,
     position: usize = 0,
     saved_position: ?usize = 0,
@@ -330,6 +331,7 @@ pub const Buffer = struct {
     }
 
     fn apply(self: *Buffer, range: Range, inserted: []const u8) void {
+        self.changes += 1;
         const first = self.rowAt(range.start) + 1;
         const end = self.rowAt(range.end) + 1;
         const added = std.mem.count(u8, inserted, "\n");
@@ -781,4 +783,25 @@ fn multibyteWorkflow(allocator: Allocator) !void {
     try expectState(&buffer, before, 4, 0, 1, false);
     try std.testing.expect(try buffer.redo(allocator));
     try std.testing.expectEqualStrings(after, buffer.bytes());
+}
+
+test "every text change counts, and nothing else does" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "ab\n");
+    defer buffer.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 0), buffer.changes);
+    try buffer.replace(allocator, .{ .start = 1, .end = 1 }, "x", 2);
+    buffer.endGroup();
+    try std.testing.expectEqual(@as(u64, 1), buffer.changes);
+    const refused = buffer.replace(allocator, .{ .start = 0, .end = 0 }, "\x00", 0);
+    try std.testing.expectError(error.UnsupportedText, refused);
+    try buffer.setCursor(0);
+    try buffer.markSaved(allocator);
+    try std.testing.expectEqual(@as(u64, 1), buffer.changes);
+    try std.testing.expect(try buffer.undo(allocator));
+    try std.testing.expectEqual(@as(u64, 2), buffer.changes);
+    try std.testing.expect(try buffer.redo(allocator));
+    try std.testing.expectEqual(@as(u64, 3), buffer.changes);
+    try std.testing.expect(!try buffer.redo(allocator));
+    try std.testing.expectEqual(@as(u64, 3), buffer.changes);
 }

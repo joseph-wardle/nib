@@ -61,6 +61,7 @@ pub const Disk = struct {
             return if (err == error.OutOfMemory) .out_of_memory else .failed;
         };
         replacement.buffer.cursor = motion.normal(&replacement.buffer, @min(document.buffer.cursor, replacement.buffer.bytes().len));
+        replacement.buffer.changes = document.buffer.changes + 1;
         document.deinit(allocator);
         document.* = replacement;
         goal.* = motion.screenColumn(&document.buffer, document.buffer.cursor, false);
@@ -430,4 +431,20 @@ test "watch paths cover intermediate symlinks, directory replacement, inode alia
     try testing.expect(disk.automatic(testing.allocator, testing.io, &document, &goal) != null);
     try testing.expectEqualStrings("latest", document.buffer.bytes());
     try testing.expect(!disk.watch.degraded);
+}
+
+test "a reload counts as a change, even for a document never edited" {
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "one\n" });
+    var document = try file.Source.load(testing.allocator, testing.io, temp.dir, "source");
+    defer document.deinit(testing.allocator);
+    var disk: Disk = .{};
+    defer disk.deinit(testing.allocator);
+    var goal: motion.Goal = null;
+    try testing.expectEqual(@as(u64, 0), document.buffer.changes);
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "source", .data = "two\n" });
+    try testing.expect(disk.reload(testing.allocator, testing.io, &document, &goal) == .reloaded);
+    try testing.expectEqualStrings("two\n", document.buffer.bytes());
+    try testing.expectEqual(@as(u64, 1), document.buffer.changes);
 }

@@ -5,15 +5,17 @@ const linux = std.os.linux;
 
 pub const Size = struct { rows: u16, columns: u16 };
 /// `input` borrows the terminal's read buffer until the next call to `next`.
-/// `watch` and `background` report the descriptors the caller passed in.
+/// `ready` means at least one descriptor the caller passed in has `revents`.
 pub const Event = union(enum) {
     input: []const u8,
     redraw: Size,
     quit: u8,
     timeout,
-    watch,
-    background,
+    ready,
 };
+
+/// How many descriptors `next` watches for its caller.
+pub const max_descriptors = 8;
 pub const Error = error{
     NotATerminal,
     NotForeground,
@@ -165,15 +167,18 @@ pub const Terminal = struct {
         self.pending.should_suspend = true;
     }
 
-    /// Blocks until input, lifecycle activity, readiness of `watch_fd` (-1 for
-    /// none) or `background_fd`, or an optional monotonic deadline. Signals are
-    /// drained first; queued termination wins over resume or input.
+    /// Blocks until input, lifecycle activity, readiness of one of the
+    /// caller's `descriptors` (a negative fd is skipped), or an optional
+    /// monotonic deadline. Each descriptor's `revents` is set on return.
+    /// Signals are drained first; queued termination wins over resume or
+    /// input, and input over the caller's descriptors.
     pub fn next(
         self: *Terminal,
         deadline: ?i64,
-        watch_fd: posix.fd_t,
-        background_fd: posix.fd_t,
+        descriptors: []linux.pollfd,
     ) Error!Event {
+        std.debug.assert(descriptors.len <= max_descriptors);
+        for (descriptors) |*descriptor| descriptor.revents = 0;
         while (true) {
             try self.readSignals();
             const signals = self.pending;
@@ -213,14 +218,12 @@ pub const Terminal = struct {
             }
             if (signals.resize) return .{ .redraw = try size() };
 
-            var fds = [_]linux.pollfd{
-                .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 },
-                .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 },
-                .{ .fd = watch_fd, .events = linux.POLL.IN, .revents = 0 },
-                .{ .fd = background_fd, .events = linux.POLL.IN, .revents = 0 },
-            };
+            var fds: [2 + max_descriptors]linux.pollfd = undefined;
+            fds[0] = .{ .fd = self.signal_fd, .events = linux.POLL.IN, .revents = 0 };
+            fds[1] = .{ .fd = 0, .events = linux.POLL.IN, .revents = 0 };
+            @memcpy(fds[2..][0..descriptors.len], descriptors);
             const timeout: i32 = if (deadline) |end| @intCast(@min(std.math.maxInt(i32), @max(0, end - try milliseconds()))) else -1;
-            const result = linux.poll(&fds, fds.len, timeout);
+            const result = linux.poll(&fds, 2 + descriptors.len, timeout);
             switch (posix.errno(result)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -242,8 +245,12 @@ pub const Terminal = struct {
                     else => return error.InputFailed,
                 }
             }
-            if (fds[2].revents != 0) return .watch;
-            if (fds[3].revents != 0) return .background;
+            var ready = false;
+            for (descriptors, fds[2..][0..descriptors.len]) |*descriptor, polled| {
+                descriptor.revents = polled.revents;
+                ready = ready or polled.revents != 0;
+            }
+            if (ready) return .ready;
         }
     }
 

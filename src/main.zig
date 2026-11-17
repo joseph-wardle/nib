@@ -103,4 +103,7 @@ test {
     _ = @import("views/editor_view.zig");
     _ = @import("views/finder_view.zig");
     _ = @import("text/search.zig");
+    _ = @import("lsp/position.zig");
+    _ = @import("lsp/protocol.zig");
+    _ = @import("lsp/client.zig");
 }

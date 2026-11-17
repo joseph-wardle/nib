@@ -20,6 +20,8 @@ const Frame = @import("terminal/frame.zig").Frame;
 const setClipboard = @import("terminal/frame.zig").setClipboard;
 const editor_view = @import("views/editor_view.zig");
 const finder_view = @import("views/finder_view.zig");
+const client = @import("lsp/client.zig");
+const linux = std.os.linux;
 
 /// Runs Nib on `device` until a command quits, opening a named file first.
 pub fn run(
@@ -38,6 +40,7 @@ pub fn run(
     };
     defer app.editor.deinit(init.gpa);
     defer app.documents.deinit(init.gpa);
+    defer for (&app.servers) |*server| server.deinit(init.gpa, init.io);
     // A named file must open before the screen is taken over.
     if (how == .file) {
         const opened = try app.documents.open(init.gpa, init.io, .cwd(), how.file);
@@ -70,8 +73,13 @@ const App = struct {
     size: terminal.Size = .{ .rows = 0, .columns = 0 },
     redraw: bool = false,
     exit: ?u8 = null,
-    /// The status line's message, on either screen.
+
     status: Status = .{},
+    servers: [client.servers.len]client.Client = clients: {
+        var all: [client.servers.len]client.Client = undefined;
+        for (&all, &client.servers) |*one, *server| one.* = .{ .server = server };
+        break :clients all;
+    },
 
     fn loop(self: *App) !u8 {
         var suspension_count = self.terminal.suspension_count;
@@ -81,14 +89,25 @@ const App = struct {
             var bytes: []const u8 = &.{};
             var expired = false;
             const watch_fd = if (self.documents.current()) |entry| entry.disk.watch.fd else -1;
-            const event = try self.terminal.next(
-                decoder.deadline,
-                watch_fd,
-                self.background.wake_fd,
-            );
+            // The watch, the jobs' wakeup, then each server's output and input.
+            var descriptors: [2 + 2 * client.servers.len]linux.pollfd = undefined;
+            descriptors[0] = .{ .fd = watch_fd, .events = linux.POLL.IN, .revents = 0 };
+            const wake_fd = self.background.wake_fd;
+            descriptors[1] = .{ .fd = wake_fd, .events = linux.POLL.IN, .revents = 0 };
+            for (&self.servers, 0..) |*server, index| {
+                descriptors[2 + 2 * index ..][0..2].* = server.descriptors();
+            }
+            const event = try self.terminal.next(decoder.deadline, &descriptors);
             switch (event) {
-                .watch => self.watched(),
-                .background => self.collect(),
+                .ready => {
+                    if (descriptors[0].revents != 0) self.watched();
+                    if (descriptors[1].revents != 0) self.collect();
+                    for (&self.servers, 0..) |*server, index| {
+                        const polled = descriptors[2 + 2 * index ..][0..2].*;
+                        if (polled[0].revents | polled[1].revents == 0) continue;
+                        self.serverReady(server, polled);
+                    }
+                },
                 .redraw => |size| {
                     self.size = size;
                     self.redraw = true;
@@ -116,7 +135,38 @@ const App = struct {
                     if (err != error.Interrupted) return err;
                 };
             }
+            self.startServer();
         }
+    }
+
+    /// Starts the active document's server the first time a file of its
+    /// language is active, once its frame is on screen: spawning blocks for
+    /// about 0.6 ms. Waits for the finder's root, else uses the file's
+    /// directory. A server that exited starts again only on request.
+    fn startServer(self: *App) void {
+        const entry = self.documents.current() orelse return;
+        const path = entry.document.source.path;
+        const server = &self.servers[client.serverFor(path) orelse return];
+        if (server.state != .idle) return;
+        const root = if (self.finder.root) |root|
+            root.path
+        else if (self.finder.root_failure != null)
+            std.fs.path.dirname(path) orelse "/"
+        else
+            return;
+        server.start(self.gpa, self.io, root);
+    }
+
+    /// Lets a server read and write; reports once, by name, a server that
+    /// exited or refused to start.
+    fn serverReady(self: *App, server: *client.Client, polled: [2]linux.pollfd) void {
+        const change = server.ready(self.gpa, self.io, polled);
+        if (!change.exited) return;
+        const name = server.server.name;
+        if (server.state == .unavailable) {
+            self.status.print("{s} failed to start", .{name});
+        } else self.status.print("{s} exited", .{name});
+        self.redraw = true;
     }
 
     /// Feeds one read, or an expired Escape deadline, through `decoder`; then
@@ -674,7 +724,6 @@ test "Enter on an Open row whose file has closed relists rather than activating 
     try testing.expectEqual(@as(usize, 1), finder.matches.len);
 }
 
-const linux = std.os.linux;
 const posix = std.posix;
 
 test "save notices distinguish failure, uncertain publication and installed durability" {
