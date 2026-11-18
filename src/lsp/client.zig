@@ -15,7 +15,7 @@ pub const Server = struct {
     extensions: []const []const u8,
 };
 
-/// zls is tested automatically
+/// Only confirmed entries: zls is tested automatically, slangd by hand.
 pub const servers = [_]Server{
     .{ .name = "zls", .language = "zig", .extensions = &.{ ".zig", ".zon" } },
     .{ .name = "slangd", .language = "slang", .extensions = &.{".slang"} },

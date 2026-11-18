@@ -76,7 +76,7 @@ const App = struct {
     size: terminal.Size = .{ .rows = 0, .columns = 0 },
     redraw: bool = false,
     exit: ?u8 = null,
-
+    /// The status line's message, on either screen.
     status: Status = .{},
     servers: [client.servers.len]client.Client = clients: {
         var all: [client.servers.len]client.Client = undefined;
@@ -190,7 +190,8 @@ const App = struct {
             return;
         }
         if (!asked) return;
-        if (change.initialized and !self.waiting.?.sent) {
+        // A server initializes once per start, before any request is sent.
+        if (change.initialized) {
             self.send();
             self.redraw = true;
         }
@@ -357,14 +358,14 @@ const App = struct {
     fn cancel(self: *App) void {
         const waiting = self.waiting orelse return;
         self.waiting = null;
-        if (waiting.sent) self.servers[waiting.server].cancel(self.gpa, self.io);
+        self.servers[waiting.server].cancel(self.gpa, self.io);
     }
 
     /// Sends the waiting request to its initialized server, after bringing
     /// the server's documents up to date. A missing provider, a stale request
     /// or a server that dies on the write gets a notice instead.
     fn send(self: *App) void {
-        const waiting = &self.waiting.?;
+        const waiting = self.waiting.?;
         const server = &self.servers[waiting.server];
         const name = server.server.name;
         const capabilities = server.capabilities.?;
@@ -391,7 +392,6 @@ const App = struct {
             self.waiting = null;
             return self.status.print("Not enough memory; {s} not asked", .{name});
         }
-        waiting.sent = true;
     }
 
     /// Brings server `index` up to date with the open editable documents of
@@ -865,8 +865,6 @@ const Waiting = struct {
     cursor: usize,
     /// The document's `Buffer.changes` when asked.
     changes: u64,
-    /// Sent to the server; until then it waits for initialization.
-    sent: bool = false,
 };
 
 /// What `navigation` looks for, as a lowercase noun for `count` of them.
