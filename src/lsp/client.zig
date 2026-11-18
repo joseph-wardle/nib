@@ -45,12 +45,12 @@ pub const Change = struct {
 };
 
 pub const State = union(enum) {
-    /// Never started.
+    /// Not running; for the caller to start.
     idle,
     running: std.process.Child,
-    /// Died or failed the protocol, and was reaped; may be started again.
+    /// Died, failed the protocol or failed to start for a reason that may pass
     exited,
-    /// Couldn't be started, or refused to initialize.
+    /// Its command can't be run, or it refused to initialize
     unavailable: anyerror,
 };
 
@@ -92,8 +92,6 @@ pub const Client = struct {
         self.* = undefined;
     }
 
-    /// Starts the server in `root` and sends `initialize`. A server that
-    /// can't be started becomes unavailable.
     pub fn start(self: *Client, gpa: Allocator, io: std.Io, root: []const u8) void {
         std.debug.assert(self.state == .idle or self.state == .exited);
         self.reset(gpa);
@@ -106,7 +104,18 @@ pub const Client = struct {
             .stderr = .ignore,
             .pgid = 0,
         }) catch |err| {
-            self.state = .{ .unavailable = err };
+            // Zig 0.17.1 leaves a zombie and two descriptors when the child
+            // reports the failure.
+            self.state = switch (err) {
+                error.OutOfMemory,
+                error.SystemResources,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.ResourceLimitReached,
+                error.FileBusy,
+                => .exited,
+                else => .{ .unavailable = err },
+            };
             return;
         };
         self.state = .{ .running = child };
@@ -116,9 +125,7 @@ pub const Client = struct {
             if (posix.errno(flags) != .SUCCESS or
                 posix.errno(linux.fcntl(fd, linux.F.SETFL, nonblocking)) != .SUCCESS)
             {
-                self.stop(io);
-                self.state = .{ .unavailable = error.PipeSetupFailed };
-                return;
+                return self.stop(io);
             }
         }
         const process: i32 = linux.getpid();
@@ -296,7 +303,6 @@ pub const Client = struct {
         self.flush(gpa, io);
     }
 
-    /// Kills the server's process group and reaps it.
     pub fn stop(self: *Client, io: std.Io) void {
         var child = self.state.running;
         _ = linux.kill(-child.id.?, .KILL);
@@ -305,6 +311,7 @@ pub const Client = struct {
         defer _ = io.swapCancelProtection(protection);
         _ = child.wait(io) catch {};
         self.state = .exited;
+        self.capabilities = null;
         self.pending = null;
     }
 
@@ -661,4 +668,45 @@ test "a missing command is unavailable" {
     defer client.deinit(testing.allocator, testing.io);
     client.start(testing.allocator, testing.io, "/");
     try testing.expectEqual(error.FileNotFound, client.state.unavailable);
+}
+
+pub const NoDescriptors = struct {
+    saved: linux.rlimit,
+    /// The lowest free descriptor when lowered.
+    lowest: u64,
+
+    pub fn lower() !NoDescriptors {
+        const lowest = lowestFree();
+        var saved: linux.rlimit = undefined;
+        if (posix.errno(linux.getrlimit(.NOFILE, &saved)) != .SUCCESS) return error.LimitFailed;
+        var lowered = saved;
+        lowered.cur = lowest;
+        if (posix.errno(linux.setrlimit(.NOFILE, &lowered)) != .SUCCESS) return error.LimitFailed;
+        return .{ .saved = saved, .lowest = lowest };
+    }
+
+    pub fn restore(self: NoDescriptors) void {
+        _ = linux.setrlimit(.NOFILE, &self.saved);
+    }
+
+    pub fn lowestFree() u64 {
+        const copy = linux.dup(0);
+        _ = linux.close(@intCast(copy));
+        return copy;
+    }
+};
+
+test "a start short of descriptors leaves the server exited, leaking none, and it starts later" {
+    var project: Project = undefined;
+    try project.init();
+    defer project.temp.cleanup();
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(testing.allocator, testing.io);
+    const limit = try NoDescriptors.lower();
+    client.start(testing.allocator, testing.io, project.root);
+    limit.restore();
+    try testing.expect(client.state == .exited);
+    try testing.expectEqual(limit.lowest, NoDescriptors.lowestFree());
+    try startZls(&client, &project);
+    try testing.expect(client.state == .running);
 }

@@ -51,10 +51,13 @@ pub const Reader = struct {
 
     /// Adds bytes read from the server. Invalidates bodies returned by `next`.
     pub fn append(self: *Reader, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
-        const unread = self.pending.items.len - self.start;
-        std.mem.copyForwards(u8, self.pending.items[0..unread], self.pending.items[self.start..]);
-        self.pending.items.len = unread;
-        self.start = 0;
+        // Moving only after a message was taken keeps a long message linear.
+        if (self.start != 0) {
+            const unread = self.pending.items.len - self.start;
+            std.mem.copyForwards(u8, self.pending.items[0..unread], self.pending.items[self.start..]);
+            self.pending.items.len = unread;
+            self.start = 0;
+        }
         try self.pending.appendSlice(gpa, bytes);
     }
 

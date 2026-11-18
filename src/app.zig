@@ -144,16 +144,29 @@ const App = struct {
         }
     }
 
-    /// Starts the active document's server the first time a file of its
-    /// language is active, once its frame is on screen: spawning blocks for
-    /// about 0.6 ms. Waits for the finder's root. A server that exited starts
-    /// again only on a navigation key.
     fn startServer(self: *App) void {
+        if (self.waiting) |waiting| {
+            if (self.documents.get(waiting.document)) |entry| {
+                const path = entry.document.source.path;
+                self.startIdle(waiting.server, path) catch {
+                    self.waiting = null;
+                    self.failedStart(&self.servers[waiting.server]);
+                    self.redraw = true;
+                };
+            }
+        }
         const entry = self.documents.current() orelse return;
         const path = entry.document.source.path;
-        const server = &self.servers[client.serverFor(path) orelse return];
+        // With no request waiting, a failure is reported by the next key.
+        self.startIdle(client.serverFor(path) orelse return, path) catch {};
+    }
+
+    /// Starts server `index` for `path` if it is idle and the root is known.
+    fn startIdle(self: *App, index: usize, path: []const u8) error{StartFailed}!void {
+        const server = &self.servers[index];
         if (server.state != .idle) return;
         server.start(self.gpa, self.io, self.serverRoot(path) orelse return);
+        if (server.state != .running) return error.StartFailed;
     }
 
     /// Where a server for `path` runs: the finder's root, else the file's
@@ -191,12 +204,17 @@ const App = struct {
     fn unavailable(self: *App, server: *const client.Client) void {
         const name = server.server.name;
         switch (server.state) {
-            .unavailable => |err| if (err == error.FileNotFound)
-                self.status.print("{s} not found", .{name})
-            else
-                self.status.print("{s} failed to start", .{name}),
+            .unavailable => self.failedStart(server),
             else => self.status.print("{s} exited", .{name}),
         }
+    }
+
+    /// Says why starting `server` just failed, or why it never can.
+    fn failedStart(self: *App, server: *const client.Client) void {
+        const name = server.server.name;
+        const missing = server.state == .unavailable and server.state.unavailable == error.FileNotFound;
+        if (missing) return self.status.print("{s} not found", .{name});
+        self.status.print("{s} failed to start", .{name});
     }
 
     /// Feeds one read, or an expired Escape deadline, through `decoder`; then
@@ -305,8 +323,8 @@ const App = struct {
     }
 
     /// `gd` and the `gr` keys: asks the active document's server, replacing
-    /// a waiting request. A server that exited starts again; until one is
-    /// initialized the request waits. The answer applies in `arrive`.
+    /// a waiting request. Until the server is started and initialized the
+    /// request waits. The answer applies in `arrive`.
     fn navigate(self: *App, navigation: protocol.Navigation) void {
         self.cancel();
         const entry = self.documents.current().?;
@@ -320,13 +338,9 @@ const App = struct {
         if (!entry.document.buffer.editable) {
             return self.status.print("Read-only file not sent to {s}", .{name});
         }
-        if (server.state == .exited) {
-            const root = self.serverRoot(path) orelse std.fs.path.dirname(path) orelse "/";
-            server.start(self.gpa, self.io, root);
-        }
-        if (server.state == .unavailable or server.state == .exited) {
-            return self.unavailable(server);
-        }
+        if (server.state == .unavailable) return self.unavailable(server);
+        // Started again after this key's frame, as at launch (`startServer`).
+        if (server.state == .exited) server.state = .idle;
         self.waiting = .{
             .server = index,
             .navigation = navigation,
@@ -2048,4 +2062,36 @@ test "a dirty target activates without reloading, and a target that fails to ope
     try testing.expectEqual(a, app.documents.active.?);
     try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
     try testing.expectEqual(jumps, app.documents.jumps.len);
+}
+
+test "a key on an exited server waits for it to start after the frame; a failed start drops the request" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    // Without a Git root, servers run in the file's directory.
+    fixture.finder.root_failure = error.FileNotFound;
+    const server = &app.servers[0];
+    server.state = .exited;
+    server.capabilities = null;
+    fixture.keys("gd");
+    try testing.expectEqualStrings("Asking zls...", app.status.text());
+    try testing.expect(server.state == .idle);
+    try testing.expectEqualStrings("", fixture.sent());
+    const limit = try client.NoDescriptors.lower();
+    app.startServer();
+    limit.restore();
+    try testing.expectEqualStrings("zls failed to start", app.status.text());
+    try testing.expectEqual(null, app.waiting);
+    try testing.expect(server.state == .exited);
+    // The next key tries again, even after a switch to a file with no server
+    // before the frame.
+    fixture.keys("gd");
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "notes.md", .data = "notes\n" });
+    _ = try fixture.open("notes.md");
+    app.startServer();
+    try testing.expect(server.state == .running);
+    try testing.expect(app.waiting != null);
+    try testing.expectEqualStrings("Asking zls...", app.status.text());
 }

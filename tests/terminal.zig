@@ -2084,7 +2084,8 @@ fn gone(pid: posix.pid_t) !void {
 }
 
 // Covers gd landing in another file through real zls, Ctrl-O returning, and
-// grr with two references landing on the first with the count.
+// grr with two references landing on the first with the count, and a killed
+// server reported, then started again by the next key.
 fn navigationWorkflow(executable: [:0]const u8) !void {
     var project: ZigProject = .{};
     try project.create("navigation");
@@ -2111,6 +2112,17 @@ fn navigationWorkflow(executable: [:0]const u8) !void {
     try landed(&process, "3:8", "a.zig");
     try process.send("\x0f");
     try landed(&process, "4:7", "a.zig");
+    // A server killed outside Nib is reported and reaped; the next key
+    // starts another after its frame.
+    const killed = try server(&process);
+    _ = try checked(linux.kill(killed, .KILL));
+    try process.until("zls exited");
+    try process.ready();
+    try gone(killed);
+    try process.send("gd");
+    try process.until("Asking zls...");
+    try process.ready();
+    try landed(&process, "1:8", "b.zig");
     const pid = try server(&process);
     try process.send(":qa\r");
     try equal(@as(u8, 0), try process.wait(false));
