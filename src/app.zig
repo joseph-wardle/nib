@@ -134,14 +134,20 @@ const App = struct {
             // One read can hold many keys or a large paste; they share a timestamp.
             const now = if (bytes.len != 0 or expired) try terminal.milliseconds() else 0;
             if (self.step(&decoder, bytes, expired, now)) |code| return code;
-            if (self.redraw) {
-                self.redraw = false;
-                self.draw() catch |err| {
-                    if (err != error.Interrupted) return err;
-                };
-            }
+            try self.present();
             self.startServer();
+            // A request whose server just failed to start says so.
+            try self.present();
         }
+    }
+
+    /// Draws a frame if anything changed since the last one.
+    fn present(self: *App) terminal.Error!void {
+        if (!self.redraw) return;
+        self.redraw = false;
+        self.draw() catch |err| {
+            if (err != error.Interrupted) return err;
+        };
     }
 
     fn startServer(self: *App) void {

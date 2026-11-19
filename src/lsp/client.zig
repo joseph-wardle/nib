@@ -48,9 +48,9 @@ pub const State = union(enum) {
     /// Not running; for the caller to start.
     idle,
     running: std.process.Child,
-    /// Died, failed the protocol or failed to start for a reason that may pass
+    /// Died, failed the protocol or failed to start for a reason that may pass.
     exited,
-    /// Its command can't be run, or it refused to initialize
+    /// Its command can't be run, or it refused to initialize.
     unavailable: anyerror,
 };
 

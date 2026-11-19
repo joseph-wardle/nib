@@ -2083,9 +2083,20 @@ fn gone(pid: posix.pid_t) !void {
     try equal(linux.E.SRCH, posix.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
 }
 
+/// The lowest descriptor number process `pid` has free.
+fn lowestFree(pid: posix.pid_t) !u64 {
+    var lowest: u64 = 0;
+    while (true) : (lowest += 1) {
+        var buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&buffer, "/proc/{d}/fd/{d}", .{ pid, lowest }, 0);
+        if (posix.errno(linux.access(path, linux.F_OK)) != .SUCCESS) return lowest;
+    }
+}
+
 // Covers gd landing in another file through real zls, Ctrl-O returning, and
 // grr with two references landing on the first with the count, and a killed
-// server reported, then started again by the next key.
+// server reported, a restart that fails shown at once, then a restart by the
+// next key.
 fn navigationWorkflow(executable: [:0]const u8) !void {
     var project: ZigProject = .{};
     try project.create("navigation");
@@ -2112,13 +2123,22 @@ fn navigationWorkflow(executable: [:0]const u8) !void {
     try landed(&process, "3:8", "a.zig");
     try process.send("\x0f");
     try landed(&process, "4:7", "a.zig");
-    // A server killed outside Nib is reported and reaped; the next key
-    // starts another after its frame.
+    // A server killed outside Nib is reported and reaped. With no descriptor
+    // free, the next key's start fails after its frame and says so unprompted.
     const killed = try server(&process);
     _ = try checked(linux.kill(killed, .KILL));
     try process.until("zls exited");
     try process.ready();
     try gone(killed);
+    var saved: linux.rlimit = undefined;
+    _ = try checked(linux.prlimit(process.pid, .NOFILE, null, &saved));
+    const lowered: linux.rlimit = .{ .cur = try lowestFree(process.pid), .max = saved.max };
+    _ = try checked(linux.prlimit(process.pid, .NOFILE, &lowered, null));
+    try process.send("gd");
+    try process.until("zls failed to start");
+    _ = try checked(linux.prlimit(process.pid, .NOFILE, &saved, null));
+    try process.ready();
+    // Started again after the next key's frame.
     try process.send("gd");
     try process.until("Asking zls...");
     try process.ready();
