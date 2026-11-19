@@ -19,8 +19,9 @@ pub const Request = union(enum) {
     all: struct { root: Io.Dir, git: bool },
     /// Holds a reference to the catalog, which the job only reads.
     filter: struct { catalog: *match.Catalog, query: []u8 },
-    /// A path relative to the borrowed root. Owned.
-    preview: struct { root: Io.Dir, path: [:0]u8 },
+    /// A path relative to the borrowed root, or absolute, and the file offset
+    /// of a line to show near the top. The path is owned.
+    preview: struct { root: Io.Dir, path: [:0]u8, at: u64 },
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         switch (self.*) {
@@ -212,7 +213,7 @@ fn run(gpa: Allocator, io: Io, slot: *Slot, wake_fd: posix.fd_t) void {
             break :listing .{ .listing = catalogued(gpa, listed, cancel) };
         },
         .filter => |job| .{ .matches = match.filter(gpa, job.catalog, job.query, cancel) },
-        .preview => |job| .{ .preview = preview.read(gpa, job.root, job.path, cancel) },
+        .preview => |job| .{ .preview = preview.read(gpa, job.root, job.path, job.at, cancel) },
     };
     publish(slot, wake_fd);
 }
@@ -322,7 +323,7 @@ test "cancelled lanes report nothing and owned requests are freed" {
     const all: Request = .{ .all = .{ .root = temp.dir, .git = false } };
     defer jobs.deinit(testing.allocator, testing.io);
     const path = try testing.allocator.dupeSentinel(u8, "d0/e/f0", 0);
-    const read: Request = .{ .preview = .{ .root = temp.dir, .path = path } };
+    const read: Request = .{ .preview = .{ .root = temp.dir, .path = path, .at = 0 } };
     jobs.submit(testing.allocator, testing.io, .preview, read);
     jobs.submit(testing.allocator, testing.io, .discovery, all);
     jobs.cancel(testing.allocator, .discovery);

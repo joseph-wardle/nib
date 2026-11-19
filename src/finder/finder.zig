@@ -50,6 +50,8 @@ pub const Location = struct {
     /// read. Borrowed for the call; only its first `max_text` bytes, after
     /// leading whitespace, are kept.
     text: []const u8,
+    /// Where the line starts in the file it was read from
+    start: u64,
 };
 
 /// Bytes of a location's line text that its row keeps.
@@ -120,6 +122,8 @@ pub const Located = struct {
     place: Place,
     /// Label bytes spelling `path:line:column`, before the line's text.
     heading: usize,
+    /// As `Location.start`.
+    start: u64,
 };
 
 /// What the preview pane shows for the selection.
@@ -170,6 +174,8 @@ pub const Finder = struct {
     /// The path whose file preview is shown or being read; empty when the
     /// selection needs none.
     previewed: std.ArrayList(u8) = .empty,
+    /// The offset in `previewed` of the line shown near the top.
+    previewed_at: u64 = 0,
     /// Owned.
     snapshot: ?Snapshot = null,
     preview_failure: ?jobs.Error = null,
@@ -283,7 +289,7 @@ pub const Finder = struct {
             try bytes.append(gpa, 0);
             try paths.appendSlice(gpa, place.path);
             // Pointed into the owned bytes below, once they stop moving.
-            listed.* = .{ .place = place, .heading = heading };
+            listed.* = .{ .place = place, .heading = heading, .start = location.start };
         }
         const owned_paths = try paths.toOwnedSlice(gpa);
         errdefer gpa.free(owned_paths);
@@ -434,6 +440,7 @@ pub const Finder = struct {
         if (self.preview_failure) |err| return .{ .unavailable = err };
         if (self.reading) return .loading;
         std.debug.assert(std.mem.eql(u8, chosen.path, self.previewed.items));
+        std.debug.assert(chosen.start == self.previewed_at);
         return .{ .file = self.snapshot.? };
     }
 
@@ -490,7 +497,9 @@ pub const Finder = struct {
                 self.present(gpa, job.catalog.retain(), matches);
             },
             .preview => |result| {
-                std.debug.assert(std.mem.eql(u8, request.preview.path, self.previewed.items));
+                const job = request.preview;
+                std.debug.assert(std.mem.eql(u8, job.path, self.previewed.items));
+                std.debug.assert(job.at == self.previewed_at);
                 self.reading = false;
                 self.snapshot = result catch |err| {
                     self.preview_failure = err;
@@ -507,6 +516,8 @@ pub const Finder = struct {
         path: []const u8,
         document: ?Document,
         place: ?Place,
+        /// Where a location's line starts in the file, for its preview.
+        start: u64,
     };
 
     fn target(self: *const Finder, entry: match.Entry) Target {
@@ -514,9 +525,16 @@ pub const Finder = struct {
             .path = entry.path,
             .document = self.opened(entry.label),
             .place = null,
+            .start = 0,
         };
-        const place = self.lists.getPtrConst(.locations).located[entry.origin].place;
-        return .{ .path = place.path, .document = self.openedAt(place.path), .place = place };
+        const listed = self.lists.getPtrConst(.locations).located[entry.origin];
+        const path = listed.place.path;
+        return .{
+            .path = path,
+            .document = self.openedAt(path),
+            .place = listed.place,
+            .start = listed.start,
+        };
     }
 
     /// The open document listed under `label`, from any category.
@@ -540,28 +558,32 @@ pub const Finder = struct {
     }
 
     /// Keeps the preview on the visible selection. An open document needs no
-    /// read; a file is read in the background unless it is already shown or
-    /// being read, or `reread` asks for it again. Running out of memory shows
-    /// as an unavailable preview and is retried by the next look.
+    /// read; a file is read in the background unless the same path and line
+    /// are already shown or being read, or `reread` asks for them again.
+    /// Running out of memory shows as an unavailable preview and is retried
+    /// by the next look.
     fn look(self: *Finder, gpa: Allocator, io: Io, background: *jobs.Jobs, reread: bool) void {
-        const wanted: ?[]const u8 = wanted: {
+        const wanted: ?Target = wanted: {
             if (!self.visible) break :wanted null;
             const entry = self.selection() orelse break :wanted null;
             const chosen = self.target(entry);
             if (chosen.document != null) break :wanted null;
-            break :wanted chosen.path;
+            break :wanted chosen;
         };
-        if (wanted) |path| {
-            if (!reread and std.mem.eql(u8, path, self.previewed.items)) return;
+        if (wanted) |chosen| {
+            const same = std.mem.eql(u8, chosen.path, self.previewed.items) and
+                chosen.start == self.previewed_at;
+            if (!reread and same) return;
         }
         background.cancel(gpa, .preview);
         if (self.snapshot) |*snapshot| snapshot.deinit(gpa);
         self.snapshot = null;
         self.previewed.clearRetainingCapacity();
+        self.previewed_at = 0;
         self.preview_failure = null;
         self.reading = false;
-        const path = wanted orelse return;
-        self.read(gpa, io, background, path) catch |err| {
+        const chosen = wanted orelse return;
+        self.read(gpa, io, background, chosen.path, chosen.start) catch |err| {
             self.previewed.clearRetainingCapacity();
             self.preview_failure = err;
         };
@@ -573,13 +595,16 @@ pub const Finder = struct {
         io: Io,
         background: *jobs.Jobs,
         path: []const u8,
+        at: u64,
     ) Allocator.Error!void {
         // Discovered paths are relative to the root, which they need. A
         // location's path is absolute, which `openat` resolves without it.
         const dir = if (self.category == .locations) Io.Dir.cwd() else self.root.?.dir;
         try self.previewed.appendSlice(gpa, path);
         const owned = try gpa.dupeSentinel(u8, path, 0);
-        background.submit(gpa, io, .preview, .{ .preview = .{ .root = dir, .path = owned } });
+        const request: jobs.Request = .{ .preview = .{ .root = dir, .path = owned, .at = at } };
+        background.submit(gpa, io, .preview, request);
+        self.previewed_at = at;
         self.reading = true;
     }
 
@@ -1369,7 +1394,8 @@ test "a category change that runs out of memory never shows the old category's s
 }
 
 fn listedAt(path: []const u8, line: u32, column: u32, text: []const u8) Location {
-    return .{ .place = .{ .path = path, .line = line, .column = column }, .text = text };
+    const place: Place = .{ .path = path, .line = line, .column = column };
+    return .{ .place = place, .text = text, .start = 0 };
 }
 
 test "Locations lists rows in the given order, filters them and offers each place" {
@@ -1490,7 +1516,8 @@ test "a location in an open document is found by path, marked and previewed at i
     try testing.expectEqual(at_line, finder.preview());
     try testing.expectEqual(@as(usize, 0), finder.previewed.items.len);
     finder.move(testing.allocator, testing.io, &background, 1);
-    try testing.expectEqualStrings("src/main.zig:1:8  pub fn main() void {}", selectedLabel(&finder));
+    const main_row = "src/main.zig:1:8  pub fn main() void {}";
+    try testing.expectEqualStrings(main_row, selectedLabel(&finder));
     try testing.expectEqual(null, finder.row(finder.matches[1]).document);
     // Locations has no ignore status to show.
     try testing.expectEqual(match.Ignore.unknown, finder.row(finder.matches[1]).ignore);
@@ -1518,7 +1545,8 @@ test "allocation failure while filling Locations keeps the previous rows, focus 
     for (&after, files) |*row, file| row.* = listedAt(file.path, 1, 2, "  new");
     var index: usize = 0;
     while (true) : (index += 1) {
-        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = index });
+        const config: std.testing.FailingAllocator.Config = .{ .fail_index = index };
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, config);
         const filled = finder.locate(failing.allocator(), testing.io, &background, &after, 3);
         if (filled) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
         try testing.expectEqual(Category.open, finder.category);
@@ -1534,4 +1562,42 @@ test "allocation failure while filling Locations keeps the previous rows, focus 
     try testing.expectEqual(@as(usize, 25), finder.matches.len);
     try testing.expectEqualStrings("/p/f00:2:3  new", selectedLabel(&finder));
     try testing.expectEqual(@as(usize, 3), finder.lists.getPtrConst(.locations).omitted);
+}
+
+test "two locations in one file each preview their own line, past 64 KiB, with no root" {
+    var scratch = try Scratch.init();
+    defer scratch.deinit();
+    // 10,000 lines of 10 bytes: "line 0042\n".
+    var lines: [100_000]u8 = undefined;
+    for (0..10_000) |index| _ = std.fmt.bufPrint(lines[index * 10 ..][0..10], "line {d:0>4}\n", .{
+        index,
+    }) catch unreachable;
+    try scratch.dir.writeFile(testing.io, .{ .sub_path = "lines", .data = &lines });
+    var paths: [2][256]u8 = undefined;
+    const file = scratch.join(&paths[0], "lines");
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    const missing: discovery.Start = .{ .directory = scratch.join(&paths[1], "missing") };
+    finder.start(testing.allocator, testing.io, &background, missing);
+    try settle(&finder, &background);
+    try testing.expect(finder.root_failure != null);
+    var rows = [_]Location{
+        listedAt(file, 9000, 0, "line 9000"),
+        listedAt(file, 5, 0, "line 0005"),
+    };
+    rows[0].start = 90_000;
+    rows[1].start = 50;
+    try finder.locate(testing.allocator, testing.io, &background, &rows, 0);
+    try settle(&finder, &background);
+    try testing.expect(std.mem.startsWith(u8, try previewText(&finder), "line 8997\nline 8998\n"));
+    try testing.expectEqual(@as(u64, 89_970), finder.preview().file.start);
+    finder.move(testing.allocator, testing.io, &background, 1);
+    try testing.expect(finder.preview() == .loading);
+    try settle(&finder, &background);
+    try testing.expect(std.mem.startsWith(u8, try previewText(&finder), "line 0002\n"));
+    finder.move(testing.allocator, testing.io, &background, -1);
+    try settle(&finder, &background);
+    try testing.expect(std.mem.startsWith(u8, try previewText(&finder), "line 8997\n"));
 }

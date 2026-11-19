@@ -8,6 +8,7 @@ const Viewport = @import("../text/viewport.zig").Viewport;
 const renderText = @import("../text/viewport.zig").renderText;
 const jobs = @import("../finder/jobs.zig");
 const match = @import("../finder/match.zig");
+const preview = @import("../finder/preview.zig");
 const Finder = @import("../finder/finder.zig").Finder;
 const Category = @import("../finder/finder.zig").Category;
 const DocumentId = @import("../finder/finder.zig").DocumentId;
@@ -221,10 +222,7 @@ fn previewPane(finder: *const Finder, documents: *const Session, title: *[96]u8)
                 previewFailure(err),
             }) catch unreachable,
         },
-        .file => |snapshot| .{
-            .title = if (snapshot.truncated) "Preview: first 64 KiB" else "Preview",
-            .text = snapshot.bytes,
-        },
+        .file => |snapshot| .{ .title = snapshotTitle(snapshot), .text = snapshot.bytes },
         .document => |shown| document: {
             // The finder lists documents again whenever they close.
             const entry = opened(documents, shown.id) orelse break :document .{ .title = "" };
@@ -239,13 +237,15 @@ fn previewPane(finder: *const Finder, documents: *const Session, title: *[96]u8)
     };
 }
 
-/// Lines of a preview shown above a location's line.
-const context_above = 3;
+fn snapshotTitle(snapshot: preview.Snapshot) []const u8 {
+    if (snapshot.start != 0) return "Preview: near the line";
+    return if (snapshot.truncated) "Preview: first 64 KiB" else "Preview";
+}
 
 /// The preview's first row for a location on `line`, which may be past the
 /// text since edits after the answer.
 fn above(buffer: *const Buffer, line: u32) usize {
-    return @min(line, buffer.insertionRows() - 1) -| context_above;
+    return @min(line, buffer.insertionRows() - 1) -| preview.lines_above;
 }
 
 /// The open document the finder lists as `id`.
@@ -395,8 +395,8 @@ test "Locations counts rows and omitted locations, and a long row keeps the resu
     defer background.deinit(testing.allocator, testing.io);
     const long: [100 * 1024]u8 = @splat('x');
     const rows = [_]Location{
-        .{ .place = .{ .path = "/p/a.zig", .line = 0, .column = 0 }, .text = &long },
-        .{ .place = .{ .path = "/p/b.zig", .line = 4, .column = 2 }, .text = "b();" },
+        .{ .place = .{ .path = "/p/a.zig", .line = 0, .column = 0 }, .text = &long, .start = 0 },
+        .{ .place = .{ .path = "/p/b.zig", .line = 4, .column = 2 }, .text = "b();", .start = 0 },
     };
     try finder.locate(testing.allocator, testing.io, &background, &rows, 3);
     var row: [80]u8 = undefined;
@@ -420,4 +420,16 @@ test "an open document's location preview starts a few lines above its line, wit
     try testing.expectEqual(@as(usize, 2), above(&buffer, 5));
     // Edits since the answer may have removed the line.
     try testing.expectEqual(@as(usize, 4), above(&buffer, 4_000_000_000));
+}
+
+test "a file preview's title says when it shows only part of the file" {
+    var bytes: [1]u8 = "x".*;
+    const whole: preview.Snapshot = .{ .bytes = &bytes, .truncated = false };
+    const first: preview.Snapshot = .{ .bytes = &bytes, .truncated = true };
+    const near: preview.Snapshot = .{ .bytes = &bytes, .truncated = false, .start = 90 };
+    const near_cut: preview.Snapshot = .{ .bytes = &bytes, .truncated = true, .start = 90 };
+    try testing.expectEqualStrings("Preview", snapshotTitle(whole));
+    try testing.expectEqualStrings("Preview: first 64 KiB", snapshotTitle(first));
+    try testing.expectEqualStrings("Preview: near the line", snapshotTitle(near));
+    try testing.expectEqualStrings("Preview: near the line", snapshotTitle(near_cut));
 }
