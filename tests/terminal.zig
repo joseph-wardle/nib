@@ -2094,9 +2094,9 @@ fn lowestFree(pid: posix.pid_t) !u64 {
 }
 
 // Covers gd landing in another file through real zls, Ctrl-O returning, and
-// grr with the declaration and two calls landing on the first with the count, and a killed
-// server reported, a restart that fails shown at once, then a restart by the
-// next key.
+// grr listing the declaration and two calls in Locations, filtered, opened
+// and resumed with Ctrl-P, a killed server reported, a restart that fails
+// shown at once, then a restart by the next key.
 fn navigationWorkflow(executable: [:0]const u8) !void {
     var project: ZigProject = .{};
     try project.create("navigation");
@@ -2117,6 +2117,26 @@ fn navigationWorkflow(executable: [:0]const u8) !void {
     try process.send("j");
     try landed(&process, "4:7", "a.zig");
     try process.send("grr");
+    // The declaration in b.zig and both calls, relative to the root.
+    try process.until("[Locations]");
+    try process.until("3/3 rows");
+    try process.until("b.zig:1:8  pub fn target() void {}");
+    try process.until("a.zig:3:7  b.target();");
+    try process.until("a.zig:4:7  b.target();");
+    try process.ready();
+    try process.send("a.zig:3");
+    try process.until("1/3 rows");
+    try process.ready();
+    try process.send("\r");
+    try landed(&process, "3:7", "a.zig");
+    try process.send("\x0f");
+    try landed(&process, "4:7", "a.zig");
+    // Ctrl-P resumes Locations with the query as it was left.
+    try process.send("\x10");
+    try process.until("[Locations]");
+    try process.until("1/3 rows");
+    try process.ready();
+    try process.send("\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
     try process.until("3/3 rows");
     try process.ready();
     try process.send("\r");
