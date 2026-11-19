@@ -30,7 +30,7 @@ pub fn draw(
 ) terminal.Error!void {
     const width: usize = size.columns -| 1;
     if (size.rows == 0 or width == 0) return;
-    const selected = selection(finder);
+    const selected = finder.caption();
     const rows = layout(finder, size);
     const header_rows = rows.header;
     const progress_rows = rows.progress;
@@ -40,11 +40,14 @@ pub fn draw(
 
     if (header_rows != 0) {
         var line: Line = .init(try frame.reserve(width));
-        for ([_]Category{ .project, .all, .open }) |category| {
+        // Locations is present once an answer has filled it.
+        const located = finder.lists.get(.locations).catalog != null;
+        for ([_]Category{ .project, .all, .open, .locations }) |category| {
             const name = switch (category) {
                 .project => "Project",
                 .all => "All",
                 .open => "Open",
+                .locations => if (located) "Locations" else continue,
             };
             const focused = category == finder.category;
             line.put(if (focused) "[" else " ");
@@ -103,11 +106,6 @@ pub fn draw(
     }
 }
 
-fn selection(finder: *const Finder) []const u8 {
-    if (finder.matches.len == 0) return "";
-    return finder.row(finder.matches[finder.selected]).label;
-}
-
 /// The finder's rows, top to bottom, above the status row. The query and
 /// the selected path come first, then the header and progress.
 pub fn layout(finder: *const Finder, size: terminal.Size) Layout {
@@ -117,7 +115,7 @@ pub fn layout(finder: *const Finder, size: terminal.Size) Layout {
     var rows: Layout = .{};
     rows.query = @min(budget, 1);
     budget -= rows.query;
-    rows.path = @min(budget, (selection(finder).len + width - 1) / width);
+    rows.path = @min(budget, (finder.caption().len + width - 1) / width);
     budget -= rows.path;
     rows.header = @min(budget, 1);
     budget -= rows.header;
@@ -141,9 +139,16 @@ fn progress(finder: *const Finder, row: []u8) void {
     var number: [64]u8 = undefined;
     const list = finder.lists.getPtrConst(finder.category);
     const total = if (list.catalog) |catalog| catalog.entries.len else 0;
-    const counts = "{d}/{d} files";
-    const shown = std.fmt.bufPrint(&number, counts, .{ finder.matches.len, total });
+    const counts = .{ finder.matches.len, total };
+    const shown = if (finder.category == .locations)
+        std.fmt.bufPrint(&number, "{d}/{d} rows", counts)
+    else
+        std.fmt.bufPrint(&number, "{d}/{d} files", counts);
     line.put(shown catch unreachable);
+    if (finder.category == .locations and list.omitted != 0) {
+        const omitted = std.fmt.bufPrint(&number, " | {d} outside local files", .{list.omitted});
+        line.put(omitted catch unreachable);
+    }
     if (list.discovering) line.put(" | scanning");
     if (finder.filtering) line.put(" | searching");
     if (list.failure) |err| {
@@ -165,7 +170,7 @@ fn progress(finder: *const Finder, row: []u8) void {
     if (!root.git) return;
     // Open takes ignore status from All's listing.
     const all = finder.lists.getPtrConst(.all);
-    if (finder.category == .project) return;
+    if (finder.category == .project or finder.category == .locations) return;
     if (all.ignore_reason.len != 0) {
         line.put(" | ");
         line.put(all.ignore_reason);
@@ -189,7 +194,7 @@ fn drawResults(
     const list_width = if (split) (width - 1) / 2 else width;
     var title: [96]u8 = undefined;
     var pane: Pane = if (split) previewPane(finder, documents, &title) else .{ .title = "" };
-    const marks = finder.category != .project and
+    const marks = (finder.category == .all or finder.category == .open) and
         if (finder.root) |root| root.git else false;
     for (0..rows) |index| {
         if (index < page.len) {
@@ -220,17 +225,27 @@ fn previewPane(finder: *const Finder, documents: *const Session, title: *[96]u8)
             .title = if (snapshot.truncated) "Preview: first 64 KiB" else "Preview",
             .text = snapshot.bytes,
         },
-        .document => |id| document: {
+        .document => |shown| document: {
             // The finder lists documents again whenever they close.
-            const entry = opened(documents, id) orelse break :document .{ .title = "" };
+            const entry = opened(documents, shown.id) orelse break :document .{ .title = "" };
             const buffer = &entry.document.buffer;
+            const top = if (shown.line) |line| above(buffer, line) else entry.viewport.top;
             break :document .{
                 .title = if (buffer.modified()) "Open file, unsaved edits" else "Open file",
                 .buffer = buffer,
-                .viewport = .{ .top = entry.viewport.top },
+                .viewport = .{ .top = top },
             };
         },
     };
+}
+
+/// Lines of a preview shown above a location's line.
+const context_above = 3;
+
+/// The preview's first row for a location on `line`, which may be past the
+/// text since edits after the answer.
+fn above(buffer: *const Buffer, line: u32) usize {
+    return @min(line, buffer.insertionRows() - 1) -| context_above;
 }
 
 /// The open document the finder lists as `id`.
@@ -368,4 +383,41 @@ test "previews of UTF-8 text, from a snapshot or an open buffer, render like the
         try std.testing.expectEqualStrings(expected, row[0..snapshot.render(12, &row)]);
         try std.testing.expectEqualStrings(expected, row[0..document.render(12, &row)]);
     }
+}
+
+const testing = std.testing;
+const Location = @import("../finder/finder.zig").Location;
+
+test "Locations counts rows and omitted locations, and a long row keeps the results on screen" {
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    const long: [100 * 1024]u8 = @splat('x');
+    const rows = [_]Location{
+        .{ .place = .{ .path = "/p/a.zig", .line = 0, .column = 0 }, .text = &long },
+        .{ .place = .{ .path = "/p/b.zig", .line = 4, .column = 2 }, .text = "b();" },
+    };
+    try finder.locate(testing.allocator, testing.io, &background, &rows, 3);
+    var row: [80]u8 = undefined;
+    progress(&finder, &row);
+    const counts = "2/2 rows | 3 outside local files";
+    try testing.expectEqualStrings(counts, std.mem.trimEnd(u8, &row, " "));
+    const size: terminal.Size = .{ .rows = 24, .columns = 80 };
+    const rows_shown = layout(&finder, size);
+    try testing.expectEqual(@as(usize, 1), rows_shown.path);
+    try testing.expectEqual(@as(usize, 19), rows_shown.results);
+    try finder.locate(testing.allocator, testing.io, &background, rows[1..], 0);
+    progress(&finder, &row);
+    try testing.expectEqualStrings("1/1 rows", std.mem.trimEnd(u8, &row, " "));
+}
+
+test "an open document's location preview starts a few lines above its line, within the text" {
+    var buffer = try Buffer.fromBytes(testing.allocator, "0\n1\n2\n3\n4\n5\n6\n7");
+    defer buffer.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), above(&buffer, 0));
+    try testing.expectEqual(@as(usize, 0), above(&buffer, 3));
+    try testing.expectEqual(@as(usize, 2), above(&buffer, 5));
+    // Edits since the answer may have removed the line.
+    try testing.expectEqual(@as(usize, 4), above(&buffer, 4_000_000_000));
 }

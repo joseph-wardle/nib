@@ -532,7 +532,7 @@ const App = struct {
         switch (event) {
             .key => |byte| switch (byte) {
                 '\r', '\n' => return self.choose(),
-                '\t' => return self.find(self.finder.category.next()),
+                '\t' => return self.find(self.finder.next()),
                 0x0e => return self.move(1),
                 0x10 => return self.move(-1),
                 // Ctrl-R refreshes the category; Ctrl-X enters a command.
@@ -673,6 +673,8 @@ const App = struct {
                 };
                 self.announce(opened.activation, false);
             },
+            // Nothing fills Locations before answers build rows.
+            .location => unreachable,
         }
         self.finder.leave(self.gpa, self.io, self.background);
         self.finding = false;

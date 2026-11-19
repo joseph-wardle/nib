@@ -210,6 +210,13 @@ pub fn filter(
     return matches.toOwnedSlice(gpa);
 }
 
+/// The length of `bytes` as a label shows them. Escaping is per byte, so the
+/// label of a prefix is a prefix of the label.
+pub fn labelLength(bytes: []const u8) usize {
+    const escaped = escapedLength(bytes);
+    return if (escaped == 0) bytes.len else escaped;
+}
+
 const check_interval = 4096;
 
 const bonus_match = 16;
