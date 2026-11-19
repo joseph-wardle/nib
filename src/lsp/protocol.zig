@@ -238,7 +238,7 @@ pub fn navigate(
         .params = .{
             .textDocument = document,
             .position = at,
-            .context = .{ .includeDeclaration = false },
+            .context = .{ .includeDeclaration = true },
         },
     });
     try frame(gpa, queue, .{
@@ -593,7 +593,7 @@ test "each message Nib sends has the expected shape" {
         },
         .{
             .body =
-            \\{"jsonrpc":"2.0","id":8,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///p/a.zig"},"position":{"line":4,"character":2},"context":{"includeDeclaration":false}}}
+            \\{"jsonrpc":"2.0","id":8,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///p/a.zig"},"position":{"line":4,"character":2},"context":{"includeDeclaration":true}}}
             ,
             .write = struct {
                 fn write(queue: *std.ArrayList(u8)) Allocator.Error!void {

@@ -601,10 +601,12 @@ test "zls initializes with UTF-8 and answers definitions and references" {
     try testing.expectEqual(Position{ .line = 0, .character = 7 }, definition[0].at);
     try client.navigate(testing.allocator, testing.io, .references, a, call);
     _ = try settle(&client, isAnswered);
-    // Both calls, without the declaration.
+    // The declaration in the other file, then both calls.
     const references = client.answer.?.locations;
-    try testing.expectEqual(@as(usize, 2), references.len);
-    for (references, [_]u32{ 2, 3 }) |reference, line| {
+    try testing.expectEqual(@as(usize, 3), references.len);
+    try testing.expectEqualStrings(b, references[0].path.?);
+    try testing.expectEqual(Position{ .line = 0, .character = 7 }, references[0].at);
+    for (references[1..], [_]u32{ 2, 3 }) |reference, line| {
         try testing.expectEqualStrings(a, reference.path.?);
         try testing.expectEqual(Position{ .line = line, .character = 6 }, reference.at);
     }

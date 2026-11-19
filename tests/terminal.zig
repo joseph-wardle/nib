@@ -2094,7 +2094,7 @@ fn lowestFree(pid: posix.pid_t) !u64 {
 }
 
 // Covers gd landing in another file through real zls, Ctrl-O returning, and
-// grr with two references landing on the first with the count, and a killed
+// grr with the declaration and two calls landing on the first with the count, and a killed
 // server reported, a restart that fails shown at once, then a restart by the
 // next key.
 fn navigationWorkflow(executable: [:0]const u8) !void {
@@ -2117,10 +2117,10 @@ fn navigationWorkflow(executable: [:0]const u8) !void {
     try process.send("j");
     try landed(&process, "4:7", "a.zig");
     try process.send("grr");
-    try process.until("1 of 2 references; list not built yet");
+    try process.until("1 of 3 references; list not built yet");
     try process.ready();
     try process.send("l");
-    try landed(&process, "3:8", "a.zig");
+    try landed(&process, "1:9", "b.zig");
     try process.send("\x0f");
     try landed(&process, "4:7", "a.zig");
     // A server killed outside Nib is reported and reaped. With no descriptor

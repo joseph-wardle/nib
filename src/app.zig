@@ -1776,8 +1776,8 @@ test "several locations jump to the first and say how many; none or here says so
     const app = &fixture.app;
     var storage: [3][1024]u8 = undefined;
     fixture.keys("grr");
-    // References leave out the declaration.
-    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "\"includeDeclaration\":false") != null);
+    // References include the declaration.
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "\"includeDeclaration\":true") != null);
     var several: [4096]u8 = undefined;
     try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s},{s}]", .{
         try fixture.location(&storage[0], "a.zig", 1, 4),

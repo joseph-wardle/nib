@@ -8,20 +8,26 @@ pub const Position = struct { line: u32, character: u32 };
 
 /// The character boundary in `buffer` that `at` names.
 pub fn offset(buffer: *const Buffer, at: Position, encoding: Encoding) usize {
-    const bytes = buffer.bytes();
-    if (at.line >= buffer.insertionRows()) return bytes.len;
+    if (at.line >= buffer.insertionRows()) return buffer.bytes().len;
     const start = buffer.lineStart(at.line);
-    const end = buffer.contentEnd(at.line);
+    const text = buffer.bytes()[start..buffer.contentEnd(at.line)];
+    return start + column(text, at.character, encoding);
+}
+
+/// The byte offset in `line`, one line's text without its line break, of the
+/// character boundary that `character` names. A column past the text gives its
+/// end, and one inside a character gives that character's start.
+pub fn column(line: []const u8, character: u32, encoding: Encoding) usize {
     switch (encoding) {
-        .utf8 => return char.start(bytes, start + @min(at.character, end - start)),
+        .utf8 => return char.start(line, @min(character, line.len)),
         .utf16 => {
-            var cursor = start;
+            var cursor: usize = 0;
             var units: usize = 0;
-            while (cursor < end) {
-                const character = char.decode(bytes, cursor);
-                units += units16(character);
-                if (units > at.character) break;
-                cursor += character.len;
+            while (cursor < line.len) {
+                const decoded = char.decode(line, cursor);
+                units += units16(decoded);
+                if (units > character) break;
+                cursor += decoded.len;
             }
             return cursor;
         },
@@ -101,8 +107,8 @@ test "a column inside a character lands on its start" {
     // Between the two units of the surrogate pair.
     try expectOffset(&buffer, 0, 2, .utf16, 1);
     // Inside the UTF-8 sequence.
-    for (2..5) |column| {
-        const at: Position = .{ .line = 0, .character = @intCast(column) };
+    for (2..5) |character| {
+        const at: Position = .{ .line = 0, .character = @intCast(character) };
         try testing.expectEqual(@as(usize, 1), offset(&buffer, at, .utf8));
     }
 }
@@ -144,4 +150,17 @@ test "invalid bytes in read-only text count as one unit each" {
     try testing.expect(!buffer.editable);
     try expectRoundTrip(&buffer, 2, .utf16, .{ .line = 0, .character = 2 });
     try expectRoundTrip(&buffer, 2, .utf8, .{ .line = 0, .character = 2 });
+}
+
+test "a column is found from one line's text alone" {
+    // "a", "é" (2 bytes, 1 unit), "😀" (4 bytes, 2 units), "b".
+    const line = "a\xc3\xa9\xf0\x9f\x98\x80b";
+    const utf8 = [_][2]usize{ .{ 0, 0 }, .{ 2, 1 }, .{ 3, 3 }, .{ 6, 3 }, .{ 7, 7 }, .{ 99, 8 } };
+    for (utf8) |case| try testing.expectEqual(case[1], column(line, @intCast(case[0]), .utf8));
+    const utf16 = [_][2]usize{ .{ 1, 1 }, .{ 2, 3 }, .{ 3, 3 }, .{ 4, 7 }, .{ 5, 8 }, .{ 99, 8 } };
+    for (utf16) |case| try testing.expectEqual(case[1], column(line, @intCast(case[0]), .utf16));
+    for ([_]Encoding{ .utf8, .utf16 }) |encoding| {
+        try testing.expectEqual(@as(usize, 0), column("", 5, encoding));
+        try testing.expectEqual(@as(usize, 2), column("\xff\xfex", 2, encoding));
+    }
 }
