@@ -16,6 +16,8 @@ const Session = session.Session;
 const Finder = @import("finder/finder.zig").Finder;
 const Category = @import("finder/finder.zig").Category;
 const OpenFile = @import("finder/finder.zig").OpenFile;
+const Location = @import("finder/finder.zig").Location;
+const preview = @import("finder/preview.zig");
 const Frame = @import("terminal/frame.zig").Frame;
 const setClipboard = @import("terminal/frame.zig").setClipboard;
 const editor_view = @import("views/editor_view.zig");
@@ -453,8 +455,7 @@ const App = struct {
     }
 
     /// Applies the answer to the waiting request: one location jumps there,
-    /// recording the departure, and several jump to the first and say how
-    /// many there were.
+    /// recording the departure, and several are listed in Locations.
     fn arrive(self: *App, server: *const client.Client) void {
         const name = server.server.name;
         const departed = self.fresh() orelse return self.stale();
@@ -467,6 +468,7 @@ const App = struct {
         if (locations.len == 0) {
             return self.status.print("No {s} found", .{noun(waiting.navigation, 1)});
         }
+        if (locations.len > 1) return self.list(server, waiting.navigation, locations);
         const target = locations[0];
         const path = target.path orelse {
             return self.status.print("{s} answered with a location outside local files", .{name});
@@ -484,12 +486,7 @@ const App = struct {
         if (moved) self.documents.recordJump(departure);
         var text: [Status.capacity]u8 = undefined;
         var notice: std.Io.Writer = .fixed(&text);
-        const sought = noun(waiting.navigation, locations.len);
-        // The count matters more than where the first one is.
-        if (locations.len > 1) {
-            notice.print("1 of {d} {s}; list not built yet", .{ locations.len, sought }) catch
-                unreachable;
-        } else if (!moved) {
+        if (!moved) {
             notice.print("Already at the {s}", .{noun(waiting.navigation, 1)}) catch unreachable;
         }
         if (opened.activation) |reload| {
@@ -498,6 +495,85 @@ const App = struct {
         }
         if (notice.end != 0) text[0] = std.ascii.toUpper(text[0]);
         self.status.set(notice.buffered());
+    }
+
+    /// Opens Locations, searching, on the answer's locations in local files,
+    /// in the server's order. The editor stays where it is. Running out of
+    /// memory leaves the finder shut and any earlier rows as they were.
+    fn list(
+        self: *App,
+        server: *const client.Client,
+        navigation: protocol.Navigation,
+        locations: []const protocol.Location,
+    ) void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const encoding = server.capabilities.?.encoding;
+        const rows = self.locationRows(arena.allocator(), locations, encoding) catch {
+            return self.status.print("Not enough memory; {s} not listed", .{noun(navigation, 2)});
+        };
+        if (rows.len == 0) {
+            const name = server.server.name;
+            return self.status.print("{s} answered with locations outside local files", .{name});
+        }
+        const omitted = locations.len - rows.len;
+        self.finder.locate(self.gpa, self.io, self.background, rows, omitted) catch {
+            return self.status.print("Not enough memory; {s} not listed", .{noun(navigation, 2)});
+        };
+        self.status.clear();
+        self.finding = true;
+        self.browsing = false;
+        self.redraw = true;
+    }
+
+    /// A row for each location in a local file, with its line's text and
+    /// its column converted to bytes against that text. Allocated in `arena`,
+    /// borrowing paths from `locations` and text from open documents.
+    fn locationRows(
+        self: *const App,
+        arena: Allocator,
+        locations: []const protocol.Location,
+        encoding: position.Encoding,
+    ) Allocator.Error![]Location {
+        const listed = try arena.alloc(Location, locations.len);
+        var count: usize = 0;
+        for (locations) |location| {
+            const path = location.path orelse continue;
+            const at = location.at;
+            const found = try self.lineAt(arena, path, at.line);
+            const column = position.column(found.text, at.character, encoding);
+            listed[count] = .{
+                .place = .{ .path = path, .line = at.line, .column = @intCast(column) },
+                .text = found.text,
+                .start = found.start,
+            };
+            count += 1;
+        }
+        return listed[0..count];
+    }
+
+    /// Line `number` of the file at absolute `path` and where it starts:
+    /// from its open document, unsaved edits included, or else from disk.
+    /// Empty, starting at 0, when there is no such line or it can't be read.
+    fn lineAt(
+        self: *const App,
+        arena: Allocator,
+        path: []const u8,
+        number: u32,
+    ) Allocator.Error!struct { text: []const u8, start: u64 } {
+        for (self.documents.entries.items) |*entry| {
+            if (!std.mem.eql(u8, entry.document.source.path, path)) continue;
+            const buffer = &entry.document.buffer;
+            if (number >= buffer.insertionRows()) return .{ .text = "", .start = 0 };
+            return .{ .text = buffer.line(number), .start = buffer.lineStart(number) };
+        }
+        const terminated = try arena.dupeSentinel(u8, path, 0);
+        const read = preview.line(arena, .cwd(), terminated, number) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            else => return .{ .text = "", .start = 0 },
+        };
+        const line = read orelse return .{ .text = "", .start = 0 };
+        return .{ .text = line.text, .start = line.start };
     }
 
     /// Ctrl-O or Ctrl-I, from an idle editor, so activation may reload.
@@ -644,13 +720,14 @@ const App = struct {
         };
     }
 
-    /// Opens the selection, or activates it when it is already open.
+    /// Opens the selection, or activates it when it is already open, and
+    /// for a location puts the cursor there.
     fn choose(self: *App) void {
         std.debug.assert(self.editor.idle());
         const choice = self.finder.choice() orelse return;
-        // Recorded only once another document is active.
+        // Recorded only once the cursor is somewhere else.
         const departure = self.documents.here();
-        defer if (departure) |jump| if (self.documents.active.? != jump.id) {
+        defer if (departure) |jump| if (!std.meta.eql(self.documents.here().?, jump)) {
             self.documents.recordJump(jump);
         };
         switch (choice) {
@@ -673,8 +750,15 @@ const App = struct {
                 };
                 self.announce(opened.activation, false);
             },
-            // Nothing fills Locations before answers build rows.
-            .location => unreachable,
+            .location => |place| {
+                const path = place.path;
+                const opened = self.documents.open(self.gpa, self.io, .cwd(), path) catch |err| {
+                    self.status.print("Cannot open: {s}", .{openFailure(err)});
+                    return;
+                };
+                self.documents.moveTo(place.line, place.column);
+                self.announce(opened.activation, false);
+            },
         }
         self.finder.leave(self.gpa, self.io, self.background);
         self.finding = false;
@@ -1770,25 +1854,187 @@ test "one location jumps to another file, recording the departure Ctrl-O returns
     try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
 }
 
-test "several locations jump to the first and say how many; none or here says so" {
+/// The labels of the finder's current results, in order.
+fn expectListed(fixture: *Navigating, expected: []const []const u8) !void {
+    const testing = std.testing;
+    const finder = fixture.app.finder;
+    try testing.expectEqual(expected.len, finder.matches.len);
+    for (expected, finder.matches) |label, result| {
+        var spelled: [1024]u8 = undefined;
+        const full = try std.fmt.bufPrint(&spelled, "{s}/{s}", .{ fixture.root, label });
+        try testing.expectEqualStrings(full, finder.row(result).label);
+    }
+}
+
+/// `grr` answered with `items`, JSON, in a list.
+fn answerAll(fixture: *Navigating, items: []const []const u8) !void {
+    var several: [4096]u8 = undefined;
+    var list: std.Io.Writer = .fixed(&several);
+    try list.writeAll("[");
+    for (items, 0..) |item, index| {
+        if (index != 0) try list.writeAll(",");
+        try list.writeAll(item);
+    }
+    try list.writeAll("]");
+    fixture.keys("grr");
+    try fixture.reply(list.buffered());
+}
+
+const outside_location =
+    \\{"uri":"untitled:x","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}
+;
+
+test "several locations open Locations with each line's text and leave the editor where it was" {
     const testing = std.testing;
     var fixture: Navigating = undefined;
     try fixture.init();
     defer fixture.deinit();
     const app = &fixture.app;
+    const a = app.documents.active.?;
+    // An unsaved last line of a.zig, which its row shows.
+    const buffer = fixture.buffer();
+    const end = buffer.bytes().len;
+    try buffer.replace(testing.allocator, .{ .start = end, .end = end }, "// unsaved\n", end);
+    buffer.cursor = Navigating.call;
     var storage: [3][1024]u8 = undefined;
-    fixture.keys("grr");
+    try answerAll(&fixture, &.{
+        try fixture.location(&storage[0], "b.zig", 0, 7),
+        try fixture.location(&storage[1], "a.zig", 4, 3),
+        try fixture.location(&storage[2], "a.zig", 2, 6),
+        outside_location,
+    });
     // References include the declaration.
     try testing.expect(std.mem.indexOf(u8, fixture.sent(), "\"includeDeclaration\":true") != null);
-    var several: [4096]u8 = undefined;
-    try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s},{s}]", .{
+    try testing.expect(app.finding and !app.browsing);
+    try testing.expectEqual(Category.locations, app.finder.category);
+    try testing.expectEqualStrings("", app.status.text());
+    try testing.expectEqual(@as(usize, 1), app.finder.lists.getPtrConst(.locations).omitted);
+    try expectListed(&fixture, &.{
+        "b.zig:1:8  pub fn target() void {}",
+        "a.zig:5:4  // unsaved",
+        "a.zig:3:7  b.target();",
+    });
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    try testing.expectEqual(@as(usize, 0), app.documents.jumps.len);
+    // Enter opens the file at the place and records the departure.
+    app.finderEvent(.{ .key = '\r' });
+    try testing.expect(!app.finding);
+    try testing.expect(app.documents.active.? != a);
+    try testing.expectEqual(@as(usize, 7), fixture.buffer().cursor);
+    const departure: session.Jump = .{ .id = a, .line = 2, .column = 6 };
+    try testing.expectEqual(departure, app.documents.jumps.items[0]);
+    fixture.keys("\x0f");
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    // Ctrl-P reopens Locations as it was left; a place in the same file is
+    // a jump too, and Ctrl-O comes back from it.
+    fixture.keys("\x10");
+    try testing.expect(app.finding);
+    try testing.expectEqual(Category.locations, app.finder.category);
+    app.finderEvent(.{ .key = 0x0e });
+    app.finderEvent(.{ .key = '\r' });
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(fixture.buffer().lineStart(4) + 3, fixture.buffer().cursor);
+    fixture.keys("\x0f");
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    // Choosing where the cursor already is records nothing.
+    const recorded = app.documents.jumps.len;
+    fixture.keys("\x10");
+    app.finderEvent(.{ .key = 0x0e });
+    app.finderEvent(.{ .key = 0x0e });
+    app.finderEvent(.{ .key = '\r' });
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    try testing.expectEqual(recorded, app.documents.jumps.len);
+    // The next answer replaces the rows; one with no local file opens nothing.
+    try answerAll(&fixture, &.{
         try fixture.location(&storage[0], "a.zig", 1, 4),
         try fixture.location(&storage[1], "a.zig", 2, 6),
-        try fixture.location(&storage[2], "b.zig", 0, 7),
-    }));
-    try testing.expectEqual(@as(usize, 32), fixture.buffer().cursor);
-    try testing.expectEqualStrings("1 of 3 references; list not built yet", app.status.text());
+    });
+    try expectListed(&fixture, &.{ "a.zig:2:5  pub fn main() void {", "a.zig:3:7  b.target();" });
+    app.dismiss();
+    try answerAll(&fixture, &.{ outside_location, outside_location });
+    try testing.expect(!app.finding);
+    const nothing = "zls answered with locations outside local files";
+    try testing.expectEqualStrings(nothing, app.status.text());
+}
+
+test "a location in a missing file or past the text is listed and opens like any choice" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    var storage: [2][1024]u8 = undefined;
+    try answerAll(&fixture, &.{
+        try fixture.location(&storage[0], "missing.zig", 0, 4),
+        try fixture.location(&storage[1], "b.zig", 99, 3),
+    });
+    try expectListed(&fixture, &.{ "missing.zig:1:1  ", "b.zig:100:1  " });
+    app.finderEvent(.{ .key = '\r' });
+    const missing = "Cannot open: file not found; check the path";
+    try testing.expectEqualStrings(missing, app.status.text());
+    try testing.expect(app.finding);
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, 0), app.documents.jumps.len);
+    // Past the text, the cursor is clamped to the last line.
+    app.finderEvent(.{ .key = 0x0e });
+    app.finderEvent(.{ .key = '\r' });
+    try testing.expect(app.documents.active.? != a);
+    try testing.expectEqual(@as(usize, 0), fixture.buffer().cursor);
     try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
+}
+
+test "running out of memory while listing locations keeps the earlier rows and the editor" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    var storage: [3][1024]u8 = undefined;
+    try answerAll(&fixture, &.{
+        try fixture.location(&storage[0], "a.zig", 1, 4),
+        try fixture.location(&storage[1], "a.zig", 2, 6),
+    });
+    app.dismiss();
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        const config: std.testing.FailingAllocator.Config = .{ .fail_index = index };
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, config);
+        fixture.keys("grr");
+        app.gpa = failing.allocator();
+        var several: [4096]u8 = undefined;
+        try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s},{s}]", .{
+            try fixture.location(&storage[0], "a.zig", 1, 4),
+            try fixture.location(&storage[1], "b.zig", 0, 7),
+            try fixture.location(&storage[2], "a.zig", 2, 6),
+        }));
+        app.gpa = testing.allocator;
+        if (app.finding) break;
+        const refused = "Not enough memory; references not listed";
+        try testing.expectEqualStrings(refused, app.status.text());
+        const kept = [_][]const u8{ "a.zig:2:5  pub fn main() void {", "a.zig:3:7  b.target();" };
+        try expectListed(&fixture, &kept);
+        try testing.expectEqual(a, app.documents.active.?);
+        try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    }
+    try testing.expect(index > 2);
+    try expectListed(&fixture, &.{
+        "a.zig:2:5  pub fn main() void {",
+        "b.zig:1:8  pub fn target() void {}",
+        "a.zig:3:7  b.target();",
+    });
+}
+
+test "none, one here, a location outside local files or an error says so" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    var storage: [1024]u8 = undefined;
     fixture.keys("gd");
     try fixture.reply("null");
     try testing.expectEqualStrings("No definition found", app.status.text());
@@ -1797,22 +2043,12 @@ test "several locations jump to the first and say how many; none or here says so
     try testing.expectEqualStrings("No type definition found", app.status.text());
     // The only reference is where the cursor is: no jump is recorded.
     fixture.keys("grr");
-    try fixture.reply(try fixture.location(&storage[0], "a.zig", 1, 4));
+    try fixture.reply(try fixture.location(&storage, "a.zig", 2, 6));
     try testing.expectEqualStrings("Already at the reference", app.status.text());
-    try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
-    // Several, the first here: the count still shows, and no jump is recorded.
-    fixture.keys("grr");
-    try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s}]", .{
-        try fixture.location(&storage[0], "a.zig", 1, 4),
-        try fixture.location(&storage[1], "a.zig", 2, 6),
-    }));
-    try testing.expectEqualStrings("1 of 2 references; list not built yet", app.status.text());
-    try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
+    try testing.expectEqual(@as(usize, 0), app.documents.jumps.len);
     // A location outside local files, or an error, changes nothing.
     fixture.keys("gri");
-    try fixture.reply(
-        \\{"uri":"untitled:x","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}
-    );
+    try fixture.reply(outside_location);
     const outside = "zls answered with a location outside local files";
     try testing.expectEqualStrings(outside, app.status.text());
     fixture.keys("grD");
@@ -1822,7 +2058,8 @@ test "several locations jump to the first and say how many; none or here says so
         "\"error\":{{\"code\":-32603,\"message\":\"no index\"}}}}";
     try fixture.feed(try std.fmt.bufPrint(&failure, refused, .{id}));
     try testing.expectEqualStrings("zls failed: no index", app.status.text());
-    try testing.expectEqual(@as(usize, 32), fixture.buffer().cursor);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    try testing.expect(!app.finding);
 }
 
 test "an answer after the cursor, the text or the document changed is dropped" {

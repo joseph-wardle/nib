@@ -232,13 +232,19 @@ pub const Session = struct {
             .newer => self.jumps.forward(count),
         } orelse return null;
         const activation = self.activate(allocator, io, target.id);
+        self.moveTo(target.line, target.column);
+        return .{ .activation = activation };
+    }
+
+    /// Puts the active document's cursor on `line` at byte `column`, clamped
+    /// to the text as it is now.
+    pub fn moveTo(self: *Session, line: usize, column: usize) void {
         const entry = self.current().?;
         const buffer = &entry.document.buffer;
-        const row = @min(target.line, buffer.lineCount() - 1);
-        const offset = @min(buffer.lineStart(row) + target.column, buffer.contentEnd(row));
+        const row = @min(line, buffer.lineCount() - 1);
+        const offset = @min(buffer.lineStart(row) +| column, buffer.contentEnd(row));
         buffer.cursor = motion.normal(buffer, offset);
         entry.viewport.goal = motion.screenColumn(buffer, buffer.cursor, false);
-        return .{ .activation = activation };
     }
 
     /// Refuses unsaved edits unless `discard`. Closing the active document

@@ -2117,10 +2117,10 @@ fn navigationWorkflow(executable: [:0]const u8) !void {
     try process.send("j");
     try landed(&process, "4:7", "a.zig");
     try process.send("grr");
-    try process.until("1 of 3 references; list not built yet");
+    try process.until("3/3 rows");
     try process.ready();
-    try process.send("l");
-    try landed(&process, "1:9", "b.zig");
+    try process.send("\r");
+    try landed(&process, "1:8", "b.zig");
     try process.send("\x0f");
     try landed(&process, "4:7", "a.zig");
     // A server killed outside Nib is reported and reaped. With no descriptor
