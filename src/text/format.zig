@@ -70,7 +70,7 @@ pub fn format(
 
 /// One replacement that turns `old` into `new`: `range` in `old` is replaced
 /// by `inserted`, a slice of `new`, and `cursor` is where `old`'s cursor goes
-/// in the result.
+/// in the result: on a character, as normal mode needs.
 pub const Change = struct { range: Range, inserted: []const u8, cursor: usize };
 
 /// The smallest single replacement between `old` and `new`, with both ends on
@@ -78,7 +78,9 @@ pub const Change = struct { range: Range, inserted: []const u8, cursor: usize };
 /// The cursor keeps its place in the unchanged text around the range; inside
 /// it, the cursor goes to the same count of non-whitespace bytes from the
 /// range's start, which follows its token while formatting moves only
-/// whitespace. A cursor on whitespace goes to the next token.
+/// whitespace. A cursor on whitespace goes to the next token. One that would
+/// end on a line break or past the text steps back onto the line's last
+/// character, as `motion.normal` places it.
 pub fn change(old: []const u8, new: []const u8, cursor: usize) Change {
     const shorter = @min(old.len, new.len);
     var prefix: usize = 0;
@@ -97,7 +99,20 @@ pub fn change(old: []const u8, new: []const u8, cursor: usize) Change {
         cursor - range.end + range.start + inserted.len
     else
         range.start + nonWhitespace(inserted, countNonWhitespace(old[range.start..cursor]));
-    return .{ .range = range, .inserted = inserted, .cursor = char.start(new, placed) };
+    const landed = normal(new, char.start(new, placed));
+    return .{ .range = range, .inserted = inserted, .cursor = landed };
+}
+
+/// `offset`, a boundary of `text`, or the last character of its line when it
+/// is on a line break or at the end; an empty line keeps its start. The text's
+/// end after a final line break belongs to the last line, as in `Buffer`.
+fn normal(text: []const u8, offset: usize) usize {
+    var placed = offset;
+    const after_break = placed == text.len and placed != 0 and text[placed - 1] == '\n';
+    if (after_break) placed = char.previous(text, placed);
+    const on_break = placed == text.len or text[placed] == '\n' or text[placed] == '\r';
+    if (on_break and placed != 0 and text[placed - 1] != '\n') placed = char.previous(text, placed);
+    return placed;
 }
 
 fn boundary(bytes: []const u8, offset: usize) bool {
@@ -127,6 +142,8 @@ fn nonWhitespace(bytes: []const u8, count: usize) usize {
 }
 
 const testing = std.testing;
+const Buffer = @import("buffer.zig").Buffer;
+const motion = @import("motion.zig");
 
 fn expectFormatted(formatter: Formatter, text: []const u8, expected: []const u8) !void {
     const outcome = try format(testing.allocator, formatter, text);
@@ -284,18 +301,40 @@ test "the cursor follows its token through a change" {
         const delta = change(old, new, cursor);
         try testing.expectEqual(std.mem.indexOf(u8, new, case.lands).?, delta.cursor);
     }
-    // At the end of the text it stays at the end.
-    try testing.expectEqual(new.len, change(old, new, old.len).cursor);
+    // At the end of the text it lands on the last character.
+    try testing.expectEqual(new.len - 2, change(old, new, old.len).cursor);
 }
 
-test "a cursor lands on a character boundary of the new text" {
+test "a cursor lands on a character of the new text" {
     // The cursor on `é` stays on its first byte.
     const old = "x  = \"é\";\n";
     const new = "x = \"é\";\n";
     const delta = change(old, new, std.mem.indexOf(u8, old, "é").?);
     try testing.expectEqual(std.mem.indexOf(u8, new, "é").?, delta.cursor);
-    // A cursor past the last token of the range goes to the range's end,
-    // a boundary; the editor clamps it to a normal-mode character.
+    // Past the last token of the range is the line break: back onto `a`.
     const trailing = change("a  \r\n", "a\n", 2);
-    try testing.expectEqual(2, trailing.cursor);
+    try testing.expectEqual(0, trailing.cursor);
+}
+
+test "a cursor is placed on a line as motion.normal places it" {
+    const texts = [_][]const u8{
+        "",
+        "a",
+        "a\n",
+        "a\n\n",
+        "\n",
+        "ab\r\n",
+        "ab\r\ncd",
+        "é\n",
+        "a\n\nb\n",
+        "\r\n\r\n",
+    };
+    for (texts) |text| {
+        var buffer = try Buffer.fromBytes(testing.allocator, text);
+        defer buffer.deinit(testing.allocator);
+        for (0..text.len + 1) |offset| {
+            if (!boundary(text, offset)) continue;
+            try testing.expectEqual(motion.normal(&buffer, offset), normal(text, offset));
+        }
+    }
 }

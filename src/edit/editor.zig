@@ -11,6 +11,7 @@ const motion = @import("../text/motion.zig");
 const input = @import("../terminal/input.zig");
 const keys = @import("keys.zig");
 const search = @import("../text/search.zig");
+const change = @import("../text/format.zig").change;
 const Viewport = @import("../text/viewport.zig").Viewport;
 
 /// Text an operator took. Breaks are always LF, whatever the source used; a
@@ -147,6 +148,29 @@ pub const Editor = struct {
         }
         if (!self.highlight or self.last_query_len == 0) return null;
         return self.last_query[0..self.last_query_len];
+    }
+
+    /// Makes `formatted`, the whole formatted text, the buffer's text as one
+    /// edit and one undo step, replacing only what differs. The cursor follows
+    /// its token (`change`) and the vertical goal follows the cursor.
+    /// Only while idle, as the `:` line is. A failure changes nothing.
+    pub fn applyFormatted(
+        self: *const Editor,
+        allocator: Allocator,
+        buffer: *Buffer,
+        goal: *motion.Goal,
+        formatted: []const u8,
+    ) error{ OutOfMemory, FileTooLarge, TooManyLines, UnsupportedText }!void {
+        std.debug.assert(self.idle());
+        const delta = change(buffer.bytes(), formatted, buffer.cursor);
+        const replaced = buffer.replace(allocator, delta.range, delta.inserted, delta.cursor);
+        replaced catch |err| switch (err) {
+            // `change` puts the range on boundaries of the text and the
+            // cursor on a boundary of the result.
+            error.InvalidRange, error.InvalidCursor => unreachable,
+            else => |refused| return refused,
+        };
+        goal.* = motion.screenColumn(buffer, buffer.cursor, false);
     }
 
     pub fn interruptPaste(self: *Editor, status: *Status) void {
@@ -2447,4 +2471,43 @@ test "G, gg and searches note where they left, unless they stay on the line or o
     type_(&editor, &status, &buffer, &viewport, "?two\r");
     try expectDeparture(&editor, 10);
     try std.testing.expect(editor.selection(&buffer) != null);
+}
+
+fn formatWorkflow(allocator: Allocator) !void {
+    const old = "const  x=1;\nconst  yy=2;\n";
+    var buffer = try Buffer.fromBytes(allocator, old);
+    defer buffer.deinit(allocator);
+    buffer.cursor = 22;
+    var goal: motion.Goal = 10;
+    const editor: Editor = .{};
+    editor.applyFormatted(allocator, &buffer, &goal, "const x = 1;\nconst yy = 2;\n") catch |err| {
+        try std.testing.expectEqualStrings(old, buffer.bytes());
+        try std.testing.expectEqual(22, buffer.cursor);
+        try std.testing.expectEqual(10, goal);
+        try std.testing.expect(!buffer.modified());
+        try std.testing.expect(!try buffer.undo(allocator));
+        return err;
+    };
+    try std.testing.expectEqualStrings("const x = 1;\nconst yy = 2;\n", buffer.bytes());
+    try std.testing.expectEqual(24, buffer.cursor);
+    try std.testing.expectEqual(11, goal);
+}
+
+test "allocation failure while applying formatted text keeps the text, cursor, goal and history" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, formatWorkflow, .{});
+}
+
+test "formatted text over the size limits is refused and changes nothing" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "a\n");
+    defer buffer.deinit(allocator);
+    var goal: motion.Goal = 0;
+    const editor: Editor = .{};
+    const lines = try allocator.alloc(u8, 2 * (max_lines + 1));
+    defer allocator.free(lines);
+    for (0..max_lines + 1) |row| lines[2 * row ..][0..2].* = "a\n".*;
+    const refused = editor.applyFormatted(allocator, &buffer, &goal, lines);
+    try std.testing.expectError(error.TooManyLines, refused);
+    try std.testing.expectEqualStrings("a\n", buffer.bytes());
+    try std.testing.expect(!buffer.modified());
 }

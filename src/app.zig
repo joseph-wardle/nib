@@ -26,6 +26,7 @@ const finder_view = @import("views/finder_view.zig");
 const client = @import("lsp/client.zig");
 const protocol = @import("lsp/protocol.zig");
 const position = @import("lsp/position.zig");
+const format = @import("text/format.zig");
 const linux = std.os.linux;
 
 /// Runs Nib on `device` until a command quits, opening a named file first.
@@ -891,6 +892,15 @@ const App = struct {
                 );
                 self.announce(reload, true);
             },
+            .format => {
+                if (self.documents.current() == null) return self.refuse();
+                switch (self.formatActive()) {
+                    .formatted => self.status.set("Formatted"),
+                    .unchanged => self.status.set("Already formatted"),
+                    .no_formatter => self.status.set("No formatter for this file"),
+                    else => |failure| self.notFormatted("Not formatted", failure),
+                }
+            },
         }
     }
 
@@ -940,6 +950,68 @@ const App = struct {
             }
         }
         self.status.set(notice.buffered());
+    }
+
+    /// What formatting the active document did, for the caller to word.
+    const Formatting = union(enum) {
+        formatted,
+        unchanged,
+        no_formatter,
+        read_only,
+        /// The file changed on disk, or can't be checked: formatting the
+        /// text would dirty a buffer that should reload.
+        diverged,
+        syntax_error: format.Position,
+        too_large,
+        out_of_memory,
+        not_editable,
+    };
+
+    /// Formats the active document with its formatter, if it has one, as one
+    /// undoable edit, after checking its file is unchanged on disk. A failure
+    /// changes no text; a changed file is marked for reloading.
+    fn formatActive(self: *App) Formatting {
+        const entry = self.documents.current().?;
+        const document = &entry.document;
+        const formatter = format.formatterFor(document.source.path) orelse return .no_formatter;
+        if (!document.buffer.editable) return .read_only;
+        entry.disk.inspect(self.gpa, document, false);
+        if (entry.disk.diverged) return .diverged;
+        const outcome = format.format(self.gpa, formatter, document.buffer.bytes()) catch {
+            return .out_of_memory;
+        };
+        const formatted = switch (outcome) {
+            .formatted => |text| text,
+            .unchanged => return .unchanged,
+            .syntax_error => |at| return .{ .syntax_error = at },
+        };
+        defer self.gpa.free(formatted);
+        const goal = &entry.viewport.goal;
+        self.editor.applyFormatted(self.gpa, &document.buffer, goal, formatted) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                error.FileTooLarge, error.TooManyLines => .too_large,
+                error.UnsupportedText => .not_editable,
+            };
+        };
+        return .formatted;
+    }
+
+    /// Says why `failure` left the text unformatted, after `lead`.
+    fn notFormatted(self: *App, lead: []const u8, failure: Formatting) void {
+        const reason = switch (failure) {
+            .syntax_error => |at| {
+                const arguments = .{ lead, at.line, at.column };
+                return self.status.print("{s}: syntax error at {d}:{d}", arguments);
+            },
+            .read_only => "read-only",
+            .diverged => "source changed or missing",
+            .too_large => "result exceeds temporary 8 MiB or 262,144-line limit",
+            .out_of_memory => "not enough memory",
+            .not_editable => "result is not editable text",
+            .formatted, .unchanged, .no_formatter => unreachable,
+        };
+        self.status.print("{s}: {s}", .{ lead, reason });
     }
 
     fn saved(self: *App, result: file.Report, copy: bool) void {
@@ -2484,4 +2556,111 @@ test "Locations recognises the documents open when the answer arrives, never a c
     app.finderEvent(.{ .key = 0x0e });
     try testing.expectEqual(null, finder.row(finder.matches[1]).document);
     try testing.expect(finder.preview() == .loading);
+}
+
+/// An app over `temp` with `name` open, holding `text`, for the format tests.
+const FormatFixture = struct {
+    background: jobs.Jobs,
+    finder: Finder = .{},
+    app: App,
+
+    fn init(self: *FormatFixture, temp: std.Io.Dir, name: []const u8, text: []const u8) !void {
+        const testing = std.testing;
+        try temp.writeFile(testing.io, .{ .sub_path = name, .data = text });
+        self.* = .{ .background = try .init(), .app = undefined };
+        self.app = .{
+            .gpa = testing.allocator,
+            .io = testing.io,
+            .terminal = undefined,
+            .background = &self.background,
+            .finder = &self.finder,
+            .size = .{ .rows = 6, .columns = 40 },
+        };
+        _ = try self.app.documents.open(testing.allocator, testing.io, temp, name);
+    }
+
+    fn deinit(self: *FormatFixture) void {
+        const testing = std.testing;
+        self.app.editor.deinit(testing.allocator);
+        self.app.documents.deinit(testing.allocator);
+        self.finder.deinit(testing.allocator, testing.io);
+        self.background.deinit(testing.allocator, testing.io);
+    }
+
+    fn buffer(self: *FormatFixture) *@import("text/buffer.zig").Buffer {
+        return &self.app.documents.current().?.document.buffer;
+    }
+
+    fn keys(self: *FormatFixture, typed: []const u8) void {
+        for (typed) |byte| self.app.editorEvent(.{ .key = byte });
+    }
+};
+
+test ":fmt formats as one undo step, keeping the cursor on its token and j/k on its column" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var fixture: FormatFixture = undefined;
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\nconst  yy=2;\n");
+    defer fixture.deinit();
+    const buffer = fixture.buffer();
+    // On the `2`, at column 10.
+    fixture.keys("jwww");
+    try testing.expectEqual(22, buffer.cursor);
+    const changes = buffer.changes;
+    fixture.app.fileAction(.format);
+    try testing.expectEqualStrings("Formatted", fixture.app.status.text());
+    try testing.expectEqualStrings("const x = 1;\nconst yy = 2;\n", buffer.bytes());
+    try testing.expect(buffer.modified());
+    try testing.expectEqual(changes + 1, buffer.changes);
+    // The `2` moved to column 11, and `k` keeps that column: the `;`.
+    try testing.expectEqual(24, buffer.cursor);
+    fixture.keys("k");
+    try testing.expectEqual(11, buffer.cursor);
+    // One undo restores the text and the cursor on the `2`.
+    fixture.keys("ju");
+    try testing.expectEqualStrings("const  x=1;\nconst  yy=2;\n", buffer.bytes());
+    try testing.expectEqual(22, buffer.cursor);
+    try testing.expect(!buffer.modified());
+}
+
+test ":fmt says why it changed nothing" {
+    const testing = std.testing;
+    const cases = [_]struct { name: []const u8, text: []const u8, notice: []const u8 }{
+        .{ .name = "a.zig", .text = "const x = 1;\n", .notice = "Already formatted" },
+        .{ .name = "a.md", .text = "#  title\n", .notice = "No formatter for this file" },
+        .{ .name = "a.zig", .text = "const x = ;\n", .notice = "Not formatted: syntax error at 1:11" },
+        .{ .name = "a.zig", .text = "const  x = 1;\x01\n", .notice = "Not formatted: read-only" },
+    };
+    for (cases) |case| {
+        var temp = testing.tmpDir(.{});
+        defer temp.cleanup();
+        var fixture: FormatFixture = undefined;
+        try fixture.init(temp.dir, case.name, case.text);
+        defer fixture.deinit();
+        const changes = fixture.buffer().changes;
+        fixture.app.fileAction(.format);
+        try testing.expectEqualStrings(case.notice, fixture.app.status.text());
+        try testing.expectEqualStrings(case.text, fixture.buffer().bytes());
+        try testing.expectEqual(changes, fixture.buffer().changes);
+        try testing.expect(!fixture.buffer().modified());
+    }
+}
+
+test ":fmt leaves a file changed on disk unformatted, so a clean buffer still reloads" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var fixture: FormatFixture = undefined;
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\n");
+    defer fixture.deinit();
+    // An agent rewrites the file before Nib has seen the notification.
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "const  y=2;\n" });
+    fixture.app.fileAction(.format);
+    try testing.expectEqualStrings("Not formatted: source changed or missing", fixture.app.status.text());
+    try testing.expectEqualStrings("const  x=1;\n", fixture.buffer().bytes());
+    try testing.expect(!fixture.buffer().modified());
+    var decoder: input.Decoder = .{};
+    try testing.expect(fixture.app.step(&decoder, "", false, 0) == null);
+    try testing.expectEqualStrings("const  y=2;\n", fixture.buffer().bytes());
 }

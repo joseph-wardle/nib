@@ -15,6 +15,8 @@ pub const File = union(enum) {
     write_quit,
     /// `:e!`
     reload,
+    /// `:fmt`
+    format,
 };
 
 /// How a key ended the line.
@@ -74,6 +76,7 @@ fn parse(line: []const u8) ?File {
     if (std.mem.eql(u8, line, "wq")) return .write_quit;
     if (std.mem.eql(u8, line, "w")) return .{ .write = "" };
     if (std.mem.eql(u8, line, "e!")) return .reload;
+    if (std.mem.eql(u8, line, "fmt")) return .format;
     if (std.mem.startsWith(u8, line, "w ") and line.len > 2) return .{ .write = line[2..] };
     return null;
 }
@@ -98,6 +101,7 @@ test "the command line runs each supported command and refuses anything else" {
         .{ .keys = "qa!\r", .file = .{ .quit_all = true } },
         .{ .keys = "wq\r", .file = .write_quit },
         .{ .keys = "w\r", .file = .{ .write = "" } },
+        .{ .keys = "fmt\r", .file = .format },
         .{ .keys = "e!\r", .file = .reload },
         .{ .keys = "w\x7fq\r", .file = .{ .quit = false } },
     };
