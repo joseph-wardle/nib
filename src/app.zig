@@ -864,22 +864,30 @@ const App = struct {
             },
             .write => |copy_path| {
                 const entry = self.documents.current() orelse return self.refuse();
-                const result = if (copy_path.len == 0)
-                    self.documents.save(self.gpa, .{})
-                else
-                    file.copy(self.gpa, self.io, .cwd(), copy_path, &entry.document.buffer, .{});
-                self.saved(result, copy_path.len != 0);
+                if (copy_path.len != 0) {
+                    const buffer = &entry.document.buffer;
+                    const result = file.copy(self.gpa, self.io, .cwd(), copy_path, buffer, .{});
+                    return self.saved(result, true, null);
+                }
+                const formatting = self.formatActive();
+                self.saved(self.documents.save(self.gpa, .{}), false, formatting);
             },
             .write_quit => {
                 const entry = self.documents.current() orelse return self.refuse();
+                const formatting = self.formatActive();
                 const name = self.named(entry);
                 // Written before closing frees the path. A close follows only
                 // a save that `saveNotice` reports as plain `Written`.
                 var text: [Status.capacity]u8 = undefined;
                 var notice: std.Io.Writer = .fixed(&text);
-                notice.print("Written and closed {f}", .{name}) catch unreachable;
+                const verb = if (formatting == .formatted)
+                    "Formatted, written and closed"
+                else
+                    "Written and closed";
+                notice.print("{s} {f}", .{ verb, name }) catch unreachable;
                 const closing = self.documents.saveAndClose(self.gpa, self.io, .{});
-                if (!closing.closed) return self.saved(closing.report, false);
+                if (!closing.closed) return self.saved(closing.report, false, formatting);
+                if (formatting.failed()) notFormatted(&notice, "; not formatted", formatting);
                 self.closed(&notice, closing.activation);
             },
             .reload => {
@@ -898,7 +906,12 @@ const App = struct {
                     .formatted => self.status.set("Formatted"),
                     .unchanged => self.status.set("Already formatted"),
                     .no_formatter => self.status.set("No formatter for this file"),
-                    else => |failure| self.notFormatted("Not formatted", failure),
+                    else => |failure| {
+                        var text: [Status.capacity]u8 = undefined;
+                        var notice: std.Io.Writer = .fixed(&text);
+                        notFormatted(&notice, "Not formatted", failure);
+                        self.status.set(notice.buffered());
+                    },
                 }
             },
         }
@@ -965,6 +978,15 @@ const App = struct {
         too_large,
         out_of_memory,
         not_editable,
+
+        /// Whether formatting was attempted and failed for a reason a save
+        /// reports. A changed file isn't one: the save refuses it itself.
+        fn failed(self: Formatting) bool {
+            return switch (self) {
+                .formatted, .unchanged, .no_formatter, .diverged => false,
+                .read_only, .syntax_error, .too_large, .out_of_memory, .not_editable => true,
+            };
+        }
     };
 
     /// Formats the active document with its formatter, if it has one, as one
@@ -997,12 +1019,13 @@ const App = struct {
         return .formatted;
     }
 
-    /// Says why `failure` left the text unformatted, after `lead`.
-    fn notFormatted(self: *App, lead: []const u8, failure: Formatting) void {
+    /// Writes `lead`, then why `failure` left the text unformatted, cut short
+    /// if it doesn't fit.
+    fn notFormatted(notice: *std.Io.Writer, lead: []const u8, failure: Formatting) void {
         const reason = switch (failure) {
             .syntax_error => |at| {
                 const arguments = .{ lead, at.line, at.column };
-                return self.status.print("{s}: syntax error at {d}:{d}", arguments);
+                return notice.print("{s}: syntax error at {d}:{d}", arguments) catch {};
             },
             .read_only => "read-only",
             .diverged => "source changed or missing",
@@ -1011,13 +1034,24 @@ const App = struct {
             .not_editable => "result is not editable text",
             .formatted, .unchanged, .no_formatter => unreachable,
         };
-        self.status.print("{s}: {s}", .{ lead, reason });
+        notice.print("{s}: {s}", .{ lead, reason }) catch {};
     }
 
-    fn saved(self: *App, result: file.Report, copy: bool) void {
-        const notice = saveNotice(result, copy);
-        if (!result.cleanup_failure) return self.status.set(notice);
-        self.status.print("{s}; cleanup failed", .{notice});
+    /// Words a save's outcome and, for the source, what formatting first did;
+    /// null for a copy, which isn't formatted.
+    fn saved(self: *App, result: file.Report, copy: bool, formatting: ?Formatting) void {
+        var text: [Status.capacity]u8 = undefined;
+        var notice: std.Io.Writer = .fixed(&text);
+        const written = saveNotice(result, copy);
+        const formatted = formatting != null and formatting.? == .formatted;
+        const plain = std.mem.eql(u8, written, "Written");
+        const first = if (formatted and plain) "Formatted and written" else written;
+        notice.writeAll(first) catch unreachable;
+        if (result.cleanup_failure) notice.writeAll("; cleanup failed") catch unreachable;
+        if (formatting) |attempt| {
+            if (attempt.failed()) notFormatted(&notice, "; not formatted", attempt);
+        }
+        self.status.set(notice.buffered());
     }
 
     /// Names every file with unsaved edits, as the finder lists them, in
@@ -2564,9 +2598,19 @@ const FormatFixture = struct {
     finder: Finder = .{},
     app: App,
 
-    fn init(self: *FormatFixture, temp: std.Io.Dir, name: []const u8, text: []const u8) !void {
+    /// `mode` is the file's permission bits before it is opened.
+    fn init(
+        self: *FormatFixture,
+        temp: std.Io.Dir,
+        name: []const u8,
+        text: []const u8,
+        mode: u32,
+    ) !void {
         const testing = std.testing;
         try temp.writeFile(testing.io, .{ .sub_path = name, .data = text });
+        const written = try temp.openFile(testing.io, name, .{});
+        defer written.close(testing.io);
+        try testing.expectEqual(0, linux.fchmod(written.handle, mode));
         self.* = .{ .background = try .init(), .app = undefined };
         self.app = .{
             .gpa = testing.allocator,
@@ -2601,7 +2645,7 @@ test ":fmt formats as one undo step, keeping the cursor on its token and j/k on 
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     var fixture: FormatFixture = undefined;
-    try fixture.init(temp.dir, "a.zig", "const  x=1;\nconst  yy=2;\n");
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\nconst  yy=2;\n", 0o644);
     defer fixture.deinit();
     const buffer = fixture.buffer();
     // On the `2`, at column 10.
@@ -2636,7 +2680,7 @@ test ":fmt says why it changed nothing" {
         var temp = testing.tmpDir(.{});
         defer temp.cleanup();
         var fixture: FormatFixture = undefined;
-        try fixture.init(temp.dir, case.name, case.text);
+        try fixture.init(temp.dir, case.name, case.text, 0o644);
         defer fixture.deinit();
         const changes = fixture.buffer().changes;
         fixture.app.fileAction(.format);
@@ -2652,7 +2696,7 @@ test ":fmt leaves a file changed on disk unformatted, so a clean buffer still re
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     var fixture: FormatFixture = undefined;
-    try fixture.init(temp.dir, "a.zig", "const  x=1;\n");
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\n", 0o644);
     defer fixture.deinit();
     // An agent rewrites the file before Nib has seen the notification.
     try temp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "const  y=2;\n" });
@@ -2663,4 +2707,143 @@ test ":fmt leaves a file changed on disk unformatted, so a clean buffer still re
     var decoder: input.Decoder = .{};
     try testing.expect(fixture.app.step(&decoder, "", false, 0) == null);
     try testing.expectEqualStrings("const  y=2;\n", fixture.buffer().bytes());
+}
+
+fn expectDisk(dir: std.Io.Dir, name: []const u8, expected: []const u8) !void {
+    var storage: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, try dir.readFile(std.testing.io, name, &storage));
+}
+
+test ":w formats the source first and saves whether or not formatting worked" {
+    const testing = std.testing;
+    const Case = struct {
+        name: []const u8,
+        text: []const u8,
+        disk: []const u8,
+        notice: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "a.zig",
+            .text = "const  x=1;\r\n",
+            .disk = "const x = 1;\n",
+            .notice = "Formatted and written",
+        },
+        .{
+            .name = "a.zon",
+            .text = ".{.a=1,}\n",
+            .disk = ".{\n    .a = 1,\n}\n",
+            .notice = "Formatted and written",
+        },
+        .{
+            .name = "a.zig",
+            .text = "const x = 1;\n",
+            .disk = "const x = 1;\n",
+            .notice = "Written",
+        },
+        .{ .name = "a.md", .text = "#  title\n", .disk = "#  title\n", .notice = "Written" },
+        .{
+            .name = "a.zig",
+            .text = "const x = ;\n",
+            .disk = "const x = ;\n",
+            .notice = "Written; not formatted: syntax error at 1:11",
+        },
+    };
+    for (cases) |case| {
+        var temp = testing.tmpDir(.{});
+        defer temp.cleanup();
+        var fixture: FormatFixture = undefined;
+        try fixture.init(temp.dir, case.name, case.text, 0o644);
+        defer fixture.deinit();
+        fixture.app.fileAction(.{ .write = "" });
+        try testing.expectEqualStrings(case.notice, fixture.app.status.text());
+        try expectDisk(temp.dir, case.name, case.disk);
+        try testing.expectEqualStrings(case.disk, fixture.buffer().bytes());
+        try testing.expect(!fixture.buffer().modified());
+    }
+}
+
+test ":w <path> writes the copy unformatted" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var fixture: FormatFixture = undefined;
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\n", 0o644);
+    defer fixture.deinit();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const directory = root[0..try temp.dir.realPath(testing.io, &root)];
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const copy = try std.fmt.bufPrint(&path, "{s}/b.zig", .{directory});
+    fixture.app.fileAction(.{ .write = copy });
+    try testing.expectStringStartsWith(fixture.app.status.text(), "Copy written");
+    try expectDisk(temp.dir, "b.zig", "const  x=1;\n");
+    try testing.expectEqualStrings("const  x=1;\n", fixture.buffer().bytes());
+}
+
+test ":w on a file changed on disk refuses without formatting, so a clean buffer reloads" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var fixture: FormatFixture = undefined;
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\n", 0o644);
+    defer fixture.deinit();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a.zig", .data = "const  y=2;\n" });
+    fixture.app.fileAction(.{ .write = "" });
+    try testing.expectStringStartsWith(fixture.app.status.text(), "Source changed or missing; save refused");
+    try testing.expect(!fixture.buffer().modified());
+    var decoder: input.Decoder = .{};
+    try testing.expect(fixture.app.step(&decoder, "", false, 0) == null);
+    try testing.expectEqualStrings("const  y=2;\n", fixture.buffer().bytes());
+    try expectDisk(temp.dir, "a.zig", "const  y=2;\n");
+}
+
+test "a save refused for another reason keeps its formatting as one undoable edit" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var fixture: FormatFixture = undefined;
+    try fixture.init(temp.dir, "a.zig", "const  x=1;\n", 0o444);
+    defer fixture.deinit();
+    fixture.app.fileAction(.{ .write = "" });
+    try testing.expectEqualStrings("Write permission denied; save refused", fixture.app.status.text());
+    try expectDisk(temp.dir, "a.zig", "const  x=1;\n");
+    try testing.expectEqualStrings("const x = 1;\n", fixture.buffer().bytes());
+    try testing.expect(fixture.buffer().modified());
+    fixture.keys("u");
+    try testing.expectEqualStrings("const  x=1;\n", fixture.buffer().bytes());
+    try testing.expect(!fixture.buffer().modified());
+}
+
+test ":wq formats, saves and closes, and says when it couldn't format" {
+    const testing = std.testing;
+    const cases = [_]struct { text: []const u8, disk: []const u8, notice: []const u8 }{
+        .{
+            .text = "const  x=1;\n",
+            .disk = "const x = 1;\n",
+            .notice = "Formatted, written and closed {s}",
+        },
+        .{
+            .text = "const x = ;\n",
+            .disk = "const x = ;\n",
+            .notice = "Written and closed {s}; not formatted: syntax error at 1:11",
+        },
+    };
+    inline for (cases) |case| {
+        var temp = testing.tmpDir(.{});
+        defer temp.cleanup();
+        var fixture: FormatFixture = undefined;
+        // b.md stays open, so closing a.zig doesn't quit.
+        try temp.dir.writeFile(testing.io, .{ .sub_path = "b.md", .data = "b\n" });
+        try fixture.init(temp.dir, "a.zig", case.text, 0o644);
+        defer fixture.deinit();
+        _ = try fixture.app.documents.open(testing.allocator, testing.io, temp.dir, "b.md");
+        const documents = &fixture.app.documents;
+        const a = (try documents.open(testing.allocator, testing.io, temp.dir, "a.zig")).id;
+        var path: [std.fs.max_path_bytes]u8 = undefined;
+        const name = copyPath(&path, &fixture.app, a);
+        fixture.app.fileAction(.write_quit);
+        try expectNotice(&fixture.app, case.notice, .{name});
+        try expectDisk(temp.dir, "a.zig", case.disk);
+        try testing.expectEqual(null, fixture.app.documents.get(a));
+    }
 }

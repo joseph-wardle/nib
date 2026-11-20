@@ -91,6 +91,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "clipboardWorkflow", clipboardWorkflow },
         .{ "clipboardSuspend", clipboardSuspend },
         .{ "externalChanges", externalChanges },
+        .{ "formattingWorkflow", formattingWorkflow },
         .{ "startupFailures", startupFailures },
         .{ "stalledOutputRecovery", stalledOutputRecovery },
         .{ "stalledOutputTermination", stalledOutputTermination },
@@ -1582,6 +1583,63 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try expectFile(path, "Yresumed\n");
+}
+
+fn formattingWorkflow(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const name = "/tmp/nib-format-{d}.zig";
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, name, .{linux.getpid()}, 0);
+    defer _ = linux.unlink(path);
+    try putFile(path, "const  x=1;\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.ready();
+    // :w formats, then writes.
+    try process.send(":w\r");
+    try process.until("Formatted and written");
+    try process.ready();
+    try expectFile(path, "const x = 1;\n");
+    // :fmt formats without saving, and u restores the agent's text.
+    try putFile(path, "const  y=2;\n");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    try process.send(":fmt\r");
+    try process.until("const y = 2;");
+    try process.until("Formatted");
+    try process.ready();
+    try expectFile(path, "const  y=2;\n");
+    try process.send("u");
+    try process.until("const  y=2;");
+    try process.ready();
+    // A syntax error saves the text as it is, and says why.
+    try putFile(path, "const x = ;\n");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    try process.send(":w\r");
+    try process.until("Written; not formatted: syntax error at 1:11");
+    try process.ready();
+    try expectFile(path, "const x = ;\n");
+    // A formattable file rewritten behind a clean buffer while the command line holds
+    // the reload: :w refuses without formatting, so the buffer stays clean
+    // and the agent's text reloads.
+    try putFile(path, "const  w=0;\n");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    try process.send(":");
+    try process.until("\x1b[7m:");
+    try process.ready();
+    try putFile(path, "const  z=3;\n");
+    try process.until("DISK CONFLICT | :");
+    try process.ready();
+    try process.send("w\r");
+    try process.until("const  z=3;");
+    try process.until("Reloaded external changes");
+    try process.ready();
+    try expectFile(path, "const  z=3;\n");
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }
 
 /// Runs a helper program to completion with no terminal I/O.
