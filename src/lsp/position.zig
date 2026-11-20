@@ -6,14 +6,6 @@ const char = @import("../text/char.zig");
 pub const Encoding = enum { utf8, utf16 };
 pub const Position = struct { line: u32, character: u32 };
 
-/// The character boundary in `buffer` that `at` names.
-pub fn offset(buffer: *const Buffer, at: Position, encoding: Encoding) usize {
-    if (at.line >= buffer.insertionRows()) return buffer.bytes().len;
-    const start = buffer.lineStart(at.line);
-    const text = buffer.bytes()[start..buffer.contentEnd(at.line)];
-    return start + column(text, at.character, encoding);
-}
-
 /// The byte offset in `line`, one line's text without its line break, of the
 /// character boundary that `character` names. A column past the text gives its
 /// end, and one inside a character gives that character's start.
@@ -64,6 +56,12 @@ fn units16(character: char.Character) usize {
 }
 
 const testing = std.testing;
+
+/// The character boundary in `buffer` that `at` names, converted from its
+/// line's text as Locations rows are.
+fn offset(buffer: *const Buffer, at: Position, encoding: Encoding) usize {
+    return buffer.lineStart(at.line) + column(buffer.line(at.line), at.character, encoding);
+}
 
 fn expectRoundTrip(
     buffer: *const Buffer,
@@ -129,19 +127,15 @@ test "columns past a line's text stop before its line break, CRLF included" {
     }
 }
 
-test "a line past the end gives the end of the text" {
+test "the empty line after a final LF, and in an empty text, has a position" {
     var buffer = try Buffer.fromBytes(testing.allocator, "one\ntwo\n");
     defer buffer.deinit(testing.allocator);
     for ([_]Encoding{ .utf8, .utf16 }) |encoding| {
-        // The empty line after the final LF exists; the one after it doesn't.
         try expectRoundTrip(&buffer, 8, encoding, .{ .line = 2, .character = 0 });
-        try expectOffset(&buffer, 3, 0, encoding, 8);
-        try expectOffset(&buffer, 4_000_000_000, 7, encoding, 8);
     }
     var empty = try Buffer.fromBytes(testing.allocator, "");
     defer empty.deinit(testing.allocator);
     try expectRoundTrip(&empty, 0, .utf16, .{ .line = 0, .character = 0 });
-    try expectOffset(&empty, 1, 0, .utf8, 0);
 }
 
 test "invalid bytes in read-only text count as one unit each" {

@@ -96,66 +96,51 @@ fn linesBefore(bytes: []const u8, target: usize, whole: bool) usize {
     return cut;
 }
 
-/// One line of a file.
-pub const Line = struct {
-    /// The line without its LF or CRLF. Owned.
-    text: []u8,
-    /// The file offset where the line starts.
-    start: u64,
-
-    pub fn deinit(self: *Line, gpa: Allocator) void {
-        gpa.free(self.text);
-        self.* = undefined;
-    }
-};
-
-/// Reads zero-based line `number` of `path`, relative to `root`, as `read`
-/// opens it. Lines are split at LF, so a file ending in one has an empty
-/// last line. Null when the file has fewer lines or the line doesn't end
-/// within its first `max_file_bytes`, the most Nib opens. This blocks until
-/// the bytes before the line are read.
-pub fn line(gpa: Allocator, root: Io.Dir, path: [*:0]const u8, number: u32) Failure!?Line {
+/// Reads all of `path`, relative to `root`, as `read` opens it. Refuses a
+/// file over `max_file_bytes`, the most Nib opens. The caller frees the bytes.
+/// This blocks until the whole file is read.
+pub fn readAll(
+    gpa: Allocator,
+    root: Io.Dir,
+    path: [*:0]const u8,
+) (Failure || error{FileTooLarge})![]u8 {
     const fd = try open(root, path);
     defer _ = linux.close(fd);
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
-    var chunk: [16 * 1024]u8 = undefined;
-    var offset: u64 = 0;
-    var start: ?u64 = if (number == 0) 0 else null;
-    var breaks: u32 = 0;
-    while (offset < max_file_bytes) {
-        const wanted = chunk[0..@intCast(@min(chunk.len, max_file_bytes - offset))];
-        const count = try retried(fd, wanted, offset);
-        if (count == 0) break;
-        var rest = chunk[0..count];
-        if (start == null) {
-            for (rest, 0..) |byte, index| {
-                if (byte != '\n') continue;
-                breaks += 1;
-                if (breaks < number) continue;
-                start = offset + index + 1;
-                rest = rest[index + 1 ..];
-                break;
-            } else rest = rest[rest.len..];
-        }
-        offset += count;
-        if (start == null) continue;
-        const end = std.mem.indexOfScalar(u8, rest, '\n') orelse {
-            try text.appendSlice(gpa, rest);
-            continue;
-        };
-        try text.appendSlice(gpa, rest[0..end]);
-        return try finished(gpa, &text, start.?);
-    } else {
-        // The line goes on past the bound, or the file is larger still.
-        if (try retried(fd, chunk[0..1], offset) != 0) return null;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(gpa);
+    while (true) {
+        try bytes.ensureUnusedCapacity(gpa, 16 * 1024);
+        const room = bytes.unusedCapacitySlice();
+        // One byte past the bound tells a file at it from a larger one.
+        const wanted = room[0..@min(room.len, max_file_bytes + 1 - bytes.items.len)];
+        const count = try retried(fd, wanted, bytes.items.len);
+        if (count == 0) return bytes.toOwnedSlice(gpa);
+        bytes.items.len += count;
+        if (bytes.items.len > max_file_bytes) return error.FileTooLarge;
     }
-    return if (start) |found| try finished(gpa, &text, found) else null;
 }
 
-fn finished(gpa: Allocator, text: *std.ArrayList(u8), start: u64) Allocator.Error!Line {
-    if (std.mem.endsWith(u8, text.items, "\r")) text.items.len -= 1;
-    return .{ .text = try text.toOwnedSlice(gpa), .start = start };
+/// One line of a text, borrowed from it.
+pub const Line = struct {
+    /// The line without its LF or CRLF.
+    text: []const u8,
+    /// Where the line starts in the text.
+    start: usize,
+};
+
+/// Zero-based line `number` of `bytes`, split at LF, so a text ending in one
+/// has an empty last line, as in `Buffer.line`. Null when the text has fewer
+/// lines.
+pub fn lineOf(bytes: []const u8, number: u32) ?Line {
+    var start: usize = 0;
+    for (0..number) |_| {
+        start = 1 + (std.mem.indexOfScalarPos(u8, bytes, start, '\n') orelse return null);
+    }
+    const lf = std.mem.indexOfScalarPos(u8, bytes, start, '\n') orelse {
+        return .{ .text = bytes[start..], .start = start };
+    };
+    const end = if (lf > start and bytes[lf - 1] == '\r') lf - 1 else lf;
+    return .{ .text = bytes[start..end], .start = start };
 }
 
 fn open(root: Io.Dir, path: [*:0]const u8) Failure!posix.fd_t {
@@ -350,66 +335,57 @@ test "a preview at a line reads 64 KiB and leaves out a line above cut short" {
     try testing.expect(snapshot.truncated);
 }
 
-fn expectLine(dir: Io.Dir, path: [*:0]const u8, number: u32, text: []const u8, start: u64) !void {
-    var found = (try line(testing.allocator, dir, path, number)).?;
-    defer found.deinit(testing.allocator);
+fn expectLine(bytes: []const u8, number: u32, text: []const u8, start: usize) !void {
+    const found = lineOf(bytes, number).?;
     try testing.expectEqualStrings(text, found.text);
     try testing.expectEqual(start, found.start);
 }
 
-test "a line is read whole, without its break, with where it starts" {
-    var temp = testing.tmpDir(.{});
-    defer temp.cleanup();
-    try temp.dir.writeFile(testing.io, .{ .sub_path = "mixed", .data = "one\r\n  two\nlast" });
-    try temp.dir.writeFile(testing.io, .{ .sub_path = "ended", .data = "a\n" });
-    try temp.dir.writeFile(testing.io, .{ .sub_path = "empty", .data = "" });
-    try expectLine(temp.dir, "mixed", 0, "one", 0);
-    try expectLine(temp.dir, "mixed", 1, "  two", 5);
-    try expectLine(temp.dir, "mixed", 2, "last", 11);
-    try testing.expectEqual(null, try line(testing.allocator, temp.dir, "mixed", 3));
-    try expectLine(temp.dir, "ended", 1, "", 2);
-    try testing.expectEqual(null, try line(testing.allocator, temp.dir, "ended", 2));
-    try expectLine(temp.dir, "empty", 0, "", 0);
-    try testing.expectEqual(null, try line(testing.allocator, temp.dir, "empty", 1));
-    const largest = std.math.maxInt(u32);
-    try testing.expectEqual(null, try line(testing.allocator, temp.dir, "mixed", largest));
+test "a line is taken whole, without its break, with where it starts" {
+    const mixed = "one\r\n  two\nlast\r";
+    try expectLine(mixed, 0, "one", 0);
+    try expectLine(mixed, 1, "  two", 5);
+    try expectLine(mixed, 2, "last\r", 11);
+    try testing.expectEqual(null, lineOf(mixed, 3));
+    try testing.expectEqual(null, lineOf(mixed, std.math.maxInt(u32)));
+    try expectLine("a\n", 1, "", 2);
+    try testing.expectEqual(null, lineOf("a\n", 2));
+    try expectLine("", 0, "", 0);
+    try testing.expectEqual(null, lineOf("", 1));
 }
 
-test "a line is found across reads, and only within 8 MiB" {
+test "a whole file is read up to 8 MiB, and a larger one refused" {
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     const bytes = try testing.allocator.alloc(u8, max_file_bytes + 1);
     defer testing.allocator.free(bytes);
-    @memset(bytes, 'y');
-    // A 100 KiB line after 40,000 short ones, then one longer than the bound.
-    for (0..40_000) |index| bytes[index * 2 ..][0..2].* = "x\n".*;
-    bytes[80_000 + 100 * 1024] = '\n';
-    try temp.dir.writeFile(testing.io, .{ .sub_path = "big", .data = bytes });
-    try expectLine(temp.dir, "big", 39_999, "x", 79_998);
-    try expectLine(temp.dir, "big", 40_000, bytes[80_000..][0 .. 100 * 1024], 80_000);
-    try testing.expectEqual(null, try line(testing.allocator, temp.dir, "big", 40_001));
-    // The same line ending exactly at the bound is read.
-    bytes[max_file_bytes - 1] = '\n';
+    for (bytes, 0..) |*byte, index| byte.* = @truncate(index);
     try temp.dir.writeFile(testing.io, .{ .sub_path = "edge", .data = bytes[0..max_file_bytes] });
-    const rest = bytes[80_000 + 100 * 1024 + 1 .. max_file_bytes - 1];
-    try expectLine(temp.dir, "edge", 40_001, rest, 80_000 + 100 * 1024 + 1);
-    try expectLine(temp.dir, "edge", 40_002, "", max_file_bytes);
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "big", .data = bytes });
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "empty", .data = "" });
+    const edge = try readAll(testing.allocator, temp.dir, "edge");
+    defer testing.allocator.free(edge);
+    try testing.expectEqualSlices(u8, bytes[0..max_file_bytes], edge);
+    const empty = try readAll(testing.allocator, temp.dir, "empty");
+    defer testing.allocator.free(empty);
+    try testing.expectEqual(0, empty.len);
+    try testing.expectError(error.FileTooLarge, readAll(testing.allocator, temp.dir, "big"));
 }
 
-test "a line is read only from a regular file, and a FIFO never blocks" {
+test "a whole file is read only from a regular file, and a FIFO never blocks" {
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     try temp.dir.createDirPath(testing.io, "dir");
     const fifo = linux.mknodat(temp.dir.handle, "fifo", linux.S.IFIFO | 0o600, 0);
     try testing.expectEqual(posix.E.SUCCESS, posix.errno(fifo));
     const gpa = testing.allocator;
-    try testing.expectError(error.UnsupportedFileType, line(gpa, temp.dir, "fifo", 0));
-    try testing.expectError(error.UnsupportedFileType, line(gpa, temp.dir, "dir", 0));
-    try testing.expectError(error.FileNotFound, line(gpa, temp.dir, "missing", 0));
-    try testing.expectError(error.UnsupportedFileType, line(gpa, Io.Dir.cwd(), "/dev/null", 0));
+    try testing.expectError(error.UnsupportedFileType, readAll(gpa, temp.dir, "fifo"));
+    try testing.expectError(error.UnsupportedFileType, readAll(gpa, temp.dir, "dir"));
+    try testing.expectError(error.FileNotFound, readAll(gpa, temp.dir, "missing"));
+    try testing.expectError(error.UnsupportedFileType, readAll(gpa, Io.Dir.cwd(), "/dev/null"));
 }
 
-test "allocation failure while reading a line or a preview at a line leaks nothing" {
+test "allocation failure while reading a whole file or a preview at a line leaks nothing" {
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
     const bytes: [3 * limit]u8 = @splat('z');
@@ -418,9 +394,9 @@ test "allocation failure while reading a line or a preview at a line leaks nothi
     defer cancel.deinit();
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn run(gpa: Allocator, dir: Io.Dir, flag: *const Cancel) !void {
-            var found = (try line(gpa, dir, "long", 0)).?;
-            defer found.deinit(gpa);
-            try testing.expectEqual(3 * limit, found.text.len);
+            const whole = try readAll(gpa, dir, "long");
+            defer gpa.free(whole);
+            try testing.expectEqual(3 * limit, whole.len);
             var snapshot = try read(gpa, dir, "long", limit, flag);
             defer snapshot.deinit(gpa);
             try testing.expectEqual(@as(u64, limit), snapshot.start);

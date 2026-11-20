@@ -17,6 +17,7 @@ const Finder = @import("finder/finder.zig").Finder;
 const Category = @import("finder/finder.zig").Category;
 const OpenFile = @import("finder/finder.zig").OpenFile;
 const Location = @import("finder/finder.zig").Location;
+const Place = @import("finder/finder.zig").Place;
 const preview = @import("finder/preview.zig");
 const Frame = @import("terminal/frame.zig").Frame;
 const setClipboard = @import("terminal/frame.zig").setClipboard;
@@ -25,7 +26,6 @@ const finder_view = @import("views/finder_view.zig");
 const client = @import("lsp/client.zig");
 const protocol = @import("lsp/protocol.zig");
 const position = @import("lsp/position.zig");
-const motion = @import("text/motion.zig");
 const linux = std.os.linux;
 
 /// Runs Nib on `device` until a command quits, opening a named file first.
@@ -473,25 +473,28 @@ const App = struct {
         const path = target.path orelse {
             return self.status.print("{s} answered with a location outside local files", .{name});
         };
-        const departure = self.documents.place(departed.document.buffer.cursor);
-        const opened = self.documents.open(self.gpa, self.io, .cwd(), path) catch |err| {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        var files: Files = .empty;
+        const encoding = server.capabilities.?.encoding;
+        const converted = self.locationRow(arena.allocator(), &files, path, target.at, encoding);
+        const row = converted catch |err| {
             return self.status.print("Cannot open: {s}", .{openFailure(err)});
         };
-        const entry = self.documents.current().?;
-        const buffer = &entry.document.buffer;
-        const offset = position.offset(buffer, target.at, server.capabilities.?.encoding);
-        buffer.cursor = motion.normal(buffer, offset);
-        entry.viewport.goal = motion.screenColumn(buffer, buffer.cursor, false);
-        const moved = opened.id != departure.id or buffer.cursor != waiting.cursor;
-        if (moved) self.documents.recordJump(departure);
+        const departure = self.documents.place(departed.document.buffer.cursor);
+        const activation = self.goTo(row.place) catch |err| {
+            return self.status.print("Cannot open: {s}", .{openFailure(err)});
+        };
+        const moved = self.recordDeparture(departure);
         var text: [Status.capacity]u8 = undefined;
         var notice: std.Io.Writer = .fixed(&text);
         if (!moved) {
             notice.print("Already at the {s}", .{noun(waiting.navigation, 1)}) catch unreachable;
         }
-        if (opened.activation) |reload| {
+        if (activation) |reload| {
             if (notice.end != 0) notice.writeAll("; ") catch unreachable;
-            reloaded(&notice, reload, false, self.named(entry)) catch unreachable;
+            const opened = self.named(self.documents.current().?);
+            reloaded(&notice, reload, false, opened) catch unreachable;
         }
         if (notice.end != 0) text[0] = std.ascii.toUpper(text[0]);
         self.status.set(notice.buffered());
@@ -508,22 +511,32 @@ const App = struct {
     ) void {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
-        const encoding = server.capabilities.?.encoding;
-        const rows = self.locationRows(arena.allocator(), locations, encoding) catch {
+        const listed = self.locate(arena.allocator(), server, locations) catch {
             return self.status.print("Not enough memory; {s} not listed", .{noun(navigation, 2)});
         };
-        if (rows.len == 0) {
+        if (!listed) {
             const name = server.server.name;
             return self.status.print("{s} answered with locations outside local files", .{name});
         }
-        const omitted = locations.len - rows.len;
-        self.finder.locate(self.gpa, self.io, self.background, rows, omitted) catch {
-            return self.status.print("Not enough memory; {s} not listed", .{noun(navigation, 2)});
-        };
-        self.status.clear();
-        self.finding = true;
+        self.showFinder();
         self.browsing = false;
-        self.redraw = true;
+    }
+
+    /// Fills Locations with the answer's locations in local files, with the
+    /// open documents, unless none are local. False when none are.
+    fn locate(
+        self: *App,
+        arena: Allocator,
+        server: *const client.Client,
+        locations: []const protocol.Location,
+    ) Allocator.Error!bool {
+        const encoding = server.capabilities.?.encoding;
+        const rows = try self.locationRows(arena, locations, encoding);
+        if (rows.len == 0) return false;
+        const omitted = locations.len - rows.len;
+        const open = try self.openFiles(arena);
+        try self.finder.locate(self.gpa, self.io, self.background, rows, omitted, open);
+        return true;
     }
 
     /// A row for each location in a local file, with its line's text and
@@ -536,44 +549,68 @@ const App = struct {
         encoding: position.Encoding,
     ) Allocator.Error![]Location {
         const listed = try arena.alloc(Location, locations.len);
+        var files: Files = .empty;
         var count: usize = 0;
         for (locations) |location| {
             const path = location.path orelse continue;
-            const at = location.at;
-            const found = try self.lineAt(arena, path, at.line);
-            const column = position.column(found.text, at.character, encoding);
-            listed[count] = .{
-                .place = .{ .path = path, .line = at.line, .column = @intCast(column) },
-                .text = found.text,
-                .start = found.start,
-            };
+            listed[count] = try self.locationRow(arena, &files, path, location.at, encoding);
             count += 1;
         }
         return listed[0..count];
     }
 
-    /// Line `number` of the file at absolute `path` and where it starts:
-    /// from its open document, unsaved edits included, or else from disk.
-    /// Empty, starting at 0, when there is no such line or it can't be read.
+    /// The row for position `at` in the file at absolute `path`, with its
+    /// line's text from `lineAt` and its column converted to bytes against
+    /// that text. Borrows `path`.
+    fn locationRow(
+        self: *const App,
+        arena: Allocator,
+        files: *Files,
+        path: []const u8,
+        at: position.Position,
+        encoding: position.Encoding,
+    ) Allocator.Error!Location {
+        const found = try self.lineAt(arena, files, path, at.line);
+        const column = position.column(found.text, at.character, encoding);
+        return .{
+            .place = .{ .path = path, .line = at.line, .column = @intCast(column) },
+            .text = found.text,
+            .start = found.start,
+        };
+    }
+
+    /// The text of each file a row was read from, by absolute path, so each
+    /// is read once per answer. Empty when the file couldn't be read.
+    const Files = std.StringHashMapUnmanaged([]const u8);
+
+    /// Line `number` of the file at absolute `path`: from its open document,
+    /// unsaved edits included, or else from its text in `files`, read into
+    /// `arena` on first use. Empty, starting at 0, when there is no such line
+    /// or the file can't be read.
     fn lineAt(
         self: *const App,
         arena: Allocator,
+        files: *Files,
         path: []const u8,
         number: u32,
-    ) Allocator.Error!struct { text: []const u8, start: u64 } {
+    ) Allocator.Error!preview.Line {
+        const none: preview.Line = .{ .text = "", .start = 0 };
         for (self.documents.entries.items) |*entry| {
             if (!std.mem.eql(u8, entry.document.source.path, path)) continue;
             const buffer = &entry.document.buffer;
-            if (number >= buffer.insertionRows()) return .{ .text = "", .start = 0 };
+            if (number >= buffer.insertionRows()) return none;
             return .{ .text = buffer.line(number), .start = buffer.lineStart(number) };
         }
-        const terminated = try arena.dupeSentinel(u8, path, 0);
-        const read = preview.line(arena, .cwd(), terminated, number) catch |err| switch (err) {
-            error.OutOfMemory => |e| return e,
-            else => return .{ .text = "", .start = 0 },
-        };
-        const line = read orelse return .{ .text = "", .start = 0 };
-        return .{ .text = line.text, .start = line.start };
+        const cached = try files.getOrPut(arena, path);
+        if (!cached.found_existing) {
+            const terminated = try arena.dupeSentinel(u8, path, 0);
+            const read = preview.readAll(arena, .cwd(), terminated);
+            cached.value_ptr.* = read catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => "",
+            };
+        }
+        return preview.lineOf(cached.value_ptr.*, number) orelse none;
     }
 
     /// Ctrl-O or Ctrl-I, from an idle editor, so activation may reload.
@@ -665,22 +702,34 @@ const App = struct {
 
     /// Focuses the finder on `category`, which discovers it again.
     fn find(self: *App, category: Category) void {
-        self.status.clear();
-        self.finding = true;
-        self.redraw = true;
-        const open = self.gpa.alloc(OpenFile, self.documents.entries.items.len) catch {
+        self.showFinder();
+        const open = self.openFiles(self.gpa) catch {
             self.status.set("Not enough memory; finder not refreshed");
             return;
         };
         defer self.gpa.free(open);
+        self.finder.focus(self.gpa, self.io, self.background, category, open) catch {
+            self.status.set("Not enough memory; finder results may be incomplete");
+        };
+    }
+
+    /// Puts the finder on screen in place of the editor.
+    fn showFinder(self: *App) void {
+        self.status.clear();
+        self.finding = true;
+        self.redraw = true;
+    }
+
+    /// The open documents as the finder lists them, borrowing their paths.
+    /// Allocated in `allocator`.
+    fn openFiles(self: *const App, allocator: Allocator) Allocator.Error![]OpenFile {
+        const open = try allocator.alloc(OpenFile, self.documents.entries.items.len);
         for (self.documents.entries.items, open) |*entry, *listed| listed.* = .{
             .id = @fromBackingInt(@backingInt(entry.id)),
             .path = entry.document.source.path,
             .used = entry.used,
         };
-        self.finder.focus(self.gpa, self.io, self.background, category, open) catch {
-            self.status.set("Not enough memory; finder results may be incomplete");
-        };
+        return open;
     }
 
     /// Leaves the list for the editor; without a document there is nowhere to go.
@@ -725,10 +774,9 @@ const App = struct {
     fn choose(self: *App) void {
         std.debug.assert(self.editor.idle());
         const choice = self.finder.choice() orelse return;
-        // Recorded only once the cursor is somewhere else.
         const departure = self.documents.here();
-        defer if (departure) |jump| if (!std.meta.eql(self.documents.here().?, jump)) {
-            self.documents.recordJump(jump);
+        defer if (departure) |jump| {
+            _ = self.recordDeparture(jump);
         };
         switch (choice) {
             .document => |listed| {
@@ -751,17 +799,33 @@ const App = struct {
                 self.announce(opened.activation, false);
             },
             .location => |place| {
-                const path = place.path;
-                const opened = self.documents.open(self.gpa, self.io, .cwd(), path) catch |err| {
+                const activation = self.goTo(place) catch |err| {
                     self.status.print("Cannot open: {s}", .{openFailure(err)});
                     return;
                 };
-                self.documents.moveTo(place.line, place.column);
-                self.announce(opened.activation, false);
+                self.announce(activation, false);
             },
         }
         self.finder.leave(self.gpa, self.io, self.background);
         self.finding = false;
+    }
+
+    /// Opens the file at `place`'s absolute path and puts the cursor on its
+    /// line and column, clamped to the text as it is now. Returns how opening
+    /// reloaded the file, as `Session.open` does; changes nothing when it
+    /// can't be opened. The caller records the departure.
+    fn goTo(self: *App, place: Place) file.Error!?Disk.Reload {
+        const opened = try self.documents.open(self.gpa, self.io, .cwd(), place.path);
+        self.documents.moveTo(place.line, place.column);
+        return opened.activation;
+    }
+
+    /// Records `departure` as a jump when the cursor is now somewhere else.
+    /// True when it is.
+    fn recordDeparture(self: *App, departure: session.Jump) bool {
+        if (std.meta.eql(self.documents.here().?, departure)) return false;
+        self.documents.recordJump(departure);
+        return true;
     }
 
     /// Runs a file command from either screen. Closing the last document
@@ -1908,7 +1972,7 @@ test "several locations open Locations with each line's text and leave the edito
     try testing.expect(app.finding and !app.browsing);
     try testing.expectEqual(Category.locations, app.finder.category);
     try testing.expectEqualStrings("", app.status.text());
-    try testing.expectEqual(@as(usize, 1), app.finder.lists.getPtrConst(.locations).omitted);
+    try testing.expectEqual(@as(usize, 1), app.finder.locations.omitted);
     try expectListed(&fixture, &.{
         "b.zig:1:8  pub fn target() void {}",
         "a.zig:5:4  // unsaved",
@@ -1981,6 +2045,55 @@ test "a location in a missing file or past the text is listed and opens like any
     // Past the text, the cursor is clamped to the last line.
     app.finderEvent(.{ .key = 0x0e });
     app.finderEvent(.{ .key = '\r' });
+    try testing.expect(app.documents.active.? != a);
+    try testing.expectEqual(@as(usize, 0), fixture.buffer().cursor);
+    try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
+}
+
+test "rows in a file that isn't open each take their own line of it, in the server's order" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const text = "first\r\nsecond\nthird";
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "c.zig", .data = text });
+    var storage: [4][1024]u8 = undefined;
+    try answerAll(&fixture, &.{
+        try fixture.location(&storage[0], "c.zig", 2, 1),
+        try fixture.location(&storage[1], "a.zig", 1, 0),
+        try fixture.location(&storage[2], "c.zig", 0, 0),
+        try fixture.location(&storage[3], "c.zig", 1, 0),
+    });
+    try expectListed(&fixture, &.{
+        "c.zig:3:2  third",
+        "a.zig:2:1  pub fn main() void {",
+        "c.zig:1:1  first",
+        "c.zig:2:1  second",
+    });
+    const starts = [_]u64{ 14, 28, 0, 7 };
+    for (starts, fixture.app.finder.locations.rows) |start, row| {
+        try testing.expectEqual(start, row.start);
+    }
+}
+
+test "one location in a missing file or past the text lands as its Locations row would" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    var storage: [1024]u8 = undefined;
+    fixture.keys("gd");
+    try fixture.reply(try fixture.location(&storage, "missing.zig", 0, 4));
+    const missing = "Cannot open: file not found; check the path";
+    try testing.expectEqualStrings(missing, app.status.text());
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    try testing.expectEqual(@as(usize, 0), app.documents.jumps.len);
+    // Past the text, the cursor is clamped to the last line's column.
+    fixture.keys("gd");
+    try fixture.reply(try fixture.location(&storage, "b.zig", 99, 3));
     try testing.expect(app.documents.active.? != a);
     try testing.expectEqual(@as(usize, 0), fixture.buffer().cursor);
     try testing.expectEqual(@as(usize, 1), app.documents.jumps.len);
@@ -2337,4 +2450,38 @@ test "a key on an exited server waits for it to start after the frame; a failed 
     try testing.expect(server.state == .running);
     try testing.expect(app.waiting != null);
     try testing.expectEqualStrings("Asking zls...", app.status.text());
+}
+
+const DocumentId = @import("finder/finder.zig").DocumentId;
+const Preview = @import("finder/finder.zig").Preview;
+
+test "Locations recognises the documents open when the answer arrives, never a closed one" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    // b.zig is open when the finder last listed documents, then closed.
+    _ = try fixture.open("b.zig");
+    app.find(.open);
+    app.dismiss();
+    app.fileAction(.{ .quit = false });
+    try testing.expectEqual(a, app.documents.active.?);
+    fixture.buffer().cursor = Navigating.call;
+    var storage: [2][1024]u8 = undefined;
+    try answerAll(&fixture, &.{
+        try fixture.location(&storage[0], "a.zig", 1, 4),
+        try fixture.location(&storage[1], "b.zig", 0, 7),
+    });
+    // a.zig, opened before the finder ever listed it, previews its buffer.
+    const finder = app.finder;
+    const own: DocumentId = @fromBackingInt(@backingInt(a));
+    try testing.expectEqual(own, finder.row(finder.matches[0]).document.?);
+    const at_line: Preview = .{ .document = .{ .id = own, .line = 1 } };
+    try testing.expectEqual(at_line, finder.preview());
+    // The closed b.zig is read from disk.
+    app.finderEvent(.{ .key = 0x0e });
+    try testing.expectEqual(null, finder.row(finder.matches[1]).document);
+    try testing.expect(finder.preview() == .loading);
 }

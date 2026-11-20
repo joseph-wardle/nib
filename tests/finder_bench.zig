@@ -206,7 +206,7 @@ fn rooted(finder: *const Finder) bool {
 }
 
 fn discovered(finder: *const Finder, category: Category) bool {
-    const list = finder.lists.getPtrConst(category);
+    const list = finder.listOf(category).?;
     return list.catalog != null and !list.discovering and !finder.filtering;
 }
 

@@ -31,7 +31,7 @@ pub fn draw(
 ) terminal.Error!void {
     const width: usize = size.columns -| 1;
     if (size.rows == 0 or width == 0) return;
-    const selected = finder.caption();
+    const selected = finder.selectedPath();
     const rows = layout(finder, size);
     const header_rows = rows.header;
     const progress_rows = rows.progress;
@@ -42,7 +42,7 @@ pub fn draw(
     if (header_rows != 0) {
         var line: Line = .init(try frame.reserve(width));
         // Locations is present once an answer has filled it.
-        const located = finder.lists.get(.locations).catalog != null;
+        const located = finder.locations.filled();
         for ([_]Category{ .project, .all, .open, .locations }) |category| {
             const name = switch (category) {
                 .project => "Project",
@@ -116,7 +116,7 @@ pub fn layout(finder: *const Finder, size: terminal.Size) Layout {
     var rows: Layout = .{};
     rows.query = @min(budget, 1);
     budget -= rows.query;
-    rows.path = @min(budget, (finder.caption().len + width - 1) / width);
+    rows.path = @min(budget, (finder.selectedPath().len + width - 1) / width);
     budget -= rows.path;
     rows.header = @min(budget, 1);
     budget -= rows.header;
@@ -138,28 +138,28 @@ pub const Layout = struct {
 fn progress(finder: *const Finder, row: []u8) void {
     var line: Line = .init(row);
     var number: [64]u8 = undefined;
-    const list = finder.lists.getPtrConst(finder.category);
-    const total = if (list.catalog) |catalog| catalog.entries.len else 0;
-    const counts = .{ finder.matches.len, total };
-    const shown = if (finder.category == .locations)
-        std.fmt.bufPrint(&number, "{d}/{d} rows", counts)
-    else
-        std.fmt.bufPrint(&number, "{d}/{d} files", counts);
-    line.put(shown catch unreachable);
-    if (finder.category == .locations and list.omitted != 0) {
-        const omitted = std.fmt.bufPrint(&number, " | {d} outside local files", .{list.omitted});
-        line.put(omitted catch unreachable);
+    const total = if (finder.catalogOf(finder.category)) |catalog| catalog.entries.len else 0;
+    const noun = if (finder.category == .locations) "rows" else "files";
+    const counts = .{ finder.matches.len, total, noun };
+    line.put(std.fmt.bufPrint(&number, "{d}/{d} {s}", counts) catch unreachable);
+    // Locations has no list: it is never discovered.
+    const listed = finder.listOf(finder.category);
+    if (listed == null and finder.locations.omitted != 0) {
+        const omitted = .{finder.locations.omitted};
+        const spelled = std.fmt.bufPrint(&number, " | {d} outside local files", omitted);
+        line.put(spelled catch unreachable);
     }
-    if (list.discovering) line.put(" | scanning");
+    if (listed) |list| if (list.discovering) line.put(" | scanning");
     if (finder.filtering) line.put(" | searching");
-    if (list.failure) |err| {
+    if (listed) |list| if (list.failure) |err| {
         line.put(" | Listing failed: ");
         line.put(jobFailure(err));
-    }
+    };
     if (finder.filter_failure) |err| {
         line.put(" | Search failed: ");
         line.put(jobFailure(err));
     }
+    const list = listed orelse return;
     if (list.partial) {
         line.put(" | Partial: ");
         line.put(list.reason);
@@ -168,10 +168,9 @@ fn progress(finder: *const Finder, row: []u8) void {
         line.put(list.reason);
     }
     const root = finder.root orelse return;
-    if (!root.git) return;
+    if (!root.git or finder.category == .project) return;
     // Open takes ignore status from All's listing.
     const all = finder.lists.getPtrConst(.all);
-    if (finder.category == .project or finder.category == .locations) return;
     if (all.ignore_reason.len != 0) {
         line.put(" | ");
         line.put(all.ignore_reason);
@@ -398,7 +397,7 @@ test "Locations counts rows and omitted locations, and a long row keeps the resu
         .{ .place = .{ .path = "/p/a.zig", .line = 0, .column = 0 }, .text = &long, .start = 0 },
         .{ .place = .{ .path = "/p/b.zig", .line = 4, .column = 2 }, .text = "b();", .start = 0 },
     };
-    try finder.locate(testing.allocator, testing.io, &background, &rows, 3);
+    try finder.locate(testing.allocator, testing.io, &background, &rows, 3, &.{});
     var row: [80]u8 = undefined;
     progress(&finder, &row);
     const counts = "2/2 rows | 3 outside local files";
@@ -407,7 +406,7 @@ test "Locations counts rows and omitted locations, and a long row keeps the resu
     const rows_shown = layout(&finder, size);
     try testing.expectEqual(@as(usize, 1), rows_shown.path);
     try testing.expectEqual(@as(usize, 19), rows_shown.results);
-    try finder.locate(testing.allocator, testing.io, &background, rows[1..], 0);
+    try finder.locate(testing.allocator, testing.io, &background, rows[1..], 0, &.{});
     progress(&finder, &row);
     try testing.expectEqualStrings("1/1 rows", std.mem.trimEnd(u8, &row, " "));
 }
