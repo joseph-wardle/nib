@@ -51,8 +51,9 @@ pub const Location = struct {
     /// leading whitespace, are kept.
     text: []const u8,
     /// Where the line starts in the text it was read from, an open
-    /// document's or the file's, so a preview of the file shows it; 0 when
-    /// it couldn't be read.
+    /// document's or the file's; 0 when it couldn't be read. A preview read
+    /// from disk starts there; an open document's preview goes by
+    /// `place.line` instead.
     start: u64,
 };
 
@@ -523,8 +524,8 @@ pub const Finder = struct {
                 try self.relabel(gpa, background);
             },
             .listing => |result| {
-                const category: Category = if (request == .project) .project else .all;
-                const list = self.lists.getPtr(if (category == .project) .project else .all);
+                const listing: Listing = if (request == .project) .project else .all;
+                const list = self.lists.getPtr(listing);
                 list.discovering = false;
                 const found = result catch |err| {
                     list.failure = err;
@@ -538,7 +539,7 @@ pub const Finder = struct {
                 gpa.free(list.ignore_reason);
                 list.ignore_reason = found.ignore_reason;
                 list.replace(gpa, found.catalog, &.{});
-                if (category != self.category) return;
+                if (self.listOf(self.category) != list) return;
                 try self.show(gpa, io, background);
             },
             .matches => |result| {
@@ -573,7 +574,7 @@ pub const Finder = struct {
         path: []const u8,
         document: ?Document,
         place: ?Place,
-        /// Where a location's line starts in the file, for its preview.
+        /// As `Location.start`; 0 for a file.
         start: u64,
     };
 

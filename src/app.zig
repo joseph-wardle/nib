@@ -382,7 +382,8 @@ const App = struct {
             self.waiting = null;
             return self.status.print("{s} has no {s}", .{ name, sought });
         }
-        const entry = self.fresh() orelse return self.stale();
+        if (!self.fresh()) return self.stale();
+        const entry = self.documents.current().?;
         const buffer = &entry.document.buffer;
         const at = position.position(buffer, buffer.cursor, capabilities.encoding);
         const path = entry.document.source.path;
@@ -435,17 +436,16 @@ const App = struct {
         return true;
     }
 
-    /// The waiting request's document while its answer may still apply: the
-    /// same document is active with the same cursor and text, and the editor
-    /// is idle on it, so a jump may switch and reload documents.
-    fn fresh(self: *App) ?*session.Entry {
+    /// Whether the waiting request may still apply: its document is active
+    /// with the same cursor and text, and the editor is idle on it, so a jump
+    /// may switch and reload documents.
+    fn fresh(self: *App) bool {
         const waiting = self.waiting.?;
-        if (self.finding or self.command_line.open or !self.editor.idle()) return null;
-        const entry = self.documents.current() orelse return null;
+        if (self.finding or self.command_line.open or !self.editor.idle()) return false;
+        const entry = self.documents.current() orelse return false;
         const buffer = &entry.document.buffer;
-        if (entry.id != waiting.document or buffer.cursor != waiting.cursor) return null;
-        if (buffer.changes != waiting.changes) return null;
-        return entry;
+        return entry.id == waiting.document and buffer.cursor == waiting.cursor and
+            buffer.changes == waiting.changes;
     }
 
     fn stale(self: *App) void {
@@ -458,7 +458,7 @@ const App = struct {
     /// recording the departure, and several are listed in Locations.
     fn arrive(self: *App, server: *const client.Client) void {
         const name = server.server.name;
-        const departed = self.fresh() orelse return self.stale();
+        if (!self.fresh()) return self.stale();
         const waiting = self.waiting.?;
         self.waiting = null;
         const locations = switch (server.answer.?) {
@@ -481,7 +481,7 @@ const App = struct {
         const row = converted catch |err| {
             return self.status.print("Cannot open: {s}", .{openFailure(err)});
         };
-        const departure = self.documents.place(departed.document.buffer.cursor);
+        const departure = self.documents.here().?;
         const activation = self.goTo(row.place) catch |err| {
             return self.status.print("Cannot open: {s}", .{openFailure(err)});
         };
