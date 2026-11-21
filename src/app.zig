@@ -877,7 +877,7 @@ const App = struct {
                 const formatting = self.formatActive();
                 const name = self.named(entry);
                 // Written before closing frees the path. A close follows only
-                // a save that `saveNotice` reports as plain `Written`.
+                // a save that `saveNotice` reports as written, formatted or not.
                 var text: [Status.capacity]u8 = undefined;
                 var notice: std.Io.Writer = .fixed(&text);
                 const verb = if (formatting == .formatted)
@@ -887,7 +887,9 @@ const App = struct {
                 notice.print("{s} {f}", .{ verb, name }) catch unreachable;
                 const closing = self.documents.saveAndClose(self.gpa, self.io, .{});
                 if (!closing.closed) return self.saved(closing.report, false, formatting);
-                if (formatting.failed()) notFormatted(&notice, "; not formatted", formatting);
+                if (formatting == .failed) {
+                    notFormatted(&notice, "; not formatted", formatting.failed);
+                }
                 self.closed(&notice, closing.activation);
             },
             .reload => {
@@ -906,7 +908,8 @@ const App = struct {
                     .formatted => self.status.set("Formatted"),
                     .unchanged => self.status.set("Already formatted"),
                     .no_formatter => self.status.set("No formatter for this file"),
-                    else => |failure| {
+                    .diverged => self.status.set("Not formatted: source changed or missing"),
+                    .failed => |failure| {
                         var text: [Status.capacity]u8 = undefined;
                         var notice: std.Io.Writer = .fixed(&text);
                         notFormatted(&notice, "Not formatted", failure);
@@ -970,23 +973,20 @@ const App = struct {
         formatted,
         unchanged,
         no_formatter,
-        read_only,
         /// The file changed on disk, or can't be checked: formatting the
-        /// text would dirty a buffer that should reload.
+        /// text would dirty a buffer that should reload. A save refuses it
+        /// itself, so only `:fmt` words it.
         diverged,
+        failed: Failure,
+    };
+
+    /// Why formatting was attempted and changed nothing, which every caller words.
+    const Failure = union(enum) {
+        read_only,
         syntax_error: format.Position,
         too_large,
         out_of_memory,
         not_editable,
-
-        /// Whether formatting was attempted and failed for a reason a save
-        /// reports. A changed file isn't one: the save refuses it itself.
-        fn failed(self: Formatting) bool {
-            return switch (self) {
-                .formatted, .unchanged, .no_formatter, .diverged => false,
-                .read_only, .syntax_error, .too_large, .out_of_memory, .not_editable => true,
-            };
-        }
     };
 
     /// Formats the active document with its formatter, if it has one, as one
@@ -996,43 +996,41 @@ const App = struct {
         const entry = self.documents.current().?;
         const document = &entry.document;
         const formatter = format.formatterFor(document.source.path) orelse return .no_formatter;
-        if (!document.buffer.editable) return .read_only;
+        if (!document.buffer.editable) return .{ .failed = .read_only };
         entry.disk.inspect(self.gpa, document, false);
         if (entry.disk.diverged) return .diverged;
         const outcome = format.format(self.gpa, formatter, document.buffer.bytes()) catch {
-            return .out_of_memory;
+            return .{ .failed = .out_of_memory };
         };
         const formatted = switch (outcome) {
             .formatted => |text| text,
             .unchanged => return .unchanged,
-            .syntax_error => |at| return .{ .syntax_error = at },
+            .syntax_error => |at| return .{ .failed = .{ .syntax_error = at } },
         };
         defer self.gpa.free(formatted);
         const goal = &entry.viewport.goal;
         self.editor.applyFormatted(self.gpa, &document.buffer, goal, formatted) catch |err| {
-            return switch (err) {
+            return .{ .failed = switch (err) {
                 error.OutOfMemory => .out_of_memory,
                 error.FileTooLarge, error.TooManyLines => .too_large,
                 error.UnsupportedText => .not_editable,
-            };
+            } };
         };
         return .formatted;
     }
 
     /// Writes `lead`, then why `failure` left the text unformatted, cut short
     /// if it doesn't fit.
-    fn notFormatted(notice: *std.Io.Writer, lead: []const u8, failure: Formatting) void {
+    fn notFormatted(notice: *std.Io.Writer, lead: []const u8, failure: Failure) void {
         const reason = switch (failure) {
             .syntax_error => |at| {
                 const arguments = .{ lead, at.line, at.column };
                 return notice.print("{s}: syntax error at {d}:{d}", arguments) catch {};
             },
             .read_only => "read-only",
-            .diverged => "source changed or missing",
             .too_large => "result exceeds temporary 8 MiB or 262,144-line limit",
             .out_of_memory => "not enough memory",
             .not_editable => "result is not editable text",
-            .formatted, .unchanged, .no_formatter => unreachable,
         };
         notice.print("{s}: {s}", .{ lead, reason }) catch {};
     }
@@ -1042,14 +1040,11 @@ const App = struct {
     fn saved(self: *App, result: file.Report, copy: bool, formatting: ?Formatting) void {
         var text: [Status.capacity]u8 = undefined;
         var notice: std.Io.Writer = .fixed(&text);
-        const written = saveNotice(result, copy);
         const formatted = formatting != null and formatting.? == .formatted;
-        const plain = std.mem.eql(u8, written, "Written");
-        const first = if (formatted and plain) "Formatted and written" else written;
-        notice.writeAll(first) catch unreachable;
+        notice.writeAll(saveNotice(result, copy, formatted)) catch unreachable;
         if (result.cleanup_failure) notice.writeAll("; cleanup failed") catch unreachable;
         if (formatting) |attempt| {
-            if (attempt.failed()) notFormatted(&notice, "; not formatted", attempt);
+            if (attempt == .failed) notFormatted(&notice, "; not formatted", attempt.failed);
         }
         self.status.set(notice.buffered());
     }
@@ -1189,7 +1184,8 @@ pub fn openFailure(err: file.Error) []const u8 {
     };
 }
 
-fn saveNotice(result: file.Report, copy: bool) []const u8 {
+/// `formatted` says the source was formatted first, for a save that succeeded.
+fn saveNotice(result: file.Report, copy: bool, formatted: bool) []const u8 {
     if (result.publication == .uncertain) return "Save outcome uncertain; inspect disk before retrying";
     if (result.publication == .installed and !result.verified) return "Bytes installed but changed/unverified; local edits retained";
     if (result.publication == .installed and !result.durable) return "Bytes installed and verified; durability not confirmed";
@@ -1203,7 +1199,8 @@ fn saveNotice(result: file.Report, copy: bool) []const u8 {
         error.OutOfMemory => "Not enough memory; save refused",
         else => @errorName(err),
     };
-    return if (copy) "Copy written; source association and unsaved status retained" else "Written";
+    if (copy) return "Copy written; source association and unsaved status retained";
+    return if (formatted) "Formatted and written" else "Written";
 }
 
 test "Enter on an Open row whose file has closed relists rather than activating it" {
@@ -1242,12 +1239,55 @@ test "Enter on an Open row whose file has closed relists rather than activating 
 const posix = std.posix;
 
 test "save notices distinguish failure, uncertain publication and installed durability" {
-    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .failure = error.SourceChanged }, false), "Source changed"));
-    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .uncertain, .failure = error.PublishFailed }, false), "Save outcome uncertain"));
-    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .installed, .failure = error.SourceChanged }, false), "Bytes installed but changed/unverified"));
-    try std.testing.expectEqualStrings("Bytes installed and verified; durability not confirmed", saveNotice(.{ .publication = .installed, .verified = true, .failure = error.SyncFailed }, false));
-    try std.testing.expect(std.mem.startsWith(u8, saveNotice(.{ .publication = .installed, .verified = true, .durable = true, .failure = error.InjectedFailure }, false), "Bytes installed and verified"));
-    try std.testing.expectEqualStrings("Written", saveNotice(.{ .publication = .installed, .verified = true, .durable = true }, false));
+    const installed: file.Report = .{
+        .publication = .installed,
+        .verified = true,
+        .durable = true,
+    };
+    const cases = [_]struct { result: file.Report, formatted: bool, notice: []const u8 }{
+        .{
+            .result = .{ .failure = error.SourceChanged },
+            .formatted = false,
+            .notice = "Source changed",
+        },
+        .{
+            .result = .{ .publication = .uncertain, .failure = error.PublishFailed },
+            .formatted = false,
+            .notice = "Save outcome uncertain",
+        },
+        .{
+            .result = .{ .publication = .installed, .failure = error.SourceChanged },
+            .formatted = false,
+            .notice = "Bytes installed but changed/unverified",
+        },
+        .{
+            .result = .{ .publication = .installed, .verified = true, .failure = error.SyncFailed },
+            .formatted = false,
+            .notice = "Bytes installed and verified; durability not confirmed",
+        },
+        .{
+            .result = .{
+                .publication = .installed,
+                .verified = true,
+                .durable = true,
+                .failure = error.InjectedFailure,
+            },
+            .formatted = false,
+            .notice = "Bytes installed and verified; save reported an error",
+        },
+        .{ .result = installed, .formatted = false, .notice = "Written" },
+        // Formatting changes only the wording of a save that succeeded.
+        .{ .result = installed, .formatted = true, .notice = "Formatted and written" },
+        .{
+            .result = .{ .failure = error.AccessDenied },
+            .formatted = true,
+            .notice = "Write permission denied; save refused",
+        },
+    };
+    for (cases) |case| {
+        const notice = saveNotice(case.result, false, case.formatted);
+        try std.testing.expectStringStartsWith(notice, case.notice);
+    }
 }
 
 test "the search prompt and its matches are drawn until Escape in normal mode hides them" {
