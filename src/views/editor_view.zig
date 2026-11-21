@@ -517,3 +517,44 @@ test "Zig files are drawn in colour under unchanged gutters and search matches" 
     try std.testing.expect(std.mem.startsWith(u8, plain, gutter ++ "const x = 1;" ++ after));
     try std.testing.expect(std.mem.endsWith(u8, plain, matches));
 }
+
+test "a Zig row puts every character in the cells a plain row does, for any bytes" {
+    const allocator = std.testing.allocator;
+    const renderText = @import("../text/viewport.zig").renderText;
+    // Overlays place their cells as a plain row does, so a coloured row must
+    // agree with it, including where tokens meet tabs, wide characters and
+    // invalid bytes.
+    const parts = [_][]const u8{
+        "const", "u8",       "1",    "0x1e-", "..",      "\"", "'",      "\\",       "\\\\",
+        "//",    "@",        "@\"",  "x",     " ",       "\t", "\u{e9}", "\u{6750}", "\u{1f680}",
+        "\xc3",  "\xe6\x9d", "\x01", "\x7f",  "\u{301}",
+    };
+    var prng: std.Random.DefaultPrng = .init(0x6e6962);
+    const random = prng.random();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(allocator);
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(allocator);
+    var storage: [3 * 40]u8 = undefined;
+    var frame: Frame = .{ .screen = undefined };
+    for (0..2000) |_| {
+        line.clearRetainingCapacity();
+        for (0..random.uintLessThan(usize, 16)) |_| {
+            try line.appendSlice(allocator, parts[random.uintLessThan(usize, parts.len)]);
+        }
+        const left = random.uintLessThan(usize, 24);
+        const columns = random.uintLessThan(usize, 41);
+        frame.len = 0;
+        try code(&frame, line.items, left, columns);
+        // The row without its looks, each of which ends in `m`.
+        plain.clearRetainingCapacity();
+        var rest: []const u8 = frame.bytes[0..frame.len];
+        while (std.mem.indexOfScalar(u8, rest, 0x1b)) |escape| {
+            try plain.appendSlice(allocator, rest[0..escape]);
+            rest = rest[std.mem.indexOfScalarPos(u8, rest, escape, 'm').? + 1 ..];
+        }
+        try plain.appendSlice(allocator, rest);
+        const expected = storage[0..renderText(line.items, left, columns, &storage)];
+        try std.testing.expectEqualStrings(expected, plain.items);
+    }
+}

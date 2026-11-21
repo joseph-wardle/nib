@@ -16,8 +16,9 @@ const session = nib.session;
 // along the middle line, where column scans are longest. Rendering and output
 // are not timed with the motions; a separate sample draws a whole frame through
 // the editor view once it follows the cursor, as Zig and as plain text, and
-// again with every content row selected by `V`. Search samples time one incremental query change, for a query
-// that is found and one that is not, and again on an 8 MiB file with no match.
+// again with every content row selected by `V`. Search samples time one
+// incremental query change, for a query that is found and one that is not, and
+// again on an 8 MiB file with no match.
 // Output is never written to a terminal. No timing threshold is a test.
 pub fn main(init: std.process.Init) !void {
     const lines = [_]struct {
@@ -105,8 +106,8 @@ pub fn main(init: std.process.Init) !void {
 /// One frame of the editor view at `rows` content rows by `columns` of a
 /// document at `path`, which decides its colours, the cursor where `buffer` has
 /// it and the view following it as the app does. With an `anchor`, a linewise
-/// selection runs from it to the cursor. Reports the
-/// frame's bytes; nothing is written to a terminal.
+/// selection runs from it to the cursor. Reports the frame's bytes; nothing is
+/// written to a terminal.
 fn render(
     io: std.Io,
     buffer: *const Buffer,
