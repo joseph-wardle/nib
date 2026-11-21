@@ -86,6 +86,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "editingWorkflow", editingWorkflow },
         .{ "utf8Editing", utf8Editing },
         .{ "searchWorkflow", searchWorkflow },
+        .{ "lineNumbers", lineNumbers },
         .{ "visualWorkflow", visualWorkflow },
         .{ "pasteLifecycle", pasteLifecycle },
         .{ "clipboardWorkflow", clipboardWorkflow },
@@ -597,11 +598,12 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     _ = try process.wait(true);
     try process.until(leave);
     try process.restored();
-    var dimensions: posix.winsize = .{ .row = 4, .col = 12, .xpixel = 0, .ypixel = 0 };
+    // Eleven cells of text behind the four-cell gutter.
+    var dimensions: posix.winsize = .{ .row = 4, .col = 16, .xpixel = 0, .ypixel = 0 };
     _ = try checked(linux.ioctl(process.master.?, linux.T.IOCSWINSZ, @intFromPtr(&dimensions)));
     try process.signal(.CONT);
     try process.until("line000 xxx");
-    try process.until("\x1b[3;4H\x1b[?25h");
+    try process.until("\x1b[3;8H\x1b[?25h");
     try process.ready();
     // Reach the final row and the final display column, then check the whole
     // clipped frame. The fixture ends with CRLF and contains an eight-stop tab.
@@ -612,12 +614,14 @@ fn viewerWorkflow(executable: [:0]const u8) !void {
     try process.until("\x1b[0m");
     @memset(&movement, 'l');
     try process.send(&movement);
-    try process.until("\x1b[H\x1b[2JxxTAIL    !\r\nxxTAIL    !\r\nxxTAIL    !\r\n");
-    try process.until("\x1b[3;11H\x1b[?25h");
+    try process.until("\x1b[H\x1b[2J\x1b[0;90m  2\x1b[m xxTAIL    !\r\n" ++
+        "\x1b[0;90m  1\x1b[m xxTAIL    !\r\n\x1b[0;1;33m60 \x1b[m xxTAIL    !\r\n");
+    try process.until("\x1b[3;15H\x1b[?25h");
     try process.ready();
     try process.send("gg0");
-    try process.until("line000 xxx\r\nline001 xxx\r\nline002 xxx\r\n");
-    try process.until("\x1b[1;1H\x1b[?25h");
+    try process.until("\x1b[0;1;33m1  \x1b[m line000 xxx\r\n" ++
+        "\x1b[0;90m  1\x1b[m line001 xxx\r\n\x1b[0;90m  2\x1b[m line002 xxx\r\n");
+    try process.until("\x1b[1;5H\x1b[?25h");
     try process.ready();
     try equal(@as(usize, 0), try process.read(100));
     try process.send(":qa\r");
@@ -765,18 +769,30 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
     const bytes = process.output[0..process.used];
     const start = (std.mem.indexOf(u8, bytes, frame) orelse return error.MissingOutput) + frame.len;
     const status = std.mem.indexOf(u8, bytes, "\x1b[0;7mNORMAL") orelse return error.MissingOutput;
-    try equal(@as(usize, 199 * 301), status - start);
+    // Each row: its line number in a four-cell gutter, then 295 cells of text.
+    var offset = start;
     for (0..199) |number| {
-        var expected: [299]u8 = @splat(' ');
+        var label: [32]u8 = undefined;
+        const gutter = if (number == 0)
+            "\x1b[0;1;33m1  \x1b[m "
+        else if (number < 60)
+            try std.fmt.bufPrint(&label, "\x1b[0;90m{d:>3}\x1b[m ", .{number})
+        else
+            "    ";
+        try std.testing.expectEqualStrings(gutter, bytes[offset..][0..gutter.len]);
+        offset += gutter.len;
+        var expected: [295]u8 = @splat(' ');
         if (number < 60) {
             _ = try std.fmt.bufPrint(expected[0..8], "line{d:0>3} ", .{number});
             @memset(expected[8..120], 'x');
             @memcpy(expected[120..124], "TAIL");
             expected[128] = '!';
         }
-        try std.testing.expectEqualSlices(u8, &expected, bytes[start + number * 301 ..][0..299]);
-        try std.testing.expectEqualStrings("\r\n", bytes[start + number * 301 + 299 ..][0..2]);
+        try std.testing.expectEqualSlices(u8, &expected, bytes[offset..][0..295]);
+        try std.testing.expectEqualStrings("\r\n", bytes[offset + 295 ..][0..2]);
+        offset += 297;
     }
+    try equal(status, offset);
     process.used = 0;
     // Each large command-line frame also meets backpressure. Consume each
     // frame before continuing so the bounded capture retains one at a time.
@@ -919,7 +935,7 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.until("\x1b[24;2H");
     try process.ready();
     try process.send("t");
-    try process.until("\x1b[1;7H\x1b[0;33;7mt\x1b[m");
+    try process.until("\x1b[1;11H\x1b[0;33;7mt\x1b[m");
     try process.until("\x1b[24;3H");
     try process.ready();
     // The preview scrolls the view to row 30, the one match of "ta".
@@ -930,7 +946,7 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.ready();
     // Escape returns cursor and view to the start, without highlights.
     try process.send("\x1b");
-    try process.until("\x1b[2Jrow00 text");
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m row00 text");
     try process.until("NORMAL | 1:1 | ");
     try plainFrame(&process);
     try process.send("/target\r");
@@ -958,11 +974,11 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.ready();
     // d/ deletes up to the match as one undo step.
     try process.send("d/text\r");
-    try process.until("\r\ntext ");
+    try process.until("\r\n\x1b[0;1;33m20 \x1b[m text ");
     try process.until("NORMAL [+] | 20:1 | ");
     try process.ready();
     try process.send("u");
-    try process.until("\r\nrow19 text");
+    try process.until("\r\n\x1b[0;1;33m20 \x1b[m row19 text");
     try process.until("NORMAL | 20:1 | ");
     try process.ready();
     try process.send(":qa\r");
@@ -970,6 +986,45 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try expectFile(path, text[0..used]);
+}
+
+fn lineNumbers(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/tmp/nib-numbers-{d}", .{pid}, 0);
+    defer _ = linux.unlink(path);
+    try putFile(path, "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\n");
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m l01 ");
+    try process.ready();
+    // A count read off the gutter lands on the row it labels, and the
+    // terminal cursor sits after the four-cell gutter.
+    try editingKeys(&process, "5");
+    try process.send("j");
+    try process.until("\x1b[2J\x1b[0;90m  5\x1b[m l01 ");
+    try process.until("\r\n\x1b[0;90m  1\x1b[m l05 ");
+    try process.until("\r\n\x1b[0;1;33m6  \x1b[m l06 ");
+    try process.until("\r\n\x1b[0;90m  1\x1b[m l07 ");
+    try process.until("\r\n\x1b[0;90m  6\x1b[m l12 ");
+    // The row after the final line break is blank in normal mode.
+    const blank: [79]u8 = @splat(' ');
+    try process.until("\r\n" ++ blank ++ "\r\n");
+    try process.until("NORMAL | 6:1 | ");
+    try process.until("\x1b[6;5H\x1b[?25h");
+    try process.ready();
+    try editingKeys(&process, "3");
+    try process.send("k");
+    try process.until("\x1b[2J\x1b[0;90m  2\x1b[m l01 ");
+    try process.until("\r\n\x1b[0;1;33m3  \x1b[m l03 ");
+    try process.until("\r\n\x1b[0;90m  3\x1b[m l06 ");
+    try process.until("NORMAL | 3:1 | ");
+    try process.until("\x1b[3;5H\x1b[?25h");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }
 
 fn visualWorkflow(executable: [:0]const u8) !void {
@@ -986,11 +1041,11 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try editingKeys(&process, "wv");
     try process.send("e");
     try process.until("VISUAL | 1:10 | ");
-    try process.until("\x1b[1;7H\x1b[0;7mbeta\x1b[m\x1b[1;10H");
+    try process.until("\x1b[1;11H\x1b[0;7mbeta\x1b[m\x1b[1;14H");
     try process.ready();
     try process.send("Vj");
     try process.until("VISUAL LINE | 2:");
-    try process.until("\x1b[1;1H\x1b[0;7malpha beta \x1b[m\x1b[2;1H\x1b[0;7mgamma \x1b[m");
+    try process.until("\x1b[1;5H\x1b[0;7malpha beta \x1b[m\x1b[2;5H\x1b[0;7mgamma \x1b[m");
     try process.ready();
     // Escape ends it, and the next frame draws nothing styled.
     try process.send("\x1b");
@@ -1008,7 +1063,7 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try process.signal(.CONT);
     try process.until(enter);
     try process.until("VISUAL | 1:10 | ");
-    try process.until("\x1b[1;7H\x1b[0;7mbeta\x1b[m");
+    try process.until("\x1b[1;11H\x1b[0;7mbeta\x1b[m");
     try process.ready();
     // A yank ends it and sends "beta" to the clipboard.
     try process.send("y");
@@ -1030,7 +1085,7 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try editingKeys(&process, "ggVj");
     try process.send("d");
     try process.until(clipboard ++ "YWxwaGEgYmV0YQpnYW1tYQo=\x07");
-    try process.until("\x1b[2Jthird");
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m third");
     try process.until("NORMAL [+] | 1:1 | ");
     try process.ready();
     // Putting them back over the line left sends the replaced line instead.
@@ -1039,7 +1094,7 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try process.ready();
     try process.send("p");
     try process.until(clipboard ++ "dGhpcmQK\x07");
-    try process.until("\x1b[2Jalpha beta");
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m alpha beta");
     try process.until("NORMAL [+] | 1:1 | ");
     try process.ready();
     try process.send(":w\r");
@@ -1078,7 +1133,7 @@ fn editingWorkflow(executable: [:0]const u8) !void {
     try editingKeys(&process, "G$a\rX\tY\x7fZ");
     try process.send("\x03");
     try process.until("3:9 | ");
-    try process.until("\x1b[3;9H\x1b[?25h");
+    try process.until("\x1b[3;13H\x1b[?25h");
     try process.ready();
     try process.send(":q\r");
     try process.until("Unsaved changes");
@@ -1160,18 +1215,18 @@ fn utf8Editing(executable: [:0]const u8) !void {
     var process = try Process.start(executable, .{ .path = path });
     defer process.close();
     try process.until(line ++ " ");
-    try process.until("\r\ne?x ");
+    try process.until("\r\n\x1b[0;90m  1\x1b[m e?x ");
     try process.ready();
     const motions = [_]struct { []const u8, []const u8, []const u8 }{
-        .{ "l", "1:2 | ", "\x1b[1;2H" },
-        .{ "l", "1:4 | ", "\x1b[1;4H" },
-        .{ "$", "1:7 | ", "\x1b[1;7H" },
-        .{ "h", "1:5 | ", "\x1b[1;5H" },
-        .{ "j", "2:3 | ", "\x1b[2;3H" },
-        .{ "k", "1:5 | ", "\x1b[1;5H" },
-        .{ "b", "1:1 | ", "\x1b[1;1H" },
-        .{ "w", "1:5 | ", "\x1b[1;5H" },
-        .{ "0", "1:1 | ", "\x1b[1;1H" },
+        .{ "l", "1:2 | ", "\x1b[1;6H" },
+        .{ "l", "1:4 | ", "\x1b[1;8H" },
+        .{ "$", "1:7 | ", "\x1b[1;11H" },
+        .{ "h", "1:5 | ", "\x1b[1;9H" },
+        .{ "j", "2:3 | ", "\x1b[2;7H" },
+        .{ "k", "1:5 | ", "\x1b[1;9H" },
+        .{ "b", "1:1 | ", "\x1b[1;5H" },
+        .{ "w", "1:5 | ", "\x1b[1;9H" },
+        .{ "0", "1:1 | ", "\x1b[1;5H" },
     };
     for (motions) |case| {
         const keys, const status, const position = case;
@@ -1184,10 +1239,10 @@ fn utf8Editing(executable: [:0]const u8) !void {
     // complete each read draws the cursor where it was.
     try editingKeys(&process, "i");
     const typed = [_]struct { []const u8, []const u8 }{
-        .{ "\u{e9}", "\x1b[1;2H" },
-        .{ "\u{2705}", "\x1b[1;4H" },
+        .{ "\u{e9}", "\x1b[1;6H" },
+        .{ "\u{2705}", "\x1b[1;8H" },
     };
-    var previous: []const u8 = "\x1b[1;1H";
+    var previous: []const u8 = "\x1b[1;5H";
     for (typed) |case| {
         const character, const position = case;
         for (character, 1..) |byte, count| {
@@ -1204,7 +1259,7 @@ fn utf8Editing(executable: [:0]const u8) !void {
     // A character cut short by Tab inserts nothing; the Tab still inserts.
     for ([_][]const u8{ "\xe2", "\x9c" }) |byte| {
         try process.send(byte);
-        try process.until("\x1b[1;4H");
+        try process.until("\x1b[1;8H");
         try process.ready();
     }
     try process.send("\t");
@@ -1212,14 +1267,14 @@ fn utf8Editing(executable: [:0]const u8) !void {
     try process.ready();
     try process.send("\x1b[200~\u{3c3}\u{2014}\x1b[201~");
     try process.until("\u{e9}\u{2705}     \u{3c3}\u{2014}" ++ line);
-    try process.until("\x1b[1;11H");
+    try process.until("\x1b[1;15H");
     try process.ready();
     try process.send("\x03");
     try process.until("NORMAL [+] | 1:10 | ");
     try process.ready();
     // One undo removes the whole insertion; redo restores it.
     try process.send("u");
-    try process.until("\x1b[2J" ++ line ++ " ");
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m " ++ line ++ " ");
     try process.ready();
     try process.send("\x12");
     try process.until("\u{3c3}\u{2014}" ++ line);
@@ -1793,7 +1848,7 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.until("alpha one");
     try process.ready();
     try process.send("\r");
-    try process.until("\x1b[2Jalpha one ");
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m alpha one ");
     try process.until("NORMAL | 1:1 | ");
     try process.ready();
     try editingKeys(&process, "iA\x03j");
@@ -1841,7 +1896,7 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.ready();
     try process.send("\r");
     // Switching back restores text, cursor and history exactly.
-    try process.until("\x1b[2JAalpha one ");
+    try process.until("\x1b[2J\x1b[0;90m  1\x1b[m Aalpha one ");
     try process.until("NORMAL [+] | 2:9 | ");
     try process.ready();
     try process.send("u");

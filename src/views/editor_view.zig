@@ -13,8 +13,8 @@ const Editor = @import("../edit/editor.zig").Editor;
 const session = @import("../files/session.zig");
 const theme = @import("theme.zig");
 
-/// Draws the active document's rows, its selection or search highlights,
-/// then the status row: the disk status,
+/// Draws the active document's rows behind their line numbers, its selection
+/// or search highlights, then the status row: the disk status,
 /// then the open `:` line, the search prompt, the operator hint, `status`
 /// or a summary of the document. `command_line` is the `:` line's text
 /// while it is open.
@@ -33,12 +33,16 @@ pub fn draw(
     // Reserve the last column on every row to avoid autowrap, including the
     // bottom-right cell.
     const width = size.columns -| 1;
+    const content = contentWidth(size, buffer);
+    const gutter = width - content;
     // The status-row cell after a search prompt's query, when drawn.
     var prompt: ?usize = null;
     if (rows != 0 and width != 0) {
+        const current = buffer.rowAt(buffer.cursor);
         for (0..rows - 1) |number| {
-            const output = try frame.room(3 * width);
-            frame.commit(entry.viewport.renderRow(buffer, number, width, output));
+            try lineNumber(frame, buffer, entry.viewport.top +| number, current, gutter);
+            const output = try frame.room(3 * content);
+            frame.commit(entry.viewport.renderRow(buffer, number, content, output));
             try frame.append("\r\n");
         }
         try theme.set(frame, &.{.status});
@@ -84,29 +88,79 @@ pub fn draw(
         }
         try frame.append(theme.plain);
         if (editor.highlighted()) |query| {
-            try highlight(frame, buffer, entry.viewport, query, rows - 1, width);
+            try highlight(frame, buffer, entry.viewport, query, rows - 1, gutter, content);
         }
         if (selection) |selected| {
-            try select(frame, buffer, entry.viewport, selected.range, rows - 1, width);
+            const range = selected.range;
+            try select(frame, buffer, entry.viewport, range, rows - 1, gutter, content);
         }
     }
     if (mode == .search) {
         if (prompt) |column| try frame.cursor(rows - 1, @min(column, width - 1));
         return;
     }
-    if (entry.viewport.cursor(buffer, rows -| 1, width, mode == .insert)) |cell| {
-        try frame.cursor(cell.row, cell.column);
+    if (entry.viewport.cursor(buffer, rows -| 1, content, mode == .insert)) |cell| {
+        try frame.cursor(cell.row, gutter + cell.column);
     }
 }
 
-/// Redraws the visible matches of `query` in the search style over content rows
-/// already drawn, leaving every other cell as drawn.
+/// The cells each content row has for text in a terminal of `size`: its
+/// width less the reserved last column and the line-number gutter. The view
+/// draws, and the caller follows the cursor, in this width.
+pub fn contentWidth(size: terminal.Size, buffer: *const Buffer) usize {
+    const width = size.columns -| 1;
+    return width - gutterWidth(buffer, width);
+}
+
+/// The gutter's cells: the digits of the largest line number, at least 3,
+/// and a space. A terminal without room for it and one cell of text has none.
+/// The empty row after a final line break counts, so entering insert mode
+/// there never moves the text.
+fn gutterWidth(buffer: *const Buffer, width: usize) usize {
+    const digits = @max(3, std.math.log10_int(buffer.insertionRows()) + 1);
+    return if (digits + 1 < width) digits + 1 else 0;
+}
+
+/// Draws the gutter of the row showing line `number` (zero-based) with the
+/// cursor on line `current`: the cursor line's own number, left-aligned, or
+/// the distance to it, right-aligned. Rows past the text, and the empty row
+/// after a final line break unless the cursor is on it, are blank.
+fn lineNumber(
+    frame: *Frame,
+    buffer: *const Buffer,
+    number: usize,
+    current: usize,
+    gutter: usize,
+) terminal.Error!void {
+    if (gutter == 0) return;
+    if (number >= buffer.lineCount() and number != current) {
+        @memset(try frame.reserve(gutter), ' ');
+        return;
+    }
+    const shown = if (number == current) number + 1 else @max(number, current) - @min(number, current);
+    var digits: [20]u8 = undefined;
+    const text = std.fmt.bufPrint(&digits, "{d}", .{shown}) catch unreachable;
+    try theme.set(frame, &.{if (number == current) .current_line_number else .line_number});
+    const cells = try frame.reserve(gutter - 1);
+    @memset(cells, ' ');
+    if (number == current) {
+        @memcpy(cells[0..text.len], text);
+    } else {
+        @memcpy(cells[cells.len - text.len ..], text);
+    }
+    try frame.append(theme.plain ++ " ");
+}
+
+/// Redraws the visible matches of `query` in the search style over content
+/// rows already drawn `gutter` cells from the left, leaving every other cell
+/// as drawn.
 fn highlight(
     frame: *Frame,
     buffer: *const Buffer,
     viewport: Viewport,
     query: []const u8,
     rows: usize,
+    gutter: usize,
     width: usize,
 ) terminal.Error!void {
     const shown = buffer.insertionRows() -| viewport.top;
@@ -114,21 +168,23 @@ fn highlight(
         const text = buffer.line(viewport.top + row);
         var highlights: Highlights = .init(text, query, viewport.left, width);
         while (highlights.next()) |part| {
-            try restyle(frame, row, part.cell, .search_match);
+            try restyle(frame, row, gutter + part.cell, .search_match);
             try frame.append(part.bytes);
             try frame.append(theme.plain);
         }
     }
 }
 
-/// Redraws the visible part of `range` in the selection style over content rows
-/// already drawn, with one cell for each line break it takes.
+/// Redraws the visible part of `range` in the selection style over content
+/// rows already drawn `gutter` cells from the left, with one cell for each
+/// line break it takes.
 fn select(
     frame: *Frame,
     buffer: *const Buffer,
     viewport: Viewport,
     range: Range,
     rows: usize,
+    gutter: usize,
     width: usize,
 ) terminal.Error!void {
     if (range.start == range.end) return;
@@ -145,13 +201,13 @@ fn select(
             viewport.left,
             width,
         ) orelse continue;
-        try restyle(frame, number - viewport.top, span.cell, .selection);
+        try restyle(frame, number - viewport.top, gutter + span.cell, .selection);
         frame.commit(span.render(try frame.room(3 * width)));
         try frame.append(theme.plain);
     }
 }
 
-/// Moves to a zero-based content cell and starts `role`, which the caller
+/// Moves to a zero-based cell and starts `role`, which the caller
 /// ends with `theme.plain` after the cells it redraws.
 fn restyle(frame: *Frame, row: usize, cell: usize, role: theme.Role) terminal.Error!void {
     var position: [32]u8 = undefined;
@@ -168,7 +224,7 @@ test "a whole row of matches at the widest terminal fits the frame unsplit" {
     var buffer = try Buffer.fromBytes(std.testing.allocator, text);
     defer buffer.deinit(std.testing.allocator);
     var frame: Frame = .{ .screen = undefined };
-    try highlight(&frame, &buffer, .{}, "a", columns, columns);
+    try highlight(&frame, &buffer, .{}, "a", columns, 0, columns);
     const drawn = frame.bytes[0..frame.len];
     try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[1;1H\x1b[0;33;7maaa"));
     try std.testing.expect(std.mem.endsWith(u8, drawn, "aaa\x1b[m"));
@@ -180,16 +236,128 @@ test "a selection is drawn in the selection style over the rows it covers" {
     defer buffer.deinit(std.testing.allocator);
     var frame: Frame = .{ .screen = undefined };
     // From b through the empty line's break and c's tab; three rows shown.
-    try select(&frame, &buffer, .{}, .{ .start = 1, .end = 8 }, 3, 10);
+    try select(&frame, &buffer, .{}, .{ .start = 1, .end = 8 }, 3, 0, 10);
     try std.testing.expectEqualStrings("\x1b[1;2H\x1b[0;7mb \x1b[m" ++
         "\x1b[2;1H\x1b[0;7m \x1b[m" ++
         "\x1b[3;1H\x1b[0;7mc       \x1b[m", frame.bytes[0..frame.len]);
     // Scrolled down and right: only what remains in view.
     frame.len = 0;
-    try select(&frame, &buffer, .{ .top = 2, .left = 3 }, .{ .start = 6, .end = 15 }, 1, 10);
+    try select(&frame, &buffer, .{ .top = 2, .left = 3 }, .{ .start = 6, .end = 15 }, 1, 0, 10);
     const scrolled = "\x1b[1;1H\x1b[0;7m     d \x1b[m";
     try std.testing.expectEqualStrings(scrolled, frame.bytes[0..frame.len]);
     frame.len = 0;
-    try select(&frame, &buffer, .{ .top = 3 }, .{ .start = 0, .end = 2 }, 2, 10);
+    try select(&frame, &buffer, .{ .top = 3 }, .{ .start = 0, .end = 2 }, 2, 0, 10);
     try std.testing.expectEqual(@as(usize, 0), frame.len);
+}
+
+/// Draws `buffer` as the active document in a terminal of `size`, following
+/// the cursor first as the app does, into `frame`.
+fn expectFrame(
+    frame: *Frame,
+    buffer: *const Buffer,
+    size: terminal.Size,
+    insert: bool,
+) !void {
+    var entry: session.Entry = .{
+        .id = @fromBackingInt(@intCast(0)),
+        .document = .{
+            .source = .{ .path = "a", .resolved = undefined, .version = undefined },
+            .buffer = buffer.*,
+        },
+    };
+    entry.viewport.follow(buffer, size.rows -| 1, contentWidth(size, buffer), insert);
+    var editor: Editor = .{};
+    if (insert) editor.parser.mode = .insert;
+    frame.len = 0;
+    try draw(frame, size, &entry, &editor, "", null);
+}
+
+test "rows show their distance to the cursor line, which shows its own number" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "a\nb\nc\n");
+    defer buffer.deinit(std.testing.allocator);
+    var frame: Frame = .{ .screen = undefined };
+    // Four gutter cells and five of text; the row after the final line break
+    // and the row past the text are blank.
+    buffer.cursor = 2;
+    try expectFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, false);
+    const drawn = frame.bytes[0..frame.len];
+    try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[0;90m  1\x1b[m a    \r\n" ++
+        "\x1b[0;1;33m2  \x1b[m b    \r\n" ++
+        "\x1b[0;90m  1\x1b[m c    \r\n" ++
+        "         \r\n" ++
+        "         \r\n" ++
+        "\x1b[0;7m"));
+    try std.testing.expect(std.mem.endsWith(u8, drawn, "\x1b[2;5H\x1b[?25h"));
+    // In insert mode on that empty row, it is the cursor line.
+    buffer.cursor = buffer.bytes().len;
+    try expectFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, true);
+    const inserting = frame.bytes[0..frame.len];
+    try std.testing.expect(std.mem.startsWith(u8, inserting, "\x1b[0;90m  3\x1b[m a    \r\n" ++
+        "\x1b[0;90m  2\x1b[m b    \r\n" ++
+        "\x1b[0;90m  1\x1b[m c    \r\n" ++
+        "\x1b[0;1;33m4  \x1b[m      \r\n" ++
+        "         \r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, inserting, "\x1b[4;5H\x1b[?25h"));
+}
+
+test "the gutter widens at a thousand rows, counting the row after a final line break" {
+    const allocator = std.testing.allocator;
+    const text = try allocator.alloc(u8, 2 * 999);
+    defer allocator.free(text);
+    for (0..999) |line| @memcpy(text[2 * line ..][0..2], "x\n");
+    const size: terminal.Size = .{ .rows = 3, .columns = 20 };
+    const Case = struct { bytes: []const u8, content: usize };
+    // 999 lines and a final line break; 998 and one; 999 without one.
+    const cases = [_]Case{
+        .{ .bytes = text, .content = 19 - 5 },
+        .{ .bytes = text[0 .. text.len - 2], .content = 19 - 4 },
+        .{ .bytes = text[0 .. text.len - 1], .content = 19 - 4 },
+    };
+    for (cases) |case| {
+        var buffer = try Buffer.fromBytes(allocator, case.bytes);
+        defer buffer.deinit(allocator);
+        try std.testing.expectEqual(case.content, contentWidth(size, &buffer));
+    }
+    var buffer = try Buffer.fromBytes(allocator, text);
+    defer buffer.deinit(allocator);
+    var frame: Frame = .{ .screen = undefined };
+    // The last line in normal mode, then the row after it in insert mode.
+    buffer.cursor = text.len - 2;
+    try expectFrame(&frame, &buffer, size, false);
+    const last = "\x1b[0;90m   1\x1b[m x             \r\n\x1b[0;1;33m999 \x1b[m x";
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], last) != null);
+    buffer.cursor = text.len;
+    try expectFrame(&frame, &buffer, size, true);
+    const inserting = "\x1b[0;90m   1\x1b[m x             \r\n\x1b[0;1;33m1000\x1b[m  ";
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], inserting) != null);
+}
+
+test "a terminal without room for the gutter and one cell of text has no gutter" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "ab\n");
+    defer buffer.deinit(std.testing.allocator);
+    var frame: Frame = .{ .screen = undefined };
+    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 5 }, false);
+    try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], "ab  \r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;1H\x1b[?25h"));
+    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 6 }, false);
+    const narrow = "\x1b[0;1;33m1  \x1b[m a\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], narrow));
+    try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;5H\x1b[?25h"));
+}
+
+test "following scrolls within the cells the gutter leaves, and the cursor sits after it" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "abcdefghij\nsecond\n");
+    defer buffer.deinit(std.testing.allocator);
+    var frame: Frame = .{ .screen = undefined };
+    // One content row of four cells after the gutter.
+    buffer.cursor = 9;
+    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
+    const row = "\x1b[0;1;33m1  \x1b[m ghij\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], row));
+    try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;8H\x1b[?25h"));
+    buffer.cursor = 11;
+    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
+    const below = "\x1b[0;1;33m2  \x1b[m seco\r\n";
+    try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], below));
+    try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;5H\x1b[?25h"));
 }

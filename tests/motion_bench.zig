@@ -85,10 +85,8 @@ pub fn main(init: std.process.Init) !void {
             // every content row and the status row, then again with every
             // visible row selected by `V`.
             buffer.cursor = origin;
-            viewport = .{};
-            viewport.follow(&buffer, rows, columns, false);
-            render(init.io, &buffer, viewport, null, "render 50x200");
-            render(init.io, &buffer, viewport, 0, "render 50x200, all selected");
+            render(init.io, &buffer, null, "render 50x200");
+            render(init.io, &buffer, 0, "render 50x200, all selected");
             for ([_][]const u8{ line.found, line.missing }) |query| {
                 incremental(init.io, &buffer, origin, query);
             }
@@ -104,25 +102,25 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// One frame of the editor view at `rows` content rows by `columns`, the
-/// cursor where `buffer` has it and `viewport` already following it. With an
+/// cursor where `buffer` has it and the view following it as the app does. With an
 /// `anchor`, a linewise selection runs from it to the cursor. Reports the
 /// frame's bytes; nothing is written to a terminal.
 fn render(
     io: std.Io,
     buffer: *const Buffer,
-    viewport: Viewport,
     anchor: ?usize,
     name: []const u8,
 ) void {
+    const size: nib.terminal.Size = .{ .rows = rows + 1, .columns = columns + 1 };
     // Borrows the buffer: the entry is never freed.
-    const entry: session.Entry = .{
+    var entry: session.Entry = .{
         .id = @fromBackingInt(@intCast(0)),
         .document = .{
             .source = .{ .path = "fixture.zig", .resolved = undefined, .version = undefined },
             .buffer = buffer.*,
         },
-        .viewport = viewport,
     };
+    entry.viewport.follow(buffer, rows, nib.editor_view.contentWidth(size, buffer), false);
     var editor: Editor = .{};
     if (anchor) |offset| {
         editor.parser.visual = .linewise;
@@ -133,7 +131,7 @@ fn render(
     for (&times) |*elapsed| {
         frame.len = 0;
         const before = std.Io.Timestamp.now(io, .awake);
-        nib.editor_view.draw(&frame, .{ .rows = rows + 1, .columns = columns + 1 }, &entry, &editor, "", null) catch unreachable;
+        nib.editor_view.draw(&frame, size, &entry, &editor, "", null) catch unreachable;
         std.mem.doNotOptimizeAway(frame.bytes[0..frame.len]);
         const after = std.Io.Timestamp.now(io, .awake);
         elapsed.* = before.durationTo(after).toNanoseconds();

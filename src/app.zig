@@ -271,7 +271,7 @@ const App = struct {
             if (!self.finding) entry.viewport.follow(
                 &entry.document.buffer,
                 self.size.rows -| 1,
-                self.size.columns -| 1,
+                editor_view.contentWidth(self.size, &entry.document.buffer),
                 self.editor.mode() == .insert,
             );
         }
@@ -1305,43 +1305,43 @@ test "the search prompt and its matches are drawn until Escape in normal mode hi
         .terminal = undefined,
         .background = &background,
         .finder = &finder,
-        .size = .{ .rows = 4, .columns = 11 },
+        .size = .{ .rows = 4, .columns = 15 },
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
     _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     // Three content rows and the status row, ten columns wide.
-    const matches = "\x1b[1;1H\x1b[0;33;7mab\x1b[m" ++
-        "\x1b[2;1H\x1b[0;33;7mAB\x1b[m" ++
-        "\x1b[2;9H\x1b[0;33;7mab\x1b[m";
+    const matches = "\x1b[1;5H\x1b[0;33;7mab\x1b[m" ++
+        "\x1b[2;5H\x1b[0;33;7mAB\x1b[m" ++
+        "\x1b[2;13H\x1b[0;33;7mab\x1b[m";
     for ("/ab") |byte| app.editorEvent(.{ .key = byte });
     var frame: Frame = .{ .screen = undefined };
     try app.compose(&frame);
     const prompt = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.indexOf(u8, prompt, "\x1b[0;7m/ab       \x1b[m") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "\x1b[0;7m/ab           \x1b[m") != null);
     try testing.expect(std.mem.endsWith(u8, prompt, matches ++ "\x1b[4;4H\x1b[?25h"));
     app.editorEvent(.{ .key = '\r' });
     frame.len = 0;
     try app.compose(&frame);
     const kept = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.endsWith(u8, kept, matches ++ "\x1b[2;1H\x1b[?25h"));
+    try testing.expect(std.mem.endsWith(u8, kept, matches ++ "\x1b[2;5H\x1b[?25h"));
     app.editorEvent(.escape);
     frame.len = 0;
     try app.compose(&frame);
-    // Only the status row is styled.
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame.bytes[0..frame.len], "\x1b[0;"));
+    // No match is drawn.
+    try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[0;33;7m") == null);
     app.editorEvent(.{ .key = 'n' });
     frame.len = 0;
     try app.compose(&frame);
     const repeated = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.endsWith(u8, repeated, matches ++ "\x1b[2;9H\x1b[?25h"));
+    try testing.expect(std.mem.endsWith(u8, repeated, matches ++ "\x1b[2;13H\x1b[?25h"));
     // A long query keeps its end visible and a cell after it for the cursor.
-    for ("?abcdefghijk") |byte| app.editorEvent(.{ .key = byte });
+    for ("?abcdefghijklmno") |byte| app.editorEvent(.{ .key = byte });
     frame.len = 0;
     try app.compose(&frame);
     const long = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.indexOf(u8, long, "\x1b[0;7m?defghijk \x1b[m") != null);
-    try testing.expect(std.mem.endsWith(u8, long, "\x1b[4;10H\x1b[?25h"));
+    try testing.expect(std.mem.indexOf(u8, long, "\x1b[0;7m?defghijklmno \x1b[m") != null);
+    try testing.expect(std.mem.endsWith(u8, long, "\x1b[4;14H\x1b[?25h"));
 }
 
 test "a selection is drawn with its label instead of search matches until Escape" {
@@ -1359,7 +1359,7 @@ test "a selection is drawn with its label instead of search matches until Escape
         .terminal = undefined,
         .background = &background,
         .finder = &finder,
-        .size = .{ .rows = 4, .columns = 21 },
+        .size = .{ .rows = 4, .columns = 25 },
     };
     defer app.editor.deinit(testing.allocator);
     defer app.documents.deinit(testing.allocator);
@@ -1369,23 +1369,23 @@ test "a selection is drawn with its label instead of search matches until Escape
     try app.compose(&frame);
     const characters = frame.bytes[0..frame.len];
     try testing.expect(std.mem.indexOf(u8, characters, "\x1b[0;7mVISUAL | 2:2 | ") != null);
-    const character = "\x1b[2;2H\x1b[0;7mb\x1b[m";
-    try testing.expect(std.mem.endsWith(u8, characters, character ++ "\x1b[2;2H\x1b[?25h"));
+    const character = "\x1b[2;6H\x1b[0;7mb\x1b[m";
+    try testing.expect(std.mem.endsWith(u8, characters, character ++ "\x1b[2;6H\x1b[?25h"));
     // Lines, each with its line break cell; the matches stay hidden.
     for ("Vk") |byte| app.editorEvent(.{ .key = byte });
     frame.len = 0;
     try app.compose(&frame);
     const lines = frame.bytes[0..frame.len];
     try testing.expect(std.mem.indexOf(u8, lines, "\x1b[0;7mVISUAL LINE | 1:2 | ") != null);
-    const selected = "\x1b[1;1H\x1b[0;7mab x \x1b[m\x1b[2;1H\x1b[0;7mab \x1b[m";
-    try testing.expect(std.mem.endsWith(u8, lines, selected ++ "\x1b[1;2H\x1b[?25h"));
+    const selected = "\x1b[1;5H\x1b[0;7mab x \x1b[m\x1b[2;5H\x1b[0;7mab \x1b[m";
+    try testing.expect(std.mem.endsWith(u8, lines, selected ++ "\x1b[1;6H\x1b[?25h"));
     // Escape ends the selection and the matches return.
     app.editorEvent(.escape);
     frame.len = 0;
     try app.compose(&frame);
-    const matches = "\x1b[1;1H\x1b[0;33;7mab\x1b[m\x1b[2;1H\x1b[0;33;7mab\x1b[m";
+    const matches = "\x1b[1;5H\x1b[0;33;7mab\x1b[m\x1b[2;5H\x1b[0;33;7mab\x1b[m";
     const ended = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.endsWith(u8, ended, matches ++ "\x1b[1;2H\x1b[?25h"));
+    try testing.expect(std.mem.endsWith(u8, ended, matches ++ "\x1b[1;6H\x1b[?25h"));
     try testing.expect(std.mem.indexOf(u8, ended, "NORMAL | 1:2") != null);
 }
 

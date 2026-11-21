@@ -11,4 +11,5 @@ pub const jobs = @import("finder/jobs.zig");
 pub const motion = @import("text/motion.zig");
 pub const search = @import("text/search.zig");
 pub const session = @import("files/session.zig");
+pub const terminal = @import("terminal/terminal.zig");
 pub const viewport = @import("text/viewport.zig");
