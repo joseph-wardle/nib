@@ -104,6 +104,7 @@ test {
     _ = @import("views/finder_view.zig");
     _ = @import("views/theme.zig");
     _ = @import("text/search.zig");
+    _ = @import("text/syntax.zig");
     _ = @import("text/format.zig");
     _ = @import("lsp/position.zig");
     _ = @import("lsp/protocol.zig");
