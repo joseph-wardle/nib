@@ -55,56 +55,104 @@ pub const Viewport = struct {
 };
 
 /// Draws one line of text, without its terminator, from display column `left`
-/// into exactly `columns` cells. Allowlisted characters are copied as they are,
-/// a tab is spaces to the next eight-column stop from the start of `text`, and
-/// anything else (controls, invalid bytes, unlisted characters) is one `?`
-/// cell. A wide character cut by either edge shows its visible cell as a space.
-/// `output` holds at least `3 * columns` bytes, which bounds any row because no
-/// drawn character takes more than 3 bytes per cell. Returns the bytes used.
+/// into exactly `columns` cells, as `Cells` draws it in one piece. `output`
+/// holds at least `3 * columns` bytes, which bounds any row because no drawn
+/// character takes more than 3 bytes per cell. Returns the bytes used.
 pub fn renderText(text: []const u8, left: usize, columns: usize, output: []u8) usize {
-    std.debug.assert(output.len >= 3 * columns);
-    const right = left +| columns;
-    var used: usize = 0;
-    var column: usize = 0;
-    var position: usize = 0;
-    while (position < text.len and column < right) {
-        const byte = text[position];
-        var len: usize = 1;
-        var cells: usize = 1;
-        // Spaces when null.
-        var glyph: ?[]const u8 = "?";
-        if (byte < 0x80) {
-            if (byte == '\t') {
-                cells = char.cells('\t', column);
-                glyph = null;
-            } else if (byte >= 0x20 and byte < 0x7f) glyph = text[position..][0..1];
-        } else {
-            const character = char.decode(text, position);
-            len = character.len;
-            if (character.code) |code| if (char.width(code)) |width| {
-                cells = width;
-                glyph = text[position..][0..len];
-            };
-        }
-        const end = column + cells;
-        if (end > left) {
-            const whole = column >= left and end <= right;
-            if (whole and glyph != null) {
-                @memcpy(output[used..][0..glyph.?.len], glyph.?);
-                used += glyph.?.len;
-            } else {
-                const visible = @min(end, right) - @max(column, left);
-                @memset(output[used..][0..visible], ' ');
-                used += visible;
-            }
-        }
-        column = end;
-        position += len;
-    }
-    const drawn = @min(column, right) -| left;
-    @memset(output[used..][0 .. columns - drawn], ' ');
-    return used + columns - drawn;
+    var cells: Cells = .init(left, columns);
+    const used = cells.draw(text, output);
+    return used + cells.pad(output[used..]);
 }
+
+/// Draws one line of text, without its terminator, from display column `left`
+/// into `columns` cells, in consecutive pieces a caller can style apart.
+/// Allowlisted characters are copied as they are, a tab is spaces to the next
+/// eight-column stop from the start of the line, and anything else (controls,
+/// invalid bytes, unlisted characters) is one `?` cell. A wide character cut
+/// by either edge shows its visible cell as a space. Pieces split the line
+/// between characters.
+pub const Cells = struct {
+    left: usize,
+    columns: usize,
+    /// The display column where the next piece starts.
+    column: usize = 0,
+
+    pub fn init(left: usize, columns: usize) Cells {
+        return .{ .left = left, .columns = columns };
+    }
+
+    /// The cells from the next piece to the right edge.
+    pub fn remaining(self: Cells) usize {
+        return self.columns -| (self.column -| self.left);
+    }
+
+    /// Passes the characters at the start of the next piece that end left of
+    /// the view, and returns the rest. Unless it is empty or no cells remain,
+    /// the rest shows at least one cell.
+    pub fn skip(self: *Cells, text: []const u8) []const u8 {
+        var position: usize = 0;
+        while (position < text.len) {
+            const character = char.decode(text, position);
+            const end = self.column + char.cells(character.code, self.column);
+            if (end > self.left) break;
+            self.column = end;
+            position += character.len;
+        }
+        return text[position..];
+    }
+
+    /// Draws the next piece as far as the right edge. `output` holds at least
+    /// `3 * remaining()` bytes. Returns the bytes used.
+    pub fn draw(self: *Cells, text: []const u8, output: []u8) usize {
+        std.debug.assert(output.len >= 3 * self.remaining());
+        const right = self.left +| self.columns;
+        var used: usize = 0;
+        var position: usize = 0;
+        while (position < text.len and self.column < right) {
+            const byte = text[position];
+            var len: usize = 1;
+            var cells: usize = 1;
+            // Spaces when null.
+            var glyph: ?[]const u8 = "?";
+            if (byte < 0x80) {
+                if (byte == '\t') {
+                    cells = char.cells('\t', self.column);
+                    glyph = null;
+                } else if (byte >= 0x20 and byte < 0x7f) glyph = text[position..][0..1];
+            } else {
+                const character = char.decode(text, position);
+                len = character.len;
+                if (character.code) |code| if (char.width(code)) |width| {
+                    cells = width;
+                    glyph = text[position..][0..len];
+                };
+            }
+            const end = self.column + cells;
+            if (end > self.left) {
+                const whole = self.column >= self.left and end <= right;
+                if (whole and glyph != null) {
+                    @memcpy(output[used..][0..glyph.?.len], glyph.?);
+                    used += glyph.?.len;
+                } else {
+                    const visible = @min(end, right) - @max(self.column, self.left);
+                    @memset(output[used..][0..visible], ' ');
+                    used += visible;
+                }
+            }
+            self.column = end;
+            position += len;
+        }
+        return used;
+    }
+
+    /// Fills the cells after the last piece with spaces. `output` holds at
+    /// least `remaining()` bytes. Returns the bytes used.
+    pub fn pad(self: Cells, output: []u8) usize {
+        const count = self.remaining();
+        @memset(output[0..count], ' ');
+        return count;
+    }
+};
 
 /// The visible parts of a search query's matches in one line, as `renderText`
 /// places that line from display column `left` in `columns` cells. A match is

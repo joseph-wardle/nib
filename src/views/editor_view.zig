@@ -8,6 +8,8 @@ const motion = @import("../text/motion.zig");
 const Viewport = @import("../text/viewport.zig").Viewport;
 const Highlights = @import("../text/viewport.zig").Highlights;
 const Span = @import("../text/viewport.zig").Span;
+const Cells = @import("../text/viewport.zig").Cells;
+const syntax = @import("../text/syntax.zig");
 const Range = @import("../text/buffer.zig").Range;
 const Editor = @import("../edit/editor.zig").Editor;
 const session = @import("../files/session.zig");
@@ -39,10 +41,16 @@ pub fn draw(
     var prompt: ?usize = null;
     if (rows != 0 and width != 0) {
         const current = buffer.rowAt(buffer.cursor);
+        const language = syntax.language(entry.document.source.path);
         for (0..rows - 1) |number| {
-            try lineNumber(frame, buffer, entry.viewport.top +| number, current, gutter);
-            const output = try frame.room(3 * content);
-            frame.commit(entry.viewport.renderRow(buffer, number, content, output));
+            const shown = entry.viewport.top +| number;
+            try lineNumber(frame, buffer, shown, current, gutter);
+            if (language != null and shown < buffer.insertionRows()) {
+                try code(frame, buffer.line(shown), entry.viewport.left, content);
+            } else {
+                const output = try frame.room(3 * content);
+                frame.commit(entry.viewport.renderRow(buffer, number, content, output));
+            }
             try frame.append("\r\n");
         }
         try theme.set(frame, &.{.status});
@@ -152,6 +160,62 @@ fn lineNumber(
     try frame.append(theme.plain ++ " ");
 }
 
+/// Draws one line of Zig, without its terminator, from display column `left`
+/// into exactly `columns` cells, as `renderText` does, with each token in its
+/// role's look. A look is written only where the role changes, and the cells
+/// after the text are plain. Room is taken per piece, since looks break the
+/// 3 bytes per cell that bound a plain row, so a row may span a flush. `sink`
+/// has Frame's `append`, `room` and `commit`.
+fn code(sink: anytype, text: []const u8, left: usize, columns: usize) @TypeOf(sink.append("")) {
+    var cells: Cells = .init(left, columns);
+    var tokens: syntax.Tokens = .init(text);
+    // The role being drawn in, or null for plain.
+    var current: ?theme.Role = null;
+    var position: usize = 0;
+    while (cells.remaining() != 0) {
+        const token = tokens.next();
+        const start = if (token) |found| found.start else text.len;
+        try piece(sink, &cells, text[position..start], null, &current);
+        const found = token orelse break;
+        const look = syntaxRole(found.kind);
+        try piece(sink, &cells, text[found.start..found.end], look, &current);
+        position = found.end;
+    }
+    if (current != null) try sink.append(theme.plain);
+    const output = try sink.room(cells.remaining());
+    sink.commit(cells.pad(output));
+}
+
+/// Draws the next piece of a line in `look`, or plain when null, first
+/// changing from `current` when a cell of the piece is visible.
+fn piece(
+    sink: anytype,
+    cells: *Cells,
+    text: []const u8,
+    look: ?theme.Role,
+    current: *?theme.Role,
+) @TypeOf(sink.append("")) {
+    const visible = cells.skip(text);
+    if (visible.len == 0 or cells.remaining() == 0) return;
+    if (look != current.*) {
+        if (look) |shown| try theme.set(sink, &.{shown}) else try sink.append(theme.plain);
+        current.* = look;
+    }
+    const output = try sink.room(3 * cells.remaining());
+    sink.commit(cells.draw(visible, output));
+}
+
+fn syntaxRole(kind: syntax.Kind) theme.Role {
+    return switch (kind) {
+        .comment => .comment,
+        .keyword => .keyword,
+        .string => .string,
+        .constant => .constant,
+        .builtin => .builtin,
+        .type => .type,
+    };
+}
+
 /// Redraws the visible matches of `query` in the search style over content
 /// rows already drawn `gutter` cells from the left, leaving every other cell
 /// as drawn.
@@ -252,23 +316,28 @@ test "a selection is drawn in the selection style over the rows it covers" {
 }
 
 /// Draws `buffer` as the active document in a terminal of `size`, following
-/// the cursor first as the app does, into `frame`.
+/// the cursor first as the app does, into `frame`. The document has `path`,
+/// and the last search `query` is highlighted unless it is empty.
 fn drawFrame(
     frame: *Frame,
     buffer: *const Buffer,
     size: terminal.Size,
     insert: bool,
+    view: struct { path: []const u8 = "a", query: []const u8 = "" },
 ) !void {
     var entry: session.Entry = .{
         .id = @fromBackingInt(@intCast(0)),
         .document = .{
-            .source = .{ .path = "a", .resolved = undefined, .version = undefined },
+            .source = .{ .path = view.path, .resolved = undefined, .version = undefined },
             .buffer = buffer.*,
         },
     };
     entry.viewport.follow(buffer, size.rows -| 1, contentWidth(size, buffer), insert);
     var editor: Editor = .{};
     if (insert) editor.parser.mode = .insert;
+    @memcpy(editor.last_query[0..view.query.len], view.query);
+    editor.last_query_len = view.query.len;
+    editor.highlight = true;
     frame.len = 0;
     try draw(frame, size, &entry, &editor, "", null);
 }
@@ -280,7 +349,7 @@ test "rows show their distance to the cursor line, which shows its own number" {
     // Four gutter cells and five of text; the row after the final line break
     // and the row past the text are blank.
     buffer.cursor = 2;
-    try drawFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, false, .{});
     const drawn = frame.bytes[0..frame.len];
     try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[0;90m  1\x1b[m a    \r\n" ++
         "\x1b[0;1;33m2  \x1b[m b    \r\n" ++
@@ -291,7 +360,7 @@ test "rows show their distance to the cursor line, which shows its own number" {
     try std.testing.expect(std.mem.endsWith(u8, drawn, "\x1b[2;5H\x1b[?25h"));
     // In insert mode on that empty row, it is the cursor line.
     buffer.cursor = buffer.bytes().len;
-    try drawFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, true);
+    try drawFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, true, .{});
     const inserting = frame.bytes[0..frame.len];
     try std.testing.expect(std.mem.startsWith(u8, inserting, "\x1b[0;90m  3\x1b[m a    \r\n" ++
         "\x1b[0;90m  2\x1b[m b    \r\n" ++
@@ -324,11 +393,11 @@ test "the gutter widens at a thousand rows, counting the row after a final line 
     var frame: Frame = .{ .screen = undefined };
     // The last line in normal mode, then the row after it in insert mode.
     buffer.cursor = text.len - 2;
-    try drawFrame(&frame, &buffer, size, false);
+    try drawFrame(&frame, &buffer, size, false, .{});
     const last = "\x1b[0;90m   1\x1b[m x             \r\n\x1b[0;1;33m999 \x1b[m x";
     try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], last) != null);
     buffer.cursor = text.len;
-    try drawFrame(&frame, &buffer, size, true);
+    try drawFrame(&frame, &buffer, size, true, .{});
     const inserting = "\x1b[0;90m   1\x1b[m x             \r\n\x1b[0;1;33m1000\x1b[m  ";
     try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], inserting) != null);
 }
@@ -337,10 +406,10 @@ test "a terminal without room for the gutter and one cell of text has no gutter"
     var buffer = try Buffer.fromBytes(std.testing.allocator, "ab\n");
     defer buffer.deinit(std.testing.allocator);
     var frame: Frame = .{ .screen = undefined };
-    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 5 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 5 }, false, .{});
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], "ab  \r\n"));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;1H\x1b[?25h"));
-    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 6 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 6 }, false, .{});
     const narrow = "\x1b[0;1;33m1  \x1b[m a\r\n";
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], narrow));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;5H\x1b[?25h"));
@@ -352,13 +421,99 @@ test "following scrolls within the cells the gutter leaves, and the cursor sits 
     var frame: Frame = .{ .screen = undefined };
     // One content row of four cells after the gutter.
     buffer.cursor = 9;
-    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false, .{});
     const row = "\x1b[0;1;33m1  \x1b[m ghij\r\n";
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], row));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;8H\x1b[?25h"));
     buffer.cursor = 11;
-    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false, .{});
     const below = "\x1b[0;1;33m2  \x1b[m seco\r\n";
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], below));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;5H\x1b[?25h"));
+}
+
+/// Checks the bytes `code` draws for `text` from display column `left` in
+/// `columns` cells.
+fn expectCode(expected: []const u8, text: []const u8, left: usize, columns: usize) !void {
+    var frame: Frame = .{ .screen = undefined };
+    try code(&frame, text, left, columns);
+    try std.testing.expectEqualStrings(expected, frame.bytes[0..frame.len]);
+}
+
+test "Zig rows draw each token in its look, written only where the role changes" {
+    try expectCode(
+        "\x1b[0;35mconst\x1b[m s = \x1b[0;32m\"x\"\x1b[m; \x1b[0;90m// c\x1b[m     ",
+        "const s = \"x\"; // c",
+        0,
+        24,
+    );
+    // Adjacent tokens of one role share a look, and default text writes none.
+    try expectCode("\x1b[0;32m\"a\"\"b\"\x1b[m;  ", "\"a\"\"b\";", 0, 9);
+    try expectCode("b.target();  ", "b.target();", 0, 13);
+    try expectCode("    ", "", 0, 4);
+}
+
+test "a scrolled or cut Zig row keeps each visible token's look and cells" {
+    // Scrolled into a keyword, cut inside one, and past one entirely.
+    try expectCode("\x1b[0;35mnst\x1b[m ", "const x", 2, 4);
+    try expectCode("\x1b[0;35mcon\x1b[m", "const x", 0, 3);
+    try expectCode("x   ", "const x", 6, 4);
+    // A tab, a wide character and a `?` cell inside a string, then scrolled
+    // into the wide character, whose visible cell is a space.
+    const text = "s = \"\t\u{6750}\x01\"";
+    try expectCode("s = \x1b[0;32m\"   \u{6750}?\"\x1b[m", text, 0, 12);
+    try expectCode("\x1b[0;32m ?\"\x1b[m ", text, 9, 4);
+}
+
+test "a Zig row draws the same however the frame splits it, at the widest terminal" {
+    const allocator = std.testing.allocator;
+    const Collector = @import("../terminal/frame.zig").Collector;
+    // One-cell numbers between spaces: a look change in every cell.
+    const columns = std.math.maxInt(u16);
+    const text = try allocator.alloc(u8, columns + 1);
+    defer allocator.free(text);
+    for (0..text.len / 2) |pair| @memcpy(text[2 * pair ..][0..2], "1 ");
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    for (0..columns / 2) |_| try expected.appendSlice(allocator, "\x1b[0;36m1\x1b[m ");
+    try expected.appendSlice(allocator, "\x1b[0;36m1\x1b[m");
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    const frame_size = @sizeOf(@FieldType(Frame, "bytes"));
+    var sink: Collector = try .init(allocator, frame_size, &output);
+    defer sink.deinit(allocator);
+    try code(&sink, text, 0, columns);
+    try sink.flush();
+    try std.testing.expect(output.items.len > frame_size);
+    try std.testing.expectEqualStrings(expected.items, output.items);
+    // The smallest frame the row's room allows splits it between any pieces.
+    const line = "const s = \"x\"; // c";
+    var small: Collector = try .init(allocator, 3 * 24, &output);
+    defer small.deinit(allocator);
+    output.clearRetainingCapacity();
+    try code(&small, line, 0, 24);
+    try small.flush();
+    const whole = "\x1b[0;35mconst\x1b[m s = \x1b[0;32m\"x\"\x1b[m; \x1b[0;90m// c\x1b[m     ";
+    try std.testing.expectEqualStrings(whole, output.items);
+}
+
+test "Zig files are drawn in colour under unchanged gutters and search matches" {
+    var buffer = try Buffer.fromBytes(std.testing.allocator, "const x = 1;\n");
+    defer buffer.deinit(std.testing.allocator);
+    var frame: Frame = .{ .screen = undefined };
+    const size: terminal.Size = .{ .rows = 3, .columns = 20 };
+    const matches = "\x1b[m\x1b[1;5H\x1b[0;33;7mconst\x1b[m\x1b[1;5H\x1b[?25h";
+    const gutter = "\x1b[0;1;33m1  \x1b[m ";
+    // The padding, the blank row after the final line break, and the status.
+    const after = "   \r\n                   \r\n\x1b[0;7m";
+    try drawFrame(&frame, &buffer, size, false, .{ .path = "a.zig", .query = "const" });
+    const coloured = frame.bytes[0..frame.len];
+    const row = "\x1b[0;35mconst\x1b[m x = \x1b[0;36m1\x1b[m;";
+    try std.testing.expect(std.mem.startsWith(u8, coloured, gutter ++ row ++ after));
+    try std.testing.expect(std.mem.endsWith(u8, coloured, matches));
+    // Any other file is drawn plain, as before.
+    try drawFrame(&frame, &buffer, size, false, .{ .path = "a.txt", .query = "const" });
+    const plain = frame.bytes[0..frame.len];
+    try std.testing.expect(std.mem.startsWith(u8, plain, gutter ++ "const x = 1;" ++ after));
+    try std.testing.expect(std.mem.endsWith(u8, plain, matches));
 }

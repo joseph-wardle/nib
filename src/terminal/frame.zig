@@ -141,39 +141,39 @@ test "the clipboard gets one OSC 52 of the text's base64 however the frame split
     }
 }
 
-/// Frame's output interface, flushing into `output` whenever `capacity`
-/// bytes are buffered.
-const Collector = struct {
+/// Frame's output interface for tests, flushing into `output` whenever
+/// `capacity` bytes are buffered.
+pub const Collector = struct {
     bytes: []u8,
     len: usize = 0,
     output: *std.ArrayList(u8),
 
-    fn init(allocator: Allocator, capacity: usize, output: *std.ArrayList(u8)) !Collector {
+    pub fn init(allocator: Allocator, capacity: usize, output: *std.ArrayList(u8)) !Collector {
         return .{ .bytes = try allocator.alloc(u8, capacity), .output = output };
     }
 
-    fn deinit(self: *Collector, allocator: Allocator) void {
+    pub fn deinit(self: *Collector, allocator: Allocator) void {
         allocator.free(self.bytes);
     }
 
-    fn append(self: *Collector, data: []const u8) !void {
+    pub fn append(self: *Collector, data: []const u8) !void {
         const output = try self.room(data.len);
         @memcpy(output[0..data.len], data);
         self.commit(data.len);
     }
 
-    fn room(self: *Collector, count: usize) ![]u8 {
+    pub fn room(self: *Collector, count: usize) ![]u8 {
         std.debug.assert(count <= self.bytes.len);
         if (self.bytes.len - self.len < count) try self.flush();
         return self.bytes[self.len..];
     }
 
-    fn commit(self: *Collector, count: usize) void {
+    pub fn commit(self: *Collector, count: usize) void {
         std.debug.assert(count <= self.bytes.len - self.len);
         self.len += count;
     }
 
-    fn flush(self: *Collector) !void {
+    pub fn flush(self: *Collector) !void {
         try self.output.appendSlice(std.testing.allocator, self.bytes[0..self.len]);
         self.len = 0;
     }

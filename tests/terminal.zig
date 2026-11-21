@@ -1659,12 +1659,13 @@ fn formattingWorkflow(executable: [:0]const u8) !void {
     try process.until("Reloaded external changes");
     try process.ready();
     try process.send(":fmt\r");
-    try process.until("const y = 2;");
+    // The keyword and the number reach the terminal in their colours.
+    try process.until("\x1b[0;35mconst\x1b[m y = \x1b[0;36m2\x1b[m;");
     try process.until("Formatted");
     try process.ready();
     try expectFile(path, "const  y=2;\n");
     try process.send("u");
-    try process.until("const  y=2;");
+    try process.until("\x1b[0;35mconst\x1b[m  y=\x1b[0;36m2\x1b[m;");
     try process.ready();
     // A syntax error saves the text as it is, and says why.
     try putFile(path, "const x = ;\n");
@@ -1687,7 +1688,7 @@ fn formattingWorkflow(executable: [:0]const u8) !void {
     try process.until("DISK CONFLICT | :");
     try process.ready();
     try process.send("w\r");
-    try process.until("const  z=3;");
+    try process.until("\x1b[0;35mconst\x1b[m  z=\x1b[0;36m3\x1b[m;");
     try process.until("Reloaded external changes");
     try process.ready();
     try expectFile(path, "const  z=3;\n");
