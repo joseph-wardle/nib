@@ -467,8 +467,16 @@ test "a result row combines its styles and returns to its own after a matched le
     const Case = struct { chosen: bool, ignored: bool, expected: []const u8 };
     const cases = [_]Case{
         .{ .chosen = false, .ignored = false, .expected = "    a\x1b[0;4;33mb\x1b[mc  \x1b[m" },
-        .{ .chosen = true, .ignored = false, .expected = "\x1b[0;7m>   a\x1b[0;7;4;33mb\x1b[0;7mc  \x1b[m" },
-        .{ .chosen = false, .ignored = true, .expected = "    \x1b[0;2ma\x1b[0;2;4;33mb\x1b[0;2mc  \x1b[m" },
+        .{
+            .chosen = true,
+            .ignored = false,
+            .expected = "\x1b[0;7m>   a\x1b[0;7;4;33mb\x1b[0;7mc  \x1b[m",
+        },
+        .{
+            .chosen = false,
+            .ignored = true,
+            .expected = "    \x1b[0;2ma\x1b[0;2;4;33mb\x1b[0;2mc  \x1b[m",
+        },
         .{
             .chosen = true,
             .ignored = true,

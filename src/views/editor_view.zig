@@ -137,7 +137,8 @@ fn lineNumber(
         @memset(try frame.reserve(gutter), ' ');
         return;
     }
-    const shown = if (number == current) number + 1 else @max(number, current) - @min(number, current);
+    const distance = @max(number, current) - @min(number, current);
+    const shown = if (number == current) number + 1 else distance;
     var digits: [20]u8 = undefined;
     const text = std.fmt.bufPrint(&digits, "{d}", .{shown}) catch unreachable;
     try theme.set(frame, &.{if (number == current) .current_line_number else .line_number});
@@ -252,7 +253,7 @@ test "a selection is drawn in the selection style over the rows it covers" {
 
 /// Draws `buffer` as the active document in a terminal of `size`, following
 /// the cursor first as the app does, into `frame`.
-fn expectFrame(
+fn drawFrame(
     frame: *Frame,
     buffer: *const Buffer,
     size: terminal.Size,
@@ -279,7 +280,7 @@ test "rows show their distance to the cursor line, which shows its own number" {
     // Four gutter cells and five of text; the row after the final line break
     // and the row past the text are blank.
     buffer.cursor = 2;
-    try expectFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, false);
     const drawn = frame.bytes[0..frame.len];
     try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[0;90m  1\x1b[m a    \r\n" ++
         "\x1b[0;1;33m2  \x1b[m b    \r\n" ++
@@ -290,7 +291,7 @@ test "rows show their distance to the cursor line, which shows its own number" {
     try std.testing.expect(std.mem.endsWith(u8, drawn, "\x1b[2;5H\x1b[?25h"));
     // In insert mode on that empty row, it is the cursor line.
     buffer.cursor = buffer.bytes().len;
-    try expectFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, true);
+    try drawFrame(&frame, &buffer, .{ .rows = 6, .columns = 10 }, true);
     const inserting = frame.bytes[0..frame.len];
     try std.testing.expect(std.mem.startsWith(u8, inserting, "\x1b[0;90m  3\x1b[m a    \r\n" ++
         "\x1b[0;90m  2\x1b[m b    \r\n" ++
@@ -323,11 +324,11 @@ test "the gutter widens at a thousand rows, counting the row after a final line 
     var frame: Frame = .{ .screen = undefined };
     // The last line in normal mode, then the row after it in insert mode.
     buffer.cursor = text.len - 2;
-    try expectFrame(&frame, &buffer, size, false);
+    try drawFrame(&frame, &buffer, size, false);
     const last = "\x1b[0;90m   1\x1b[m x             \r\n\x1b[0;1;33m999 \x1b[m x";
     try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], last) != null);
     buffer.cursor = text.len;
-    try expectFrame(&frame, &buffer, size, true);
+    try drawFrame(&frame, &buffer, size, true);
     const inserting = "\x1b[0;90m   1\x1b[m x             \r\n\x1b[0;1;33m1000\x1b[m  ";
     try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], inserting) != null);
 }
@@ -336,10 +337,10 @@ test "a terminal without room for the gutter and one cell of text has no gutter"
     var buffer = try Buffer.fromBytes(std.testing.allocator, "ab\n");
     defer buffer.deinit(std.testing.allocator);
     var frame: Frame = .{ .screen = undefined };
-    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 5 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 5 }, false);
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], "ab  \r\n"));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;1H\x1b[?25h"));
-    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 6 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 6 }, false);
     const narrow = "\x1b[0;1;33m1  \x1b[m a\r\n";
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], narrow));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;5H\x1b[?25h"));
@@ -351,12 +352,12 @@ test "following scrolls within the cells the gutter leaves, and the cursor sits 
     var frame: Frame = .{ .screen = undefined };
     // One content row of four cells after the gutter.
     buffer.cursor = 9;
-    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
     const row = "\x1b[0;1;33m1  \x1b[m ghij\r\n";
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], row));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;8H\x1b[?25h"));
     buffer.cursor = 11;
-    try expectFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
+    try drawFrame(&frame, &buffer, .{ .rows = 2, .columns = 9 }, false);
     const below = "\x1b[0;1;33m2  \x1b[m seco\r\n";
     try std.testing.expect(std.mem.startsWith(u8, frame.bytes[0..frame.len], below));
     try std.testing.expect(std.mem.endsWith(u8, frame.bytes[0..frame.len], "\x1b[1;5H\x1b[?25h"));
