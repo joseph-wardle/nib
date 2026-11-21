@@ -764,7 +764,7 @@ fn stalledOutputRecovery(executable: [:0]const u8) !void {
     }
     const bytes = process.output[0..process.used];
     const start = (std.mem.indexOf(u8, bytes, frame) orelse return error.MissingOutput) + frame.len;
-    const status = std.mem.indexOf(u8, bytes, "\x1b[7mNORMAL") orelse return error.MissingOutput;
+    const status = std.mem.indexOf(u8, bytes, "\x1b[0;7mNORMAL") orelse return error.MissingOutput;
     try equal(@as(usize, 199 * 301), status - start);
     for (0..199) |number| {
         var expected: [299]u8 = @splat(' ');
@@ -853,7 +853,7 @@ fn modalCommands(executable: [:0]const u8) !void {
     try process.send(":");
     try process.ready();
     try process.send("\x1b[200~q!\r\x03\x1b[201~");
-    try process.until("\x1b[7m: ");
+    try process.until("\x1b[0;7m: ");
     try process.ready();
     try process.send("\x03^");
     try process.until("3:1 | ");
@@ -915,17 +915,17 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.ready();
     // Each key redraws; the cursor waits after the query in the status row.
     try process.send("/");
-    try process.until("\x1b[7m/ ");
+    try process.until("\x1b[0;7m/ ");
     try process.until("\x1b[24;2H");
     try process.ready();
     try process.send("t");
-    try process.until("\x1b[1;7H\x1b[7mt\x1b[27m");
+    try process.until("\x1b[1;7H\x1b[0;33;7mt\x1b[m");
     try process.until("\x1b[24;3H");
     try process.ready();
     // The preview scrolls the view to row 30, the one match of "ta".
     try process.send("a");
     try process.until("row30 target");
-    try process.until("\x1b[7mta\x1b[27m");
+    try process.until("\x1b[0;33;7mta\x1b[m");
     try process.until("\x1b[24;4H");
     try process.ready();
     // Escape returns cursor and view to the start, without highlights.
@@ -935,7 +935,7 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try plainFrame(&process);
     try process.send("/target\r");
     try process.until("NORMAL | 31:7 | ");
-    try process.until("\x1b[7mtarget\x1b[27m");
+    try process.until("\x1b[0;33;7mtarget\x1b[m");
     try process.ready();
     // Escape in normal mode only hides the highlight, and that alone redraws.
     try process.send("\x1b");
@@ -943,7 +943,7 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try plainFrame(&process);
     try process.send("n");
     try process.until("Search wrapped to top");
-    try process.until("\x1b[7mtarget\x1b[27m");
+    try process.until("\x1b[0;33;7mtarget\x1b[m");
     try process.ready();
     // Escape in normal mode hides the highlight and the notice.
     try process.send("\x1b");
@@ -951,7 +951,7 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try plainFrame(&process);
     try process.send("N");
     try process.until("Search wrapped to bottom");
-    try process.until("\x1b[7mtarget\x1b[27m");
+    try process.until("\x1b[0;33;7mtarget\x1b[m");
     try process.ready();
     try process.send("?row1\r");
     try process.until("NORMAL | 20:1 | ");
@@ -982,17 +982,17 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     defer process.close();
     try process.until("alpha beta");
     try process.ready();
-    // The selection is redrawn in reverse video, with the cursor at its end.
+    // The selection is redrawn in the selection style, with the cursor at its end.
     try editingKeys(&process, "wv");
     try process.send("e");
     try process.until("VISUAL | 1:10 | ");
-    try process.until("\x1b[1;7H\x1b[7mbeta\x1b[27m\x1b[1;10H");
+    try process.until("\x1b[1;7H\x1b[0;7mbeta\x1b[m\x1b[1;10H");
     try process.ready();
     try process.send("Vj");
     try process.until("VISUAL LINE | 2:");
-    try process.until("\x1b[1;1H\x1b[7malpha beta \x1b[27m\x1b[2;1H\x1b[7mgamma \x1b[27m");
+    try process.until("\x1b[1;1H\x1b[0;7malpha beta \x1b[m\x1b[2;1H\x1b[0;7mgamma \x1b[m");
     try process.ready();
-    // Escape ends it, and the next frame draws nothing in reverse video.
+    // Escape ends it, and the next frame draws nothing styled.
     try process.send("\x1b");
     try process.until("NORMAL | 2:");
     try plainFrame(&process);
@@ -1008,7 +1008,7 @@ fn visualWorkflow(executable: [:0]const u8) !void {
     try process.signal(.CONT);
     try process.until(enter);
     try process.until("VISUAL | 1:10 | ");
-    try process.until("\x1b[1;7H\x1b[7mbeta\x1b[27m");
+    try process.until("\x1b[1;7H\x1b[0;7mbeta\x1b[m");
     try process.ready();
     // A yank ends it and sends "beta" to the clipboard.
     try process.send("y");
@@ -1053,14 +1053,14 @@ fn visualWorkflow(executable: [:0]const u8) !void {
 }
 
 /// Consumes the rest of the frame, after the status row, and checks that it
-/// draws nothing in reverse video.
+/// draws nothing styled: no search match, no selection.
 fn plainFrame(process: *Process) !void {
-    try process.until("\x1b[27m");
+    try process.until("\x1b[m");
     while (std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m") == null) {
         if (try process.read(5000) == 0) return error.OutputTimeout;
     }
     const end = std.mem.indexOf(u8, process.output[0..process.used], "\x1b[0m").?;
-    try expect(std.mem.indexOf(u8, process.output[0..end], "\x1b[7m") == null);
+    try expect(std.mem.indexOf(u8, process.output[0..end], "\x1b[0;") == null);
     try process.ready();
 }
 
@@ -1495,7 +1495,7 @@ fn externalChanges(executable: [:0]const u8) !void {
     try process.ready();
     // An open command line holds the reload until it closes.
     try process.send(":");
-    try process.until("\x1b[7m:");
+    try process.until("\x1b[0;7m:");
     try process.ready();
     try putFile(path, "command\n");
     try process.until("pending");
@@ -1626,7 +1626,7 @@ fn formattingWorkflow(executable: [:0]const u8) !void {
     try process.until("Reloaded external changes");
     try process.ready();
     try process.send(":");
-    try process.until("\x1b[7m:");
+    try process.until("\x1b[0;7m:");
     try process.ready();
     try putFile(path, "const  z=3;\n");
     try process.until("DISK CONFLICT | :");
@@ -1770,17 +1770,17 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try process.until("LIST | ");
     try process.ready();
     try process.send("G");
-    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.until("\x1b[0;7m>   sub/gamma.txt");
     try process.ready();
     try process.send("k");
     try process.ready();
     try process.send("j");
-    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.until("\x1b[0;7m>   sub/gamma.txt");
     try process.ready();
     try process.send("g");
     try process.ready();
     try process.send("g");
-    try process.until("\x1b[7m>   .gitignore");
+    try process.until("\x1b[0;7m>   .gitignore");
     try process.ready();
     try process.send("\x1b");
     try process.until("No file open; :q quits");
@@ -1826,7 +1826,7 @@ fn finderSwitching(executable: [:0]const u8) !void {
     try finderKeys(&process, "\x7f\x7f\x7f\x7f");
     try process.send("\t");
     try process.until("[All]");
-    try process.until("\x1b[2mdebug.log");
+    try process.until("\x1b[0;2mdebug.log");
     try process.ready();
     // Open lists both, most recent first; the other one previews its edits.
     try process.send("\t");
@@ -2071,13 +2071,13 @@ fn finderQuit(executable: [:0]const u8) !void {
     try process.ready();
     // Seven results fit in half the page of 24 rows.
     try process.send("\x04");
-    try process.until("\x1b[7m>   sub/gamma.txt");
+    try process.until("\x1b[0;7m>   sub/gamma.txt");
     try process.ready();
     try process.send("\x15");
-    try process.until("\x1b[7m>   .gitignore");
+    try process.until("\x1b[0;7m>   .gitignore");
     try process.ready();
     try process.send(":");
-    try process.until("\x1b[7m:");
+    try process.until("\x1b[0;7m:");
     try process.ready();
     try process.send("q\r");
     try equal(@as(u8, 0), try process.wait(false));

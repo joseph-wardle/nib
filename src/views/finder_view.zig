@@ -14,6 +14,7 @@ const Category = @import("../finder/finder.zig").Category;
 const DocumentId = @import("../finder/finder.zig").DocumentId;
 const session = @import("../files/session.zig");
 const Session = session.Session;
+const theme = @import("theme.zig");
 
 /// Rows top to bottom: categories and root, progress, query, results
 /// beside the preview, the selected path in full, then status. Small
@@ -82,7 +83,7 @@ pub fn draw(
         line.put(selected[start..@min(start + width, selected.len)]);
         try frame.append("\r\n");
     }
-    try frame.append("\x1b[7m");
+    try theme.set(frame, &.{.status});
     var line: Line = .init(try frame.reserve(width));
     if (command_line) |text| {
         line.put(":");
@@ -98,7 +99,7 @@ pub fn draw(
         line.put("SEARCH | Enter open | Esc list | ^N/^P move | Tab category | ");
         line.put("^X command | ^R refresh");
     }
-    try frame.append("\x1b[27m");
+    try frame.append(theme.plain);
     if (command_line) |text| {
         const column = 1 + text.len;
         try frame.cursor(size.rows - 1, @min(column, width - 1));
@@ -253,9 +254,8 @@ fn opened(documents: *const Session, id: DocumentId) ?*const session.Entry {
 }
 
 /// One result row: selection, modified and unknown-status marks, then the
-/// label with matched bytes highlighted. Ignored files are dimmed, which
-/// never hides the selection, a highlight or a mark. Unsaved edits are read
-/// from the session, so the mark is current after any file command.
+/// label with matched bytes highlighted. Unsaved edits are read from the
+/// session, so the mark is current after any file command.
 fn drawResult(
     frame: *Frame,
     finder: *const Finder,
@@ -274,23 +274,52 @@ fn drawResult(
     if (chosen) prefix[0] = '>';
     if (modified) prefix[1] = '+';
     if (marks and shown.ignore == .unknown) prefix[2] = '?';
-    if (chosen) try frame.append("\x1b[7m");
+    const ignored = shown.ignore == .ignored;
+    try drawRow(frame, &prefix, shown.label, lit, chosen, ignored, width);
+}
+
+/// Draws `prefix` then `label` in `width` cells, with the label's bytes at
+/// `lit` (ascending offsets) in the matched style. A chosen row is in the
+/// chosen style throughout; an ignored file's label is dimmed, which never
+/// hides the choice, a highlight or a mark.
+fn drawRow(
+    frame: *Frame,
+    prefix: []const u8,
+    label: []const u8,
+    lit: []const usize,
+    chosen: bool,
+    ignored: bool,
+    width: usize,
+) terminal.Error!void {
+    // The row's roles, then a matched letter's on top of them.
+    var roles: [3]theme.Role = undefined;
+    var count: usize = 0;
+    if (chosen) {
+        roles[count] = .finder_chosen;
+        count += 1;
+        try theme.set(frame, roles[0..count]);
+    }
     const lead = @min(prefix.len, width);
     try frame.append(prefix[0..lead]);
-    if (shown.ignore == .ignored) try frame.append("\x1b[2m");
+    if (ignored) {
+        roles[count] = .finder_ignored;
+        count += 1;
+        try theme.set(frame, roles[0..count]);
+    }
+    roles[count] = .finder_matched;
     var next: usize = 0;
-    const label = shown.label[0..@min(shown.label.len, width - lead)];
-    for (label, 0..) |byte, offset| {
+    const shown = label[0..@min(label.len, width - lead)];
+    for (shown, 0..) |byte, offset| {
         const highlighted = next < lit.len and lit[next] == offset;
-        if (highlighted) try frame.append("\x1b[4;33m");
+        if (highlighted) try theme.set(frame, roles[0 .. count + 1]);
         try frame.append(&.{if (byte >= 0x20 and byte <= 0x7e) byte else '?'});
         if (highlighted) {
-            try frame.append("\x1b[24;39m");
+            try theme.set(frame, roles[0..count]);
             next += 1;
         }
     }
-    @memset(try frame.reserve(width - lead - label.len), ' ');
-    try frame.append("\x1b[22;27m");
+    @memset(try frame.reserve(width - lead - shown.len), ' ');
+    try frame.append(theme.plain);
 }
 
 /// The preview beside the results: a title row, then text rows.
@@ -431,4 +460,29 @@ test "a file preview's title says when it shows only part of the file" {
     try testing.expectEqualStrings("Preview: first 64 KiB", snapshotTitle(first));
     try testing.expectEqualStrings("Preview: near the line", snapshotTitle(near));
     try testing.expectEqualStrings("Preview: near the line", snapshotTitle(near_cut));
+}
+
+test "a result row combines its styles and returns to its own after a matched letter" {
+    var frame: Frame = .{ .screen = undefined };
+    const Case = struct { chosen: bool, ignored: bool, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .chosen = false, .ignored = false, .expected = "    a\x1b[0;4;33mb\x1b[mc  \x1b[m" },
+        .{ .chosen = true, .ignored = false, .expected = "\x1b[0;7m>   a\x1b[0;7;4;33mb\x1b[0;7mc  \x1b[m" },
+        .{ .chosen = false, .ignored = true, .expected = "    \x1b[0;2ma\x1b[0;2;4;33mb\x1b[0;2mc  \x1b[m" },
+        .{
+            .chosen = true,
+            .ignored = true,
+            .expected = "\x1b[0;7m>   \x1b[0;7;2ma\x1b[0;7;2;4;33mb\x1b[0;7;2mc  \x1b[m",
+        },
+    };
+    for (cases) |case| {
+        frame.len = 0;
+        const prefix = if (case.chosen) ">   " else "    ";
+        try drawRow(&frame, prefix, "abc", &.{1}, case.chosen, case.ignored, 9);
+        try std.testing.expectEqualStrings(case.expected, frame.bytes[0..frame.len]);
+    }
+    // A label cut by a narrow row still ends in plain text.
+    frame.len = 0;
+    try drawRow(&frame, ">   ", "abc", &.{2}, true, false, 5);
+    try std.testing.expectEqualStrings("\x1b[0;7m>   a\x1b[m", frame.bytes[0..frame.len]);
 }

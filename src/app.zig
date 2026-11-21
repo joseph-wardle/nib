@@ -1311,14 +1311,14 @@ test "the search prompt and its matches are drawn until Escape in normal mode hi
     defer app.documents.deinit(testing.allocator);
     _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
     // Three content rows and the status row, ten columns wide.
-    const matches = "\x1b[1;1H\x1b[7mab\x1b[27m" ++
-        "\x1b[2;1H\x1b[7mAB\x1b[27m" ++
-        "\x1b[2;9H\x1b[7mab\x1b[27m";
+    const matches = "\x1b[1;1H\x1b[0;33;7mab\x1b[m" ++
+        "\x1b[2;1H\x1b[0;33;7mAB\x1b[m" ++
+        "\x1b[2;9H\x1b[0;33;7mab\x1b[m";
     for ("/ab") |byte| app.editorEvent(.{ .key = byte });
     var frame: Frame = .{ .screen = undefined };
     try app.compose(&frame);
     const prompt = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.indexOf(u8, prompt, "\x1b[7m/ab       \x1b[27m") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "\x1b[0;7m/ab       \x1b[m") != null);
     try testing.expect(std.mem.endsWith(u8, prompt, matches ++ "\x1b[4;4H\x1b[?25h"));
     app.editorEvent(.{ .key = '\r' });
     frame.len = 0;
@@ -1328,8 +1328,8 @@ test "the search prompt and its matches are drawn until Escape in normal mode hi
     app.editorEvent(.escape);
     frame.len = 0;
     try app.compose(&frame);
-    // Only the status row is in reverse video.
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame.bytes[0..frame.len], "\x1b[7m"));
+    // Only the status row is styled.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame.bytes[0..frame.len], "\x1b[0;"));
     app.editorEvent(.{ .key = 'n' });
     frame.len = 0;
     try app.compose(&frame);
@@ -1340,7 +1340,7 @@ test "the search prompt and its matches are drawn until Escape in normal mode hi
     frame.len = 0;
     try app.compose(&frame);
     const long = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.indexOf(u8, long, "\x1b[7m?defghijk \x1b[27m") != null);
+    try testing.expect(std.mem.indexOf(u8, long, "\x1b[0;7m?defghijk \x1b[m") != null);
     try testing.expect(std.mem.endsWith(u8, long, "\x1b[4;10H\x1b[?25h"));
 }
 
@@ -1368,25 +1368,62 @@ test "a selection is drawn with its label instead of search matches until Escape
     for ("/ab\rlv") |byte| app.editorEvent(.{ .key = byte });
     try app.compose(&frame);
     const characters = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.indexOf(u8, characters, "\x1b[7mVISUAL | 2:2 | ") != null);
-    const character = "\x1b[2;2H\x1b[7mb\x1b[27m";
+    try testing.expect(std.mem.indexOf(u8, characters, "\x1b[0;7mVISUAL | 2:2 | ") != null);
+    const character = "\x1b[2;2H\x1b[0;7mb\x1b[m";
     try testing.expect(std.mem.endsWith(u8, characters, character ++ "\x1b[2;2H\x1b[?25h"));
     // Lines, each with its line break cell; the matches stay hidden.
     for ("Vk") |byte| app.editorEvent(.{ .key = byte });
     frame.len = 0;
     try app.compose(&frame);
     const lines = frame.bytes[0..frame.len];
-    try testing.expect(std.mem.indexOf(u8, lines, "\x1b[7mVISUAL LINE | 1:2 | ") != null);
-    const selected = "\x1b[1;1H\x1b[7mab x \x1b[27m\x1b[2;1H\x1b[7mab \x1b[27m";
+    try testing.expect(std.mem.indexOf(u8, lines, "\x1b[0;7mVISUAL LINE | 1:2 | ") != null);
+    const selected = "\x1b[1;1H\x1b[0;7mab x \x1b[m\x1b[2;1H\x1b[0;7mab \x1b[m";
     try testing.expect(std.mem.endsWith(u8, lines, selected ++ "\x1b[1;2H\x1b[?25h"));
     // Escape ends the selection and the matches return.
     app.editorEvent(.escape);
     frame.len = 0;
     try app.compose(&frame);
-    const matches = "\x1b[1;1H\x1b[7mab\x1b[27m\x1b[2;1H\x1b[7mab\x1b[27m";
+    const matches = "\x1b[1;1H\x1b[0;33;7mab\x1b[m\x1b[2;1H\x1b[0;33;7mab\x1b[m";
     const ended = frame.bytes[0..frame.len];
     try testing.expect(std.mem.endsWith(u8, ended, matches ++ "\x1b[1;2H\x1b[?25h"));
     try testing.expect(std.mem.indexOf(u8, ended, "NORMAL | 1:2") != null);
+}
+
+test "only the reset that draw appends ends a frame, whatever the views style" {
+    const testing = std.testing;
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(testing.io, .{ .sub_path = "a", .data = "ab x\nab\n" });
+    var background: jobs.Jobs = try .init();
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    defer background.deinit(testing.allocator, testing.io);
+    var app: App = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .terminal = undefined,
+        .background = &background,
+        .finder = &finder,
+        .size = .{ .rows = 10, .columns = 40 },
+    };
+    defer app.editor.deinit(testing.allocator);
+    defer app.documents.deinit(testing.allocator);
+    _ = try app.documents.open(testing.allocator, testing.io, temp.dir, "a");
+    var frame: Frame = .{ .screen = undefined };
+    // Search matches, then a selection, then the finder over the document.
+    for ([_][]const u8{ "/ab\r", "V" }) |keys| {
+        for (keys) |byte| app.editorEvent(.{ .key = byte });
+        frame.len = 0;
+        try app.compose(&frame);
+        try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[0;") != null);
+        try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[0m") == null);
+    }
+    app.editorEvent(.escape);
+    app.find(.open);
+    frame.len = 0;
+    try app.compose(&frame);
+    try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[0;7m>") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[0m") == null);
 }
 
 test "closing names the closed file and the next file when activating it reloads" {
@@ -1608,13 +1645,13 @@ test "the finder's unsaved mark follows a save made from the finder" {
     app.find(.open);
     var frame: Frame = .{ .screen = undefined };
     try app.compose(&frame);
-    const row = "\x1b[7m>+  ";
+    const row = "\x1b[0;7m>+  ";
     try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], row) != null);
     app.fileAction(.{ .write = "" });
     try testing.expectEqualStrings("Written", app.status.text());
     frame.len = 0;
     try app.compose(&frame);
-    try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[7m>   ") != null);
+    try testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], "\x1b[0;7m>   ") != null);
 }
 
 test "reloading names the file it reloaded or failed to reload" {

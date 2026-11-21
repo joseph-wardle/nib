@@ -6,18 +6,19 @@ const motion = nib.motion;
 const search = nib.search;
 const Viewport = nib.viewport.Viewport;
 const Highlights = nib.viewport.Highlights;
-const Span = nib.viewport.Span;
+const Editor = nib.editor.Editor;
+const Frame = nib.frame.Frame;
+const session = nib.session;
 
 // Per-key motion work as the event loop does it, without a terminal: resolve
 // the motion, move the cursor, follow it, place the terminal cursor and compute
 // the status column. Each sample starts from the same cursor, 90% of the way
 // along the middle line, where column scans are longest. Rendering and output
-// are not timed with the motions; a separate sample renders every content row
-// once the view follows the cursor, and again with every row selected by `V`
-// redrawn over it, as the editor view does. Search samples time one incremental query
-// change, for a query that is found and one that is not, and again on an
-// 8 MiB file with no match. Output is not written. No timing threshold is a
-// test.
+// are not timed with the motions; a separate sample draws a whole frame through
+// the editor view once it follows the cursor, and again with every content row
+// selected by `V`. Search samples time one incremental query change, for a query
+// that is found and one that is not, and again on an 8 MiB file with no match.
+// Output is never written to a terminal. No timing threshold is a test.
 pub fn main(init: std.process.Init) !void {
     const lines = [_]struct {
         name: []const u8,
@@ -80,47 +81,14 @@ pub fn main(init: std.process.Init) !void {
                 }
                 summary(@tagName(key), &times);
             }
-            // A whole content area scrolled to the cursor, as one frame draws it.
+            // A whole frame drawn by the editor view, scrolled to the cursor:
+            // every content row and the status row, then again with every
+            // visible row selected by `V`.
             buffer.cursor = origin;
             viewport = .{};
             viewport.follow(&buffer, rows, columns, false);
-            var output: [3 * columns]u8 = undefined;
-            var times: [samples]i96 = undefined;
-            for (&times) |*elapsed| {
-                const before = std.Io.Timestamp.now(init.io, .awake);
-                for (0..rows) |content| {
-                    const used = viewport.renderRow(&buffer, content, columns, &output);
-                    std.mem.doNotOptimizeAway(output[0..used]);
-                }
-                const after = std.Io.Timestamp.now(init.io, .awake);
-                elapsed.* = before.durationTo(after).toNanoseconds();
-            }
-            summary("render 50x200", &times);
-            const selected = motion.visualRange(&buffer, 0, text.len - 1, .linewise, null).range;
-            for (&times) |*elapsed| {
-                const before = std.Io.Timestamp.now(init.io, .awake);
-                for (0..rows) |content| {
-                    const used = viewport.renderRow(&buffer, content, columns, &output);
-                    std.mem.doNotOptimizeAway(output[0..used]);
-                }
-                const last = @min(buffer.lineCount(), viewport.top + rows);
-                for (viewport.top..last) |number| {
-                    const line_start = buffer.lineStart(number);
-                    const line_end = buffer.contentEnd(number);
-                    const span = Span.init(
-                        buffer.line(number),
-                        @max(selected.start, line_start) - line_start,
-                        @min(selected.end, line_end) - line_start,
-                        selected.end > line_end,
-                        viewport.left,
-                        columns,
-                    ) orelse continue;
-                    std.mem.doNotOptimizeAway(output[0..span.render(&output)]);
-                }
-                const after = std.Io.Timestamp.now(init.io, .awake);
-                elapsed.* = before.durationTo(after).toNanoseconds();
-            }
-            summary("render 50x200, all selected", &times);
+            render(init.io, &buffer, viewport, null, "render 50x200");
+            render(init.io, &buffer, viewport, 0, "render 50x200, all selected");
             for ([_][]const u8{ line.found, line.missing }) |query| {
                 incremental(init.io, &buffer, origin, query);
             }
@@ -133,6 +101,46 @@ pub fn main(init: std.process.Init) !void {
     defer buffer.deinit(init.gpa);
     std.debug.print("ASCII 8 MiB source, {d} bytes, cursor at the start:\n", .{large.len});
     incremental(init.io, &buffer, 0, lines[0].missing);
+}
+
+/// One frame of the editor view at `rows` content rows by `columns`, the
+/// cursor where `buffer` has it and `viewport` already following it. With an
+/// `anchor`, a linewise selection runs from it to the cursor. Reports the
+/// frame's bytes; nothing is written to a terminal.
+fn render(
+    io: std.Io,
+    buffer: *const Buffer,
+    viewport: Viewport,
+    anchor: ?usize,
+    name: []const u8,
+) void {
+    // Borrows the buffer: the entry is never freed.
+    const entry: session.Entry = .{
+        .id = @fromBackingInt(@intCast(0)),
+        .document = .{
+            .source = .{ .path = "fixture.zig", .resolved = undefined, .version = undefined },
+            .buffer = buffer.*,
+        },
+        .viewport = viewport,
+    };
+    var editor: Editor = .{};
+    if (anchor) |offset| {
+        editor.parser.visual = .linewise;
+        editor.anchor = offset;
+    }
+    var frame: Frame = .{ .screen = undefined };
+    var times: [samples]i96 = undefined;
+    for (&times) |*elapsed| {
+        frame.len = 0;
+        const before = std.Io.Timestamp.now(io, .awake);
+        nib.editor_view.draw(&frame, .{ .rows = rows + 1, .columns = columns + 1 }, &entry, &editor, "", null) catch unreachable;
+        std.mem.doNotOptimizeAway(frame.bytes[0..frame.len]);
+        const after = std.Io.Timestamp.now(io, .awake);
+        elapsed.* = before.durationTo(after).toNanoseconds();
+    }
+    var label: [64]u8 = undefined;
+    const bytes = std.fmt.bufPrint(&label, "{s}, {d} bytes", .{ name, frame.len });
+    summary(bytes catch unreachable, &times);
 }
 
 /// One incremental query change, as the editor and the next frame do it: a

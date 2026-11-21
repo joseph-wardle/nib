@@ -16,7 +16,10 @@ const rules = [_]struct { importer: []const u8, allowed: []const []const u8 }{
     .{ .importer = "finder/", .allowed = &.{ "text/", "finder/" } },
     .{ .importer = "terminal/", .allowed = &.{"terminal/"} },
     .{ .importer = "lsp/", .allowed = &.{ "text/", "lsp/" } },
-    .{ .importer = "views/", .allowed = &.{ "text/", "edit/", "files/", "finder/", "terminal/" } },
+    .{
+        .importer = "views/",
+        .allowed = &.{ "text/", "edit/", "files/", "finder/", "terminal/", "views/" },
+    },
     .{ .importer = "command_line.zig", .allowed = &.{ "edit/keys.zig", "terminal/input.zig" } },
     .{
         .importer = "app.zig",
@@ -32,7 +35,10 @@ const rules = [_]struct { importer: []const u8, allowed: []const []const u8 }{
         },
     },
     .{ .importer = "main.zig", .allowed = &.{ "app.zig", "finder/", "terminal/" } },
-    .{ .importer = "nib.zig", .allowed = &.{ "text/", "finder/" } },
+    .{
+        .importer = "nib.zig",
+        .allowed = &.{ "text/", "edit/", "files/", "finder/", "terminal/", "views/" },
+    },
 };
 
 pub fn main(init: std.process.Init) !void {

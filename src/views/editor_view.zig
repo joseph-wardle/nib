@@ -11,6 +11,7 @@ const Span = @import("../text/viewport.zig").Span;
 const Range = @import("../text/buffer.zig").Range;
 const Editor = @import("../edit/editor.zig").Editor;
 const session = @import("../files/session.zig");
+const theme = @import("theme.zig");
 
 /// Draws the active document's rows, its selection or search highlights,
 /// then the status row: the disk status,
@@ -40,7 +41,7 @@ pub fn draw(
             frame.commit(entry.viewport.renderRow(buffer, number, width, output));
             try frame.append("\r\n");
         }
-        try frame.append("\x1b[7m");
+        try theme.set(frame, &.{.status});
         var line: Line = .init(try frame.reserve(width));
         // The persistent disk/monitor status fills tiny status rows.
         line.put(entry.disk.status());
@@ -81,7 +82,7 @@ pub fn draw(
             line.put(entry.document.source.path);
             line.put(" | Ctrl-P files | :qa quit");
         }
-        try frame.append("\x1b[27m");
+        try frame.append(theme.plain);
         if (editor.highlighted()) |query| {
             try highlight(frame, buffer, entry.viewport, query, rows - 1, width);
         }
@@ -98,7 +99,7 @@ pub fn draw(
     }
 }
 
-/// Redraws the visible matches of `query` in reverse video over content rows
+/// Redraws the visible matches of `query` in the search style over content rows
 /// already drawn, leaving every other cell as drawn.
 fn highlight(
     frame: *Frame,
@@ -113,14 +114,14 @@ fn highlight(
         const text = buffer.line(viewport.top + row);
         var highlights: Highlights = .init(text, query, viewport.left, width);
         while (highlights.next()) |part| {
-            try reverse(frame, row, part.cell);
+            try restyle(frame, row, part.cell, .search_match);
             try frame.append(part.bytes);
-            try frame.append("\x1b[27m");
+            try frame.append(theme.plain);
         }
     }
 }
 
-/// Redraws the visible part of `range` in reverse video over content rows
+/// Redraws the visible part of `range` in the selection style over content rows
 /// already drawn, with one cell for each line break it takes.
 fn select(
     frame: *Frame,
@@ -144,18 +145,19 @@ fn select(
             viewport.left,
             width,
         ) orelse continue;
-        try reverse(frame, number - viewport.top, span.cell);
+        try restyle(frame, number - viewport.top, span.cell, .selection);
         frame.commit(span.render(try frame.room(3 * width)));
-        try frame.append("\x1b[27m");
+        try frame.append(theme.plain);
     }
 }
 
-/// Moves to a zero-based content cell and starts reverse video, which the
-/// caller ends with `ESC [27m` after the cells it redraws.
-fn reverse(frame: *Frame, row: usize, cell: usize) terminal.Error!void {
+/// Moves to a zero-based content cell and starts `role`, which the caller
+/// ends with `theme.plain` after the cells it redraws.
+fn restyle(frame: *Frame, row: usize, cell: usize, role: theme.Role) terminal.Error!void {
     var position: [32]u8 = undefined;
-    const sequence = std.fmt.bufPrint(&position, "\x1b[{d};{d}H\x1b[7m", .{ row + 1, cell + 1 });
+    const sequence = std.fmt.bufPrint(&position, "\x1b[{d};{d}H", .{ row + 1, cell + 1 });
     try frame.append(sequence catch unreachable);
+    try theme.set(frame, &.{role});
 }
 
 test "a whole row of matches at the widest terminal fits the frame unsplit" {
@@ -168,24 +170,24 @@ test "a whole row of matches at the widest terminal fits the frame unsplit" {
     var frame: Frame = .{ .screen = undefined };
     try highlight(&frame, &buffer, .{}, "a", columns, columns);
     const drawn = frame.bytes[0..frame.len];
-    try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[1;1H\x1b[7maaa"));
-    try std.testing.expect(std.mem.endsWith(u8, drawn, "aaa\x1b[27m"));
-    try std.testing.expectEqual(columns + "\x1b[1;1H\x1b[7m\x1b[27m".len, drawn.len);
+    try std.testing.expect(std.mem.startsWith(u8, drawn, "\x1b[1;1H\x1b[0;33;7maaa"));
+    try std.testing.expect(std.mem.endsWith(u8, drawn, "aaa\x1b[m"));
+    try std.testing.expectEqual(columns + "\x1b[1;1H\x1b[0;33;7m\x1b[m".len, drawn.len);
 }
 
-test "a selection is drawn in reverse video over the rows it covers" {
+test "a selection is drawn in the selection style over the rows it covers" {
     var buffer = try Buffer.fromBytes(std.testing.allocator, "ab\r\n\r\nc\td\nlast\n");
     defer buffer.deinit(std.testing.allocator);
     var frame: Frame = .{ .screen = undefined };
     // From b through the empty line's break and c's tab; three rows shown.
     try select(&frame, &buffer, .{}, .{ .start = 1, .end = 8 }, 3, 10);
-    try std.testing.expectEqualStrings("\x1b[1;2H\x1b[7mb \x1b[27m" ++
-        "\x1b[2;1H\x1b[7m \x1b[27m" ++
-        "\x1b[3;1H\x1b[7mc       \x1b[27m", frame.bytes[0..frame.len]);
+    try std.testing.expectEqualStrings("\x1b[1;2H\x1b[0;7mb \x1b[m" ++
+        "\x1b[2;1H\x1b[0;7m \x1b[m" ++
+        "\x1b[3;1H\x1b[0;7mc       \x1b[m", frame.bytes[0..frame.len]);
     // Scrolled down and right: only what remains in view.
     frame.len = 0;
     try select(&frame, &buffer, .{ .top = 2, .left = 3 }, .{ .start = 6, .end = 15 }, 1, 10);
-    const scrolled = "\x1b[1;1H\x1b[7m     d \x1b[27m";
+    const scrolled = "\x1b[1;1H\x1b[0;7m     d \x1b[m";
     try std.testing.expectEqualStrings(scrolled, frame.bytes[0..frame.len]);
     frame.len = 0;
     try select(&frame, &buffer, .{ .top = 3 }, .{ .start = 0, .end = 2 }, 2, 10);

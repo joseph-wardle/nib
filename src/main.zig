@@ -102,6 +102,7 @@ test {
     _ = @import("terminal/frame.zig");
     _ = @import("views/editor_view.zig");
     _ = @import("views/finder_view.zig");
+    _ = @import("views/theme.zig");
     _ = @import("text/search.zig");
     _ = @import("text/format.zig");
     _ = @import("lsp/position.zig");
