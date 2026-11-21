@@ -86,6 +86,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "editingWorkflow", editingWorkflow },
         .{ "utf8Editing", utf8Editing },
         .{ "searchWorkflow", searchWorkflow },
+        .{ "syntaxColours", syntaxColours },
         .{ "lineNumbers", lineNumbers },
         .{ "visualWorkflow", visualWorkflow },
         .{ "pasteLifecycle", pasteLifecycle },
@@ -986,6 +987,34 @@ fn searchWorkflow(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try expectFile(path, text[0..used]);
+}
+
+fn syntaxColours(executable: [:0]const u8) !void {
+    var path_buffer: [128]u8 = undefined;
+    const pid = linux.getpid();
+    const name = "/tmp/nib-syntax-{d}.zig";
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, name, .{pid}, 0);
+    defer _ = linux.unlink(path);
+    const text = "const s = \"x\"; // note\nconst n: u8 = @intCast(1);\n";
+    try putFile(path, text);
+    var process = try Process.start(executable, .{ .path = path });
+    defer process.close();
+    // Each kind of token in its look, behind an unchanged gutter.
+    try process.until("\x1b[2J\x1b[0;1;33m1  \x1b[m \x1b[0;35mconst\x1b[m s = " ++
+        "\x1b[0;32m\"x\"\x1b[m; \x1b[0;90m// note\x1b[m ");
+    try process.until("\r\n\x1b[0;90m  1\x1b[m \x1b[0;35mconst\x1b[m n: \x1b[0;33mu8\x1b[m = " ++
+        "\x1b[0;34m@intCast\x1b[m(\x1b[0;36m1\x1b[m); ");
+    try process.ready();
+    // Search matches replace the keyword's colour, as over any text.
+    try process.send("/const\r");
+    try process.until("NORMAL | 2:1 | ");
+    try process.until("\x1b[1;5H\x1b[0;33;7mconst\x1b[m\x1b[2;5H\x1b[0;33;7mconst\x1b[m");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+    try expectFile(path, text);
 }
 
 fn lineNumbers(executable: [:0]const u8) !void {

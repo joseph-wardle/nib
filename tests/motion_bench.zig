@@ -15,8 +15,8 @@ const session = nib.session;
 // the status column. Each sample starts from the same cursor, 90% of the way
 // along the middle line, where column scans are longest. Rendering and output
 // are not timed with the motions; a separate sample draws a whole frame through
-// the editor view once it follows the cursor, and again with every content row
-// selected by `V`. Search samples time one incremental query change, for a query
+// the editor view once it follows the cursor, as Zig and as plain text, and
+// again with every content row selected by `V`. Search samples time one incremental query change, for a query
 // that is found and one that is not, and again on an 8 MiB file with no match.
 // Output is never written to a terminal. No timing threshold is a test.
 pub fn main(init: std.process.Init) !void {
@@ -85,8 +85,9 @@ pub fn main(init: std.process.Init) !void {
             // every content row and the status row, then again with every
             // visible row selected by `V`.
             buffer.cursor = origin;
-            render(init.io, &buffer, null, "render 50x200");
-            render(init.io, &buffer, 0, "render 50x200, all selected");
+            render(init.io, &buffer, "fixture.zig", null, "render 50x200");
+            render(init.io, &buffer, "fixture.txt", null, "render 50x200, plain text");
+            render(init.io, &buffer, "fixture.zig", 0, "render 50x200, all selected");
             for ([_][]const u8{ line.found, line.missing }) |query| {
                 incremental(init.io, &buffer, origin, query);
             }
@@ -101,13 +102,15 @@ pub fn main(init: std.process.Init) !void {
     incremental(init.io, &buffer, 0, lines[0].missing);
 }
 
-/// One frame of the editor view at `rows` content rows by `columns`, the
-/// cursor where `buffer` has it and the view following it as the app does. With an
-/// `anchor`, a linewise selection runs from it to the cursor. Reports the
+/// One frame of the editor view at `rows` content rows by `columns` of a
+/// document at `path`, which decides its colours, the cursor where `buffer` has
+/// it and the view following it as the app does. With an `anchor`, a linewise
+/// selection runs from it to the cursor. Reports the
 /// frame's bytes; nothing is written to a terminal.
 fn render(
     io: std.Io,
     buffer: *const Buffer,
+    path: []const u8,
     anchor: ?usize,
     name: []const u8,
 ) void {
@@ -116,7 +119,7 @@ fn render(
     var entry: session.Entry = .{
         .id = @fromBackingInt(@intCast(0)),
         .document = .{
-            .source = .{ .path = "fixture.zig", .resolved = undefined, .version = undefined },
+            .source = .{ .path = path, .resolved = undefined, .version = undefined },
             .buffer = buffer.*,
         },
     };
