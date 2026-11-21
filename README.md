@@ -10,7 +10,7 @@ Goals:
 
 ## Status
 
-Very early. Think Vim, but worse in every way. Nib can open a project, find and switch between files, edit UTF-8 text with a core set of Vim motions and operators, search the current file, jump back and forth across files, select with visual mode, yank and put with registers (copying to the system clipboard), undo, save safely while watching for changes on disk, format Zig on save, and go to definitions and references through a language server (zls for Zig, slangd for Slang), with several results listed in the finder. Next come line numbers and colours, syntax highlighting, symbol search and project-wide search, then more Vim commands.
+Very early. Think Vim, but worse in every way. Nib can open a project, find and switch between files, edit UTF-8 text with a core set of Vim motions and operators, search the current file, jump back and forth across files, select with visual mode, yank and put with registers (copying to the system clipboard), undo, save safely while watching for changes on disk, format Zig on save, and go to definitions and references through a language server (zls for Zig, slangd for Slang), with several results listed in the finder. It shows relative line numbers, and one built-in theme styles everything in the terminal's own colours. Next come syntax highlighting, symbol search and project-wide search, then more Vim commands.
 
 ## Try it
 
