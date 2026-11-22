@@ -8,6 +8,39 @@ pub const max_file_bytes = 8 * 1024 * 1024;
 pub const max_lines = 256 * 1024;
 
 pub const Range = struct { start: usize, end: usize };
+
+/// Which rows changed since a caller last reset the record. Rows are
+/// `Buffer.insertionRows` rows, which are also the language server protocol's
+/// lines.
+pub const ChangedRows = union(enum) {
+    none,
+    /// Rows `first` up to `rows - unchanged` of the text when the record was
+    /// reset, where `rows` was its row count, became rows `first` up to
+    /// `insertionRows() - unchanged` now. Both spans may be wider than the
+    /// edits, never narrower.
+    lines: struct { first: usize, unchanged: usize, rows: usize },
+    /// No earlier text to compare with: a new buffer, or one loaded again.
+    whole,
+
+    /// The record of these changes followed by `later`'s, for a text that
+    /// `later` describes from where this record ends.
+    pub fn then(self: ChangedRows, later: ChangedRows) ChangedRows {
+        return switch (self) {
+            .none => later,
+            .whole => .whole,
+            .lines => |earlier| switch (later) {
+                .none => self,
+                .whole => .whole,
+                .lines => |next| .{ .lines = .{
+                    .first = @min(earlier.first, next.first),
+                    .unchanged = @min(earlier.unchanged, next.unchanged),
+                    .rows = earlier.rows,
+                } },
+            },
+        };
+    }
+};
+
 pub const Error = Allocator.Error || error{
     FileTooLarge,
     TooManyLines,
@@ -56,6 +89,9 @@ pub const Buffer = struct {
     cursor: usize = 0,
     editable: bool,
     changes: u64 = 0,
+    /// Every text change merges in here. A caller reads it and sets `.none`
+    /// once what it prepared from it can no longer fail.
+    changed_rows: ChangedRows = .whole,
     history: std.ArrayList(Group) = .empty,
     position: usize = 0,
     saved_position: ?usize = 0,
@@ -337,6 +373,13 @@ pub const Buffer = struct {
         const added = std.mem.count(u8, inserted, "\n");
         const old_rows = self.starts.items.len;
         const new_rows = old_rows - (end - first) + added;
+        // Rows `first - 1` through `end - 1` are rewritten; the rows after
+        // them keep their text.
+        self.changed_rows = self.changed_rows.then(.{ .lines = .{
+            .first = first - 1,
+            .unchanged = old_rows - end,
+            .rows = old_rows,
+        } });
         if (new_rows > old_rows) self.starts.items.len = new_rows;
         const suffix = self.starts.items[end..old_rows];
         const destination = self.starts.items[first + added .. new_rows];
@@ -804,4 +847,144 @@ test "every text change counts, and nothing else does" {
     try std.testing.expectEqual(@as(u64, 3), buffer.changes);
     try std.testing.expect(!try buffer.redo(allocator));
     try std.testing.expectEqual(@as(u64, 3), buffer.changes);
+}
+
+test "one edit's record names exactly the rows it rewrites" {
+    const allocator = std.testing.allocator;
+    // Start, end and inserted text in "a\nbb\r\ncc\ndd", then the first
+    // changed row and the unchanged rows after the change.
+    const Case = struct { usize, usize, []const u8, usize, usize };
+    const cases = [_]Case{
+        // Inside a line, at its start and at its end.
+        .{ 3, 3, "x", 1, 2 },
+        .{ 2, 2, "x", 1, 2 },
+        .{ 4, 4, "x", 1, 2 },
+        // Adding a line break, and removing a CRLF to join two lines.
+        .{ 3, 3, "\n", 1, 2 },
+        .{ 4, 6, "", 1, 1 },
+        // Removing a whole line rewrites it and the line it joins.
+        .{ 2, 6, "", 1, 1 },
+        // The unterminated last line, and the end of the text.
+        .{ 10, 11, "", 3, 0 },
+        .{ 11, 11, "\n", 3, 0 },
+        // Everything.
+        .{ 0, 11, "new", 0, 0 },
+    };
+    for (cases) |case| {
+        const start, const end, const inserted, const first, const unchanged = case;
+        var buffer = try Buffer.fromBytes(allocator, "a\nbb\r\ncc\ndd");
+        defer buffer.deinit(allocator);
+        try std.testing.expectEqual(ChangedRows.whole, buffer.changed_rows);
+        buffer.changed_rows = .none;
+        try buffer.replace(allocator, .{ .start = start, .end = end }, inserted, start);
+        const expected: ChangedRows = .{ .lines = .{
+            .first = first,
+            .unchanged = unchanged,
+            .rows = 4,
+        } };
+        try std.testing.expectEqual(expected, buffer.changed_rows);
+    }
+}
+
+test "the record rebuilds the text from the text it was reset at" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "first\r\nsecond\n\r\nthird\r\nlast");
+    defer buffer.deinit(allocator);
+    var random = std.Random.DefaultPrng.init(0x7c31);
+    const rng = random.random();
+    const replacements = [_][]const u8{
+        "", "x", "\n", "\r\n", "\n\n", "pasted\r\ntext\n", "\tline",
+    };
+    var reset = try allocator.dupe(u8, buffer.bytes());
+    defer allocator.free(reset);
+    buffer.changed_rows = .none;
+    for (0..2000) |i| {
+        switch (rng.uintLessThan(u8, 10)) {
+            0 => _ = try buffer.undo(allocator),
+            1 => _ = try buffer.redo(allocator),
+            2 => buffer.beginGroup(),
+            3 => buffer.endGroup(),
+            else => {
+                var start = rng.uintLessThan(usize, buffer.bytes().len + 1);
+                var end = start + rng.uintLessThan(usize, @min(buffer.bytes().len - start, 12) + 1);
+                if (!boundary(buffer.bytes(), start)) start -= 1;
+                if (!boundary(buffer.bytes(), end)) end += 1;
+                const inserted = replacements[rng.uintLessThan(usize, replacements.len)];
+                try buffer.replace(allocator, .{ .start = start, .end = end }, inserted, start);
+            },
+        }
+        try expectRebuilds(reset, &buffer);
+        if (i % 13 == 0) {
+            allocator.free(reset);
+            reset = try allocator.dupe(u8, buffer.bytes());
+            buffer.changed_rows = .none;
+        }
+    }
+}
+
+/// Checks that replacing the rows `buffer.changed_rows` names in `before`
+/// with the rows it names now gives the buffer's text.
+fn expectRebuilds(before: []const u8, buffer: *const Buffer) !void {
+    const changed = switch (buffer.changed_rows) {
+        .whole => unreachable,
+        .none => return std.testing.expectEqualStrings(before, buffer.bytes()),
+        .lines => |lines| lines,
+    };
+    var old = try Buffer.fromBytes(std.testing.allocator, before);
+    defer old.deinit(std.testing.allocator);
+    try std.testing.expectEqual(old.insertionRows(), changed.rows);
+    const rows = buffer.insertionRows();
+    try std.testing.expect(changed.first + changed.unchanged <= @min(changed.rows, rows));
+    const before_prefix = before[0..old.lineStart(changed.first)];
+    const after_prefix = buffer.bytes()[0..buffer.lineStart(changed.first)];
+    try std.testing.expectEqualStrings(before_prefix, after_prefix);
+    const before_suffix = before[suffixStart(&old, changed.unchanged)..];
+    const after_suffix = buffer.bytes()[suffixStart(buffer, changed.unchanged)..];
+    try std.testing.expectEqualStrings(before_suffix, after_suffix);
+}
+
+/// Where the last `unchanged` rows start.
+fn suffixStart(buffer: *const Buffer, unchanged: usize) usize {
+    if (unchanged == 0) return buffer.bytes().len;
+    return buffer.lineStart(buffer.insertionRows() - unchanged);
+}
+
+test "a record merges records that follow it, and whole text absorbs them" {
+    const early: ChangedRows = .{ .lines = .{ .first = 4, .unchanged = 2, .rows = 10 } };
+    const late: ChangedRows = .{ .lines = .{ .first = 6, .unchanged = 1, .rows = 12 } };
+    const merged: ChangedRows = .{ .lines = .{ .first = 4, .unchanged = 1, .rows = 10 } };
+    try std.testing.expectEqual(merged, early.then(late));
+    try std.testing.expectEqual(early, early.then(.none));
+    try std.testing.expectEqual(late, (ChangedRows{ .none = {} }).then(late));
+    try std.testing.expectEqual(ChangedRows.whole, early.then(.whole));
+    try std.testing.expectEqual(ChangedRows.whole, (ChangedRows{ .whole = {} }).then(late));
+}
+
+test "refused, no-op and failed edits leave the record alone" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, recordWorkflow, .{});
+}
+
+fn recordWorkflow(allocator: Allocator) !void {
+    var buffer = try Buffer.fromBytes(allocator, "a\nb\nc");
+    defer buffer.deinit(allocator);
+    buffer.changed_rows = .none;
+    const refused = buffer.replace(allocator, .{ .start = 0, .end = 0 }, "\x00", 0);
+    try std.testing.expectError(error.UnsupportedText, refused);
+    try buffer.replace(allocator, .{ .start = 2, .end = 3 }, "b", 2);
+    try buffer.setCursor(0);
+    try buffer.markSaved(allocator);
+    try std.testing.expectEqual(ChangedRows.none, buffer.changed_rows);
+    buffer.replace(allocator, .{ .start = 4, .end = 4 }, "longer\n", 4) catch |err| {
+        try std.testing.expectEqual(ChangedRows.none, buffer.changed_rows);
+        return err;
+    };
+    const one: ChangedRows = .{ .lines = .{ .first = 2, .unchanged = 0, .rows = 3 } };
+    try std.testing.expectEqual(one, buffer.changed_rows);
+    buffer.changed_rows = .none;
+    _ = buffer.undo(allocator) catch |err| {
+        try std.testing.expectEqual(ChangedRows.none, buffer.changed_rows);
+        return err;
+    };
+    const undone: ChangedRows = .{ .lines = .{ .first = 2, .unchanged = 0, .rows = 4 } };
+    try std.testing.expectEqual(undone, buffer.changed_rows);
 }
