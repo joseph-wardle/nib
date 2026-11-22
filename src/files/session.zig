@@ -21,6 +21,9 @@ pub const Entry = struct {
     used: u64 = 0,
     /// The language server's tokens for some of its rows.
     tokens: Held = .{},
+    /// The rows the last token request asked for, while it waits and after;
+    /// null until one is sent.
+    tokens_asked: ?TokensAsked = null,
 
     fn deinit(self: *Entry, allocator: Allocator) void {
         self.tokens.deinit(allocator);
@@ -28,6 +31,9 @@ pub const Entry = struct {
         self.document.deinit(allocator);
     }
 };
+
+/// Rows `top` up to `bottom` of a document's text at its `Buffer.changes`.
+pub const TokensAsked = struct { changes: u64, top: usize, bottom: usize };
 
 /// What `open` did: the document it activated, and how activating it
 /// reloaded it, if it did.

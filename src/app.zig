@@ -27,6 +27,7 @@ const client = @import("lsp/client.zig");
 const protocol = @import("lsp/protocol.zig");
 const position = @import("lsp/position.zig");
 const format = @import("text/format.zig");
+const syntax = @import("text/syntax.zig");
 const linux = std.os.linux;
 
 /// Runs Nib on `device` until a command quits, opening a named file first.
@@ -139,6 +140,7 @@ const App = struct {
             if (self.step(&decoder, bytes, expired, now)) |code| return code;
             try self.present();
             self.startServer();
+            self.askTokens();
             // A request whose server just failed to start says so.
             try self.present();
         }
@@ -187,8 +189,9 @@ const App = struct {
     }
 
     /// Acts on what server `index` just did: reports once, by name, a server
-    /// that exited or refused to start, sends a request that waited for
-    /// initialization, and applies an answer. Nothing else is drawn.
+    /// that exited or refused to start, applies a token answer, sends a
+    /// request that waited for initialization, applies a navigation answer,
+    /// then asks for tokens if they are due. Nothing else is drawn.
     fn serverChanged(self: *App, index: usize, change: client.Change) void {
         const server = &self.servers[index];
         const asked = if (self.waiting) |waiting| waiting.server == index else false;
@@ -198,16 +201,71 @@ const App = struct {
             self.redraw = true;
             return;
         }
-        if (!asked) return;
-        // A server initializes once per start, before any request is sent.
-        if (change.initialized) {
-            self.send();
-            self.redraw = true;
+        // Before any sync, which the answer's rows depend on.
+        if (change.tokens) self.applyTokens(server);
+        if (asked) {
+            // A server initializes once per start, before any request is sent.
+            if (change.initialized) {
+                self.send();
+                self.redraw = true;
+            }
+            if (change.answered) {
+                self.arrive(server);
+                self.redraw = true;
+            }
         }
-        if (change.answered) {
-            self.arrive(server);
-            self.redraw = true;
+        if (change.initialized or change.tokens) self.askTokens();
+    }
+
+    /// Asks the active document's server for the tokens of the rows in
+    /// view, after syncing, when its text changed or the view left the rows
+    /// last asked for; only for an editable document the lexer colours, a
+    /// server offering tokens, and no token request awaiting an answer. A
+    /// failed ask words no notice, and memory running out is tried again at
+    /// the next event.
+    fn askTokens(self: *App) void {
+        if (self.finding) return;
+        const entry = self.documents.current() orelse return;
+        const document = &entry.document;
+        const buffer = &document.buffer;
+        const path = document.source.path;
+        if (!buffer.editable or syntax.language(path) == null) return;
+        const index = client.serverFor(path) orelse return;
+        const server = &self.servers[index];
+        const capabilities = server.capabilities orelse return;
+        if (capabilities.legend == null or server.token_request != null) return;
+        const rows = buffer.insertionRows();
+        const top = entry.viewport.top;
+        const bottom = @min(top +| (self.size.rows -| 1), rows);
+        if (top >= bottom) return;
+        if (entry.tokens_asked) |asked| {
+            const covered = asked.top <= top and bottom <= asked.bottom;
+            if (asked.changes == buffer.changes and covered) return;
         }
+        const synced = self.syncDocuments(index);
+        if (server.state == .exited) return self.serverChanged(index, .{ .exited = true });
+        if (!synced) return;
+        const key = @backingInt(entry.id);
+        server.requestTokens(self.gpa, self.io, key, top, bottom, rows) catch return;
+        if (server.state == .exited) return self.serverChanged(index, .{ .exited = true });
+        entry.tokens_asked = .{ .changes = buffer.changes, .top = top, .bottom = bottom };
+    }
+
+    /// Replaces the held tokens of the document `server`'s token answer is
+    /// for, drawing if it is active. A failed request, a malformed answer or
+    /// memory running out keeps the earlier tokens.
+    fn applyTokens(self: *App, server: *client.Client) void {
+        const answered = server.token_answered orelse return;
+        const entry = self.documents.get(@fromBackingInt(answered.key)) orelse {
+            // Closed before its server was told.
+            server.token_answered = null;
+            return;
+        };
+        const decoded = server.tokens(self.gpa, &entry.document.buffer) catch return;
+        const held = decoded orelse return;
+        entry.tokens.deinit(self.gpa);
+        entry.tokens = held;
+        if (self.documents.active == entry.id) self.redraw = true;
     }
 
     /// Says why `server` can't be asked: gone, never found or refused.
@@ -2034,6 +2092,38 @@ const Navigating = struct {
         return self.app.servers[0].queue.items;
     }
 
+    /// Makes zls take changed lines and offer tokens: functions, then
+    /// properties.
+    fn offerTokens(self: *Navigating) void {
+        self.app.servers[0].capabilities.?.incremental = true;
+        self.app.servers[0].capabilities.?.legend = .init(&.{ "function", "property" });
+    }
+
+    /// How many token requests Nib has queued.
+    fn tokenRequests(self: *Navigating) usize {
+        return std.mem.count(u8, self.sent(), "textDocument/semanticTokens/range");
+    }
+
+    /// Answers the token request with `data`, the JSON array.
+    fn replyTokens(self: *Navigating, data: []const u8) !void {
+        var result: [1024]u8 = undefined;
+        const id = self.app.servers[0].token_request.?.id;
+        try self.replyTo(id, try std.fmt.bufPrint(&result, "{{\"data\":{s}}}", .{data}));
+    }
+
+    /// The text of each held token on `row` of the active document, as drawn.
+    fn heldText(self: *Navigating, row: usize, storage: []u8) ![]const u8 {
+        const entry = self.app.documents.current().?;
+        const text = &entry.document.buffer;
+        const tokens = entry.tokens.row(text.changed_rows, text.insertionRows(), row);
+        var writer: std.Io.Writer = .fixed(storage);
+        for (tokens, 0..) |token, index| {
+            if (index != 0) try writer.writeByte(' ');
+            try writer.writeAll(text.line(row)[token.start..token.end]);
+        }
+        return writer.buffered();
+    }
+
     /// A location in `name` as JSON, in `storage`.
     fn location(
         self: *const Navigating,
@@ -2924,4 +3014,183 @@ test ":wq formats, saves and closes, and says when it couldn't format" {
         try expectDisk(temp.dir, "a.zig", case.disk);
         try testing.expectEqual(null, fixture.app.documents.get(a));
     }
+}
+
+test "the active Zig document is asked for the rows in view once per change, never twice at once" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    // Without a legend, nothing is asked.
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 0), fixture.sent().len);
+    fixture.offerTokens();
+    app.askTokens();
+    // Opened first, then the five rows, all in view.
+    const sent = fixture.sent();
+    const opened = std.mem.indexOf(u8, sent, "\"method\":\"textDocument/didOpen\"").?;
+    const asked = std.mem.indexOf(u8, sent, "semanticTokens/range").?;
+    try testing.expect(opened < asked);
+    const range = "\"range\":{\"start\":{\"line\":0,\"character\":0}," ++
+        "\"end\":{\"line\":4,\"character\":2147483647}}";
+    try testing.expect(std.mem.indexOf(u8, sent, range) != null);
+    // Unchanged, or changed while asked: nothing more.
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 1), fixture.tokenRequests());
+    fixture.keys("dl");
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 1), fixture.tokenRequests());
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "didChange") == null);
+    // The answer draws, keeps the unchanged row's tokens, and asks again
+    // for the changed text, sending its line first.
+    var storage: [256]u8 = undefined;
+    app.redraw = false;
+    try fixture.replyTokens("[1,7,4,0,0,1,6,6,0,0]");
+    try testing.expect(app.redraw);
+    try testing.expectEqualStrings("main", try fixture.heldText(1, &storage));
+    try testing.expectEqualStrings("", try fixture.heldText(2, &storage));
+    try testing.expectEqual(@as(usize, 2), fixture.tokenRequests());
+    const changed = std.mem.lastIndexOf(u8, fixture.sent(), "didChange").?;
+    const again = std.mem.lastIndexOf(u8, fixture.sent(), "semanticTokens/range").?;
+    try testing.expect(changed < again);
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "\"text\":\"    b.arget();\\n\"") != null);
+    try fixture.replyTokens("[1,7,4,0,0,1,6,5,0,0]");
+    try testing.expectEqualStrings("arget", try fixture.heldText(2, &storage));
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 2), fixture.tokenRequests());
+    // An error answer keeps the tokens and isn't retried until the text
+    // changes.
+    fixture.keys("dl");
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 3), fixture.tokenRequests());
+    const id = app.servers[0].token_request.?.id;
+    const failed = "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":-32801,\"message\":\"modified\"}}}}";
+    var body: [256]u8 = undefined;
+    try fixture.feed(try std.fmt.bufPrint(&body, failed, .{id}));
+    try testing.expectEqualStrings("main", try fixture.heldText(1, &storage));
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 3), fixture.tokenRequests());
+    try testing.expectEqualStrings("", app.status.text());
+}
+
+test "scrolling past the rows asked asks for the rows now in view" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    fixture.offerTokens();
+    // Two content rows.
+    app.size = .{ .rows = 3, .columns = 40 };
+    const entry = app.documents.current().?;
+    for ([_][2]usize{ .{ 0, 2 }, .{ 2, 4 }, .{ 1, 3 } }, 1..) |rows, count| {
+        entry.viewport.top = rows[0];
+        app.askTokens();
+        try testing.expectEqual(count, fixture.tokenRequests());
+        var expected: [128]u8 = undefined;
+        const range = try std.fmt.bufPrint(
+            &expected,
+            "\"range\":{{\"start\":{{\"line\":{d},\"character\":0}},\"end\":{{\"line\":{d},\"character\":0}}}}",
+            .{ rows[0], rows[1] },
+        );
+        const last = std.mem.lastIndexOf(u8, fixture.sent(), "semanticTokens/range").?;
+        try testing.expect(std.mem.indexOf(u8, fixture.sent()[last..], range) != null);
+        try fixture.replyTokens("[]");
+    }
+    // Rows inside those last asked ask nothing.
+    entry.viewport.top = 2;
+    app.size = .{ .rows = 2, .columns = 40 };
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 3), fixture.tokenRequests());
+}
+
+test "only the active editable Zig document is asked, and an answer for another draws nothing" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    fixture.offerTokens();
+    const a = app.documents.active.?;
+    app.askTokens();
+    // Switched away while asked: a's answer is kept without a frame, then
+    // b, now active, is asked.
+    const b = try fixture.open("b.zig");
+    app.redraw = false;
+    try fixture.replyTokens("[1,7,4,0,0]");
+    try testing.expect(!app.redraw);
+    try testing.expectEqual(@as(usize, 1), app.documents.get(a).?.tokens.tokens.items.len);
+    try testing.expectEqual(@as(usize, 2), fixture.tokenRequests());
+    // Closed while asked: its answer is dropped.
+    _ = try app.documents.close(testing.allocator, testing.io, b, false);
+    try fixture.replyTokens("[0,7,6,0,0]");
+    try testing.expect(!app.redraw);
+    try testing.expectEqual(null, app.servers[0].token_answered);
+    // Plain text and read-only Zig are never asked; neither is the finder.
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "n.txt", .data = "n\n" });
+    try fixture.temp.dir.writeFile(testing.io, .{ .sub_path = "r.zig", .data = "\xff\n" });
+    for ([_][]const u8{ "n.txt", "r.zig" }) |name| {
+        _ = try fixture.open(name);
+        app.askTokens();
+        try testing.expectEqual(@as(usize, 2), fixture.tokenRequests());
+    }
+    _ = try fixture.open("a.zig");
+    fixture.keys("dl");
+    app.finding = true;
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 2), fixture.tokenRequests());
+    app.finding = false;
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 3), fixture.tokenRequests());
+}
+
+test "a server that initializes is asked for tokens, and an exit clears both lanes" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const server = &app.servers[0];
+    server.capabilities = null;
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 0), fixture.sent().len);
+    try fixture.feed(
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8","textDocumentSync":2,"definitionProvider":true,"semanticTokensProvider":{"range":true,"legend":{"tokenTypes":["function"],"tokenModifiers":[]}}}}}
+    );
+    try testing.expectEqual(@as(usize, 1), fixture.tokenRequests());
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "\"method\":\"initialized\"") != null);
+    fixture.keys("gd");
+    try testing.expect(server.pending != null and server.token_request != null);
+    server.state = .exited;
+    app.serverChanged(0, .{ .exited = true });
+    try testing.expectEqualStrings("zls exited", app.status.text());
+}
+
+test "running out of memory while applying a token answer keeps the earlier tokens" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    fixture.offerTokens();
+    app.askTokens();
+    try fixture.replyTokens("[1,7,4,0,0]");
+    var storage: [256]u8 = undefined;
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        fixture.keys("dl");
+        app.askTokens();
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = index });
+        app.gpa = failing.allocator();
+        try fixture.replyTokens("[0,0,5,0,0,1,7,4,0,0]");
+        app.gpa = testing.allocator;
+        const held = try fixture.heldText(1, &storage);
+        try testing.expectEqualStrings("main", held);
+        if (app.documents.current().?.tokens.tokens.items.len == 2) break;
+        try testing.expect(failing.has_induced_failure);
+        try testing.expectEqualStrings("", try fixture.heldText(0, &storage));
+    }
+    try testing.expect(index > 0);
+    try testing.expectEqualStrings("const", try fixture.heldText(0, &storage));
 }
