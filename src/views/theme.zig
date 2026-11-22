@@ -18,6 +18,8 @@ pub const Role = enum {
     constant,
     builtin,
     type,
+    function,
+    field,
 };
 
 /// The default theme: SGR parameters in the terminal's own palette, so Nib
@@ -37,6 +39,8 @@ const looks: std.enums.EnumArray(Role, []const u8) = .init(.{
     .constant = "36",
     .builtin = "34",
     .type = "33",
+    .function = "34",
+    .field = "31",
 });
 
 /// Returns to unstyled text. The app ends each frame with `ESC [0m`, the same

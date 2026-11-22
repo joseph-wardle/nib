@@ -39,6 +39,21 @@ pub const ChangedRows = union(enum) {
             },
         };
     }
+
+    /// Where `row` of the text now, which has `rows` rows, was when the
+    /// record was reset, or null when the record names it as changed.
+    pub fn before(self: ChangedRows, row: usize, rows: usize) ?usize {
+        return switch (self) {
+            .none => row,
+            .whole => null,
+            .lines => |lines| if (row < lines.first)
+                row
+            else if (row >= rows - lines.unchanged)
+                lines.rows - (rows - row)
+            else
+                null,
+        };
+    }
 };
 
 pub const Error = Allocator.Error || error{
@@ -941,6 +956,14 @@ fn expectRebuilds(before: []const u8, buffer: *const Buffer) !void {
     const before_suffix = before[suffixStart(&old, changed.unchanged)..];
     const after_suffix = buffer.bytes()[suffixStart(buffer, changed.unchanged)..];
     try std.testing.expectEqualStrings(before_suffix, after_suffix);
+    // Every row outside the record maps to a row with the same text then.
+    var kept: usize = 0;
+    for (0..rows) |row| {
+        const then = buffer.changed_rows.before(row, rows) orelse continue;
+        try std.testing.expectEqualStrings(old.line(then), buffer.line(row));
+        kept += 1;
+    }
+    try std.testing.expectEqual(changed.first + changed.unchanged, kept);
 }
 
 /// Where the last `unchanged` rows start.

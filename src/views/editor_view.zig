@@ -46,7 +46,8 @@ pub fn draw(
             const shown = entry.viewport.top +| number;
             try lineNumber(frame, buffer, shown, current, gutter);
             if (language != null and shown < buffer.insertionRows()) {
-                try code(frame, buffer.line(shown), entry.viewport.left, content);
+                const tagged = entry.tokens.row(buffer.changed_rows, buffer.insertionRows(), shown);
+                try code(frame, buffer.line(shown), tagged, entry.viewport.left, content);
             } else {
                 const output = try frame.room(3 * content);
                 frame.commit(entry.viewport.renderRow(buffer, number, content, output));
@@ -161,14 +162,21 @@ fn lineNumber(
 }
 
 /// Draws one line of Zig, without its terminator, from display column `left`
-/// into exactly `columns` cells, as `renderText` does, with each token in its
+/// into exactly `columns` cells, as `renderText` does, with each token
+/// `syntax.Merged` finds among the lexer's and the `tagged` ones in its
 /// role's look. A look is written only where the role changes, and the cells
 /// after the text are plain. Room is taken per piece, since looks break the
 /// 3 bytes per cell that bound a plain row, so a row may span a flush. `sink`
 /// has Frame's `append`, `room` and `commit`.
-fn code(sink: anytype, text: []const u8, left: usize, columns: usize) @TypeOf(sink.append("")) {
+fn code(
+    sink: anytype,
+    text: []const u8,
+    tagged: []const syntax.Tagged,
+    left: usize,
+    columns: usize,
+) @TypeOf(sink.append("")) {
     var cells: Cells = .init(left, columns);
-    var tokens: syntax.Tokens = .init(text);
+    var tokens: syntax.Merged = .init(text, tagged);
     // The role being drawn in, or null for plain.
     var current: ?theme.Role = null;
     var position: usize = 0;
@@ -213,6 +221,8 @@ fn syntaxRole(kind: syntax.Kind) theme.Role {
         .constant => .constant,
         .builtin => .builtin,
         .type => .type,
+        .function => .function,
+        .field => .field,
     };
 }
 
@@ -317,13 +327,14 @@ test "a selection is drawn in the selection style over the rows it covers" {
 
 /// Draws `buffer` as the active document in a terminal of `size`, following
 /// the cursor first as the app does, into `frame`. The document has `path`,
-/// and the last search `query` is highlighted unless it is empty.
+/// the last search `query` is highlighted unless it is empty, and `tokens`,
+/// borrowed, are its language server's.
 fn drawFrame(
     frame: *Frame,
     buffer: *const Buffer,
     size: terminal.Size,
     insert: bool,
-    view: struct { path: []const u8 = "a", query: []const u8 = "" },
+    view: struct { path: []const u8 = "a", query: []const u8 = "", tokens: syntax.Held = .{} },
 ) !void {
     var entry: session.Entry = .{
         .id = @fromBackingInt(@intCast(0)),
@@ -332,6 +343,7 @@ fn drawFrame(
             .buffer = buffer.*,
         },
     };
+    entry.tokens = view.tokens;
     entry.viewport.follow(buffer, size.rows -| 1, contentWidth(size, buffer), insert);
     var editor: Editor = .{};
     if (insert) editor.parser.mode = .insert;
@@ -436,7 +448,7 @@ test "following scrolls within the cells the gutter leaves, and the cursor sits 
 /// `columns` cells.
 fn expectCode(expected: []const u8, text: []const u8, left: usize, columns: usize) !void {
     var frame: Frame = .{ .screen = undefined };
-    try code(&frame, text, left, columns);
+    try code(&frame, text, &.{}, left, columns);
     try std.testing.expectEqualStrings(expected, frame.bytes[0..frame.len]);
 }
 
@@ -482,7 +494,7 @@ test "a Zig row draws the same however the frame splits it, at the widest termin
     const frame_size = @sizeOf(@FieldType(Frame, "bytes"));
     var sink: Collector = try .init(allocator, frame_size, &output);
     defer sink.deinit(allocator);
-    try code(&sink, text, 0, columns);
+    try code(&sink, text, &.{}, 0, columns);
     try sink.flush();
     try std.testing.expect(output.items.len > frame_size);
     try std.testing.expectEqualStrings(expected.items, output.items);
@@ -491,7 +503,7 @@ test "a Zig row draws the same however the frame splits it, at the widest termin
     var small: Collector = try .init(allocator, 3 * 24, &output);
     defer small.deinit(allocator);
     output.clearRetainingCapacity();
-    try code(&small, line, 0, 24);
+    try code(&small, line, &.{}, 0, 24);
     try small.flush();
     const whole = "\x1b[0;35mconst\x1b[m s = \x1b[0;32m\"x\"\x1b[m; \x1b[0;90m// c\x1b[m     ";
     try std.testing.expectEqualStrings(whole, output.items);
@@ -518,12 +530,13 @@ test "Zig files are drawn in colour under unchanged gutters and search matches" 
     try std.testing.expect(std.mem.endsWith(u8, plain, matches));
 }
 
-test "a Zig row puts every character in the cells a plain row does, for any bytes" {
+test "a Zig row puts every character in the cells a plain row does, for any bytes and tags" {
     const allocator = std.testing.allocator;
     const renderText = @import("../text/viewport.zig").renderText;
+    const char = @import("../text/char.zig");
     // Overlays place their cells as a plain row does, so a coloured row must
     // agree with it, including where tokens meet tabs, wide characters and
-    // invalid bytes.
+    // invalid bytes, and where tagged tokens on character boundaries meet them.
     const parts = [_][]const u8{
         "const", "u8",       "1",    "0x1e-", "..",      "\"", "'",      "\\",       "\\\\",
         "//",    "@",        "@\"",  "x",     " ",       "\t", "\u{e9}", "\u{6750}", "\u{1f680}",
@@ -542,10 +555,25 @@ test "a Zig row puts every character in the cells a plain row does, for any byte
         for (0..random.uintLessThan(usize, 16)) |_| {
             try line.appendSlice(allocator, parts[random.uintLessThan(usize, parts.len)]);
         }
+        var tags: [16]syntax.Tagged = undefined;
+        var count: usize = 0;
+        var position: usize = 0;
+        const kinds = [_]?syntax.Kind{ null, .field, .function, .type };
+        while (count < tags.len and random.boolean()) : (count += 1) {
+            const text = line.items;
+            const gap = random.uintLessThan(usize, 4);
+            const length = 1 + random.uintLessThan(usize, 6);
+            const start = char.start(text, @min(text.len, position + gap));
+            const end = char.start(text, @min(text.len, start + length));
+            if (end <= start) break;
+            const kind = kinds[random.uintLessThan(usize, kinds.len)];
+            tags[count] = .{ .start = start, .end = end, .kind = kind };
+            position = end;
+        }
         const left = random.uintLessThan(usize, 24);
         const columns = random.uintLessThan(usize, 41);
         frame.len = 0;
-        try code(&frame, line.items, left, columns);
+        try code(&frame, line.items, tags[0..count], left, columns);
         // The row without its looks, each of which ends in `m`.
         plain.clearRetainingCapacity();
         var rest: []const u8 = frame.bytes[0..frame.len];
@@ -557,4 +585,40 @@ test "a Zig row puts every character in the cells a plain row does, for any byte
         const expected = storage[0..renderText(line.items, left, columns, &storage)];
         try std.testing.expectEqualStrings(expected, plain.items);
     }
+}
+
+test "a server's tokens colour rows until they change, and the lexer the rest" {
+    const allocator = std.testing.allocator;
+    var buffer = try Buffer.fromBytes(allocator, "const x = a.b();\nconst y = 2;\n");
+    defer buffer.deinit(allocator);
+    var held: syntax.Held = .{};
+    defer held.deinit(allocator);
+    try held.tokens.appendSlice(allocator, &.{
+        .{ .start = 6, .end = 7, .kind = null },
+        .{ .start = 10, .end = 11, .kind = .field },
+        .{ .start = 12, .end = 13, .kind = .function },
+        .{ .start = 6, .end = 7, .kind = .type },
+    });
+    try held.ends.appendSlice(allocator, &.{ 3, 4 });
+    buffer.changed_rows = .none;
+    var frame: Frame = .{ .screen = undefined };
+    const size: terminal.Size = .{ .rows = 5, .columns = 30 };
+    const tagged = "\x1b[0;35mconst\x1b[m x = \x1b[0;31ma\x1b[m.\x1b[0;34mb\x1b[m();";
+    const second = "\x1b[0;35mconst\x1b[m \x1b[0;33my\x1b[m = \x1b[0;36m2\x1b[m;";
+    try drawFrame(&frame, &buffer, size, false, .{ .path = "a.zig", .tokens = held });
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], tagged) != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], second) != null);
+    // A line added at the end of the first row rewrites it, so it takes the
+    // lexer's looks, and moves the second row's tokens down with it.
+    try buffer.replace(allocator, .{ .start = 16, .end = 16 }, "\n", 17);
+    const rewritten = "\x1b[0;35mconst\x1b[m x = a.b();";
+    const moved = "\x1b[0;90m  1\x1b[m " ++ second;
+    try drawFrame(&frame, &buffer, size, false, .{ .path = "a.zig", .tokens = held });
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], rewritten) != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], moved) != null);
+    // Editing that row gives it the lexer's looks too.
+    try buffer.replace(allocator, .{ .start = 24, .end = 25 }, "y2", 24);
+    const edited = "\x1b[0;35mconst\x1b[m y2 = \x1b[0;36m2\x1b[m;";
+    try drawFrame(&frame, &buffer, size, false, .{ .path = "a.zig", .tokens = held });
+    try std.testing.expect(std.mem.indexOf(u8, frame.bytes[0..frame.len], edited) != null);
 }

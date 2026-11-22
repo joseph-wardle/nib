@@ -86,9 +86,13 @@ pub fn main(init: std.process.Init) !void {
             // every content row and the status row, then again with every
             // visible row selected by `V`.
             buffer.cursor = origin;
-            render(init.io, &buffer, "fixture.zig", null, "render 50x200");
-            render(init.io, &buffer, "fixture.txt", null, "render 50x200, plain text");
-            render(init.io, &buffer, "fixture.zig", 0, "render 50x200, all selected");
+            try render(init.gpa, init.io, &buffer, "fixture.zig", null, false, "render 50x200");
+            const tagged = "render 50x200, server tokens";
+            try render(init.gpa, init.io, &buffer, "fixture.zig", null, true, tagged);
+            const plain = "render 50x200, plain text";
+            try render(init.gpa, init.io, &buffer, "fixture.txt", null, false, plain);
+            const selected = "render 50x200, all selected";
+            try render(init.gpa, init.io, &buffer, "fixture.zig", 0, false, selected);
             for ([_][]const u8{ line.found, line.missing }) |query| {
                 incremental(init.io, &buffer, origin, query);
             }
@@ -106,17 +110,21 @@ pub fn main(init: std.process.Init) !void {
 /// One frame of the editor view at `rows` content rows by `columns` of a
 /// document at `path`, which decides its colours, the cursor where `buffer` has
 /// it and the view following it as the app does. With an `anchor`, a linewise
-/// selection runs from it to the cursor. Reports the frame's bytes; nothing is
+/// selection runs from it to the cursor. With `tokens`, every identifier in
+/// view has a server token, in turn a field, a function and plain, as a range
+/// answer would. Reports the frame's bytes; nothing is
 /// written to a terminal.
 fn render(
+    gpa: std.mem.Allocator,
     io: std.Io,
     buffer: *const Buffer,
     path: []const u8,
     anchor: ?usize,
+    tokens: bool,
     name: []const u8,
-) void {
+) !void {
     const size: nib.terminal.Size = .{ .rows = rows + 1, .columns = columns + 1 };
-    // Borrows the buffer: the entry is never freed.
+    // Borrows the buffer: only the tokens are the entry's own.
     var entry: session.Entry = .{
         .id = @fromBackingInt(@intCast(0)),
         .document = .{
@@ -125,6 +133,8 @@ fn render(
         },
     };
     entry.viewport.follow(buffer, rows, nib.editor_view.contentWidth(size, buffer), false);
+    defer entry.tokens.deinit(gpa);
+    if (tokens) try tag(gpa, buffer, &entry);
     var editor: Editor = .{};
     if (anchor) |offset| {
         editor.parser.visual = .linewise;
@@ -198,4 +208,28 @@ fn fixture(allocator: std.mem.Allocator, line: []const u8, long: bool, size: usi
         copy[line.len] = if (long) ' ' else '\n';
     }
     return text;
+}
+
+/// Gives every identifier in the rows `entry` shows a server token, in turn a
+/// field, a function and plain.
+fn tag(gpa: std.mem.Allocator, buffer: *const Buffer, entry: *session.Entry) !void {
+    const kinds = [_]?nib.syntax.Kind{ .field, .function, null };
+    const held = &entry.tokens;
+    held.top = entry.viewport.top;
+    const last = @min(buffer.insertionRows(), entry.viewport.top + rows);
+    for (entry.viewport.top..last) |row| {
+        const text = buffer.line(row);
+        var position: usize = 0;
+        while (position < text.len) {
+            const start = position;
+            while (position < text.len and std.ascii.isAlphabetic(text[position])) position += 1;
+            if (position > start) {
+                const kind = kinds[held.tokens.items.len % kinds.len];
+                try held.tokens.append(gpa, .{ .start = start, .end = position, .kind = kind });
+            } else position += 1;
+        }
+        try held.ends.append(gpa, held.tokens.items.len);
+    }
+    // The buffer's text is the tokens' text.
+    entry.document.buffer.changed_rows = .none;
 }

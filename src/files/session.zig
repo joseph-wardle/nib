@@ -5,6 +5,7 @@ const file = @import("file.zig");
 const motion = @import("../text/motion.zig");
 const Viewport = @import("../text/viewport.zig").Viewport;
 const Disk = @import("disk.zig").Disk;
+const Held = @import("../text/syntax.zig").Held;
 
 /// A document's identity for the whole session; never reused.
 pub const Id = enum(u64) { _ };
@@ -18,8 +19,11 @@ pub const Entry = struct {
     disk: Disk = .{},
     /// Activation order; larger is more recent.
     used: u64 = 0,
+    /// The language server's tokens for some of its rows.
+    tokens: Held = .{},
 
     fn deinit(self: *Entry, allocator: Allocator) void {
+        self.tokens.deinit(allocator);
         self.disk.deinit(allocator);
         self.document.deinit(allocator);
     }

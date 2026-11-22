@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ChangedRows = @import("buffer.zig").ChangedRows;
 
 /// A language Nib colours.
 pub const Language = enum { zig };
 
 /// What a coloured token is. Everything else in a line (identifiers,
-/// operators, punctuation, spaces) has no kind.
+/// operators, punctuation, spaces) has no kind. The lexer never finds a
+/// function or a field; only a language server tells them apart.
 pub const Kind = enum {
     /// `//` to the end of the line, doc comments included.
     comment,
@@ -16,8 +19,13 @@ pub const Kind = enum {
     constant,
     /// `@name`, but not the quoted identifier `@"name"`.
     builtin,
-    /// Primitive type names: `u8`, `bool`, `type`, `void`, ….
+    /// Primitive type names: `u8`, `bool`, `type`, `void`, …, and from a
+    /// language server, any type or namespace.
     type,
+    /// A function or method.
+    function,
+    /// A struct field.
+    field,
 };
 
 /// The language of the file at `path`, by extension, or null when Nib
@@ -92,6 +100,93 @@ pub const Tokens = struct {
     }
 };
 
+/// A token a language server tagged, by byte column in its line. A null
+/// kind is drawn plain, whatever the lexer would make of its bytes.
+pub const Tagged = struct { start: usize, end: usize, kind: ?Kind };
+
+/// A language server's tokens for consecutive rows, kept while the text
+/// changes. Rows are numbered in the text from when `changed` was last
+/// reset; their columns are bytes of that text, where each row's tokens are
+/// in order, apart, within it and on character boundaries. Owns its lists.
+pub const Held = struct {
+    /// The first row covered.
+    top: usize = 0,
+    /// Where each covered row's tokens end in `tokens`.
+    ends: std.ArrayList(usize) = .empty,
+    tokens: std.ArrayList(Tagged) = .empty,
+    /// The edits since the tokens' text that no longer show in the buffer's
+    /// own record: each sync merges in the record it takes.
+    changed: ChangedRows = .none,
+
+    pub fn deinit(self: *Held, allocator: Allocator) void {
+        self.ends.deinit(allocator);
+        self.tokens.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// The tokens for `row` of a buffer with `rows` rows, where `pending`
+    /// is the buffer's `changed_rows`. A row changed since the tokens' text,
+    /// or not covered, has none. Borrowed until the set changes.
+    pub fn row(self: *const Held, pending: ChangedRows, rows: usize, shown: usize) []const Tagged {
+        const earlier = self.changed.then(pending).before(shown, rows) orelse return &.{};
+        if (earlier < self.top or earlier - self.top >= self.ends.items.len) return &.{};
+        const index = earlier - self.top;
+        const start = if (index == 0) 0 else self.ends.items[index - 1];
+        return self.tokens.items[start..self.ends.items[index]];
+    }
+};
+
+/// The coloured tokens of one line: the `tagged` tokens with a kind, and
+/// the lexer's tokens, cut to the bytes no tagged token covers. In order and
+/// apart, like `Tokens`. Borrows both.
+pub const Merged = struct {
+    lexer: Tokens,
+    /// The lexer token after `position`'s, once read.
+    waiting: ?Token = null,
+    tagged: []const Tagged,
+    /// The next tagged token.
+    index: usize = 0,
+    /// Every byte before it is drawn.
+    position: usize = 0,
+
+    pub fn init(text: []const u8, tagged: []const Tagged) Merged {
+        return .{ .lexer = .init(text), .tagged = tagged };
+    }
+
+    pub fn next(self: *Merged) ?Token {
+        const text = self.lexer.text;
+        while (true) {
+            const tagged = self.index < self.tagged.len;
+            const gap_end = if (tagged) self.tagged[self.index].start else text.len;
+            if (self.position < gap_end) {
+                const found = self.waiting orelse self.lexer.next() orelse {
+                    self.position = gap_end;
+                    continue;
+                };
+                if (found.end <= self.position) {
+                    self.waiting = null;
+                    continue;
+                }
+                if (found.start >= gap_end) {
+                    self.waiting = found;
+                    self.position = gap_end;
+                    continue;
+                }
+                const start = @max(found.start, self.position);
+                const end = @min(found.end, gap_end);
+                self.waiting = if (found.end > gap_end) found else null;
+                self.position = end;
+                return .{ .start = start, .end = end, .kind = found.kind };
+            }
+            if (self.index == self.tagged.len) return null;
+            const token = self.tagged[self.index];
+            self.index += 1;
+            self.position = token.end;
+            if (token.kind) |kind| return .{ .start = token.start, .end = token.end, .kind = kind };
+        }
+    }
+};
+
 /// The primitive values, which `isPrimitive` counts with the types.
 const constants: std.StaticStringMap(void) = .initComptime(.{
     .{"true"},
@@ -149,10 +244,15 @@ const testing = std.testing;
 
 /// Checks a line's tokens, written as `kind:text` separated by spaces.
 fn expectTokens(expected: []const u8, text: []const u8) !void {
+    var tokens: Tokens = .init(text);
+    try expectFound(expected, text, &tokens);
+}
+
+/// Checks the tokens `iterator` finds in `text`, as `expectTokens` does.
+fn expectFound(expected: []const u8, text: []const u8, iterator: anytype) !void {
     var written: std.ArrayList(u8) = .empty;
     defer written.deinit(testing.allocator);
-    var tokens: Tokens = .init(text);
-    while (tokens.next()) |token| {
+    while (iterator.next()) |token| {
         if (written.items.len != 0) try written.append(testing.allocator, ' ');
         try written.appendSlice(testing.allocator, @tagName(token.kind));
         try written.append(testing.allocator, ':');
@@ -233,4 +333,64 @@ test "invalid and non-ASCII bytes are skipped without a kind" {
     try expectTokens("keyword:const string:\"\xff\xfe\"", "\xc3 const \xff \"\xff\xfe\"");
     try expectTokens("comment:// na\u{ef}ve", "x \u{2014} // na\u{ef}ve");
     try expectTokens("", "\x00\x1b[\t\x7f");
+}
+
+test "tagged tokens win where they are, and the lexer colours the bytes between" {
+    const text = "const x = foo.bar(1); // c";
+    const tagged = [_]Tagged{
+        .{ .start = 6, .end = 7, .kind = null },
+        .{ .start = 10, .end = 13, .kind = .type },
+        .{ .start = 14, .end = 17, .kind = .function },
+    };
+    var merged: Merged = .init(text, &tagged);
+    const expected = "keyword:const type:foo function:bar constant:1 comment:// c";
+    try expectFound(expected, text, &merged);
+    // A plain tag hides the lexer's look, and a tag inside a lexer token
+    // leaves the lexer's look on either side.
+    const string = "const s = \"abc\";";
+    const inside = [_]Tagged{
+        .{ .start = 0, .end = 5, .kind = null },
+        .{ .start = 12, .end = 13, .kind = .field },
+    };
+    merged = .init(string, &inside);
+    try expectFound("string:\"a field:b string:c\"", string, &merged);
+    // Tags covering the whole line leave the lexer nothing.
+    const all = [_]Tagged{.{ .start = 0, .end = string.len, .kind = .keyword }};
+    merged = .init(string, &all);
+    try expectFound("keyword:const s = \"abc\";", string, &merged);
+    merged = .init(string, &.{});
+    try expectFound("keyword:const string:\"abc\"", string, &merged);
+}
+
+test "a held set gives a row its tokens until the row changes" {
+    const allocator = testing.allocator;
+    var held: Held = .{ .top = 2 };
+    defer held.deinit(allocator);
+    // Rows 2, 3 and 4 of a ten-row text, the middle one without tokens.
+    try held.tokens.appendSlice(allocator, &.{
+        .{ .start = 0, .end = 1, .kind = .field },
+        .{ .start = 0, .end = 2, .kind = .function },
+    });
+    try held.ends.appendSlice(allocator, &.{ 1, 1, 2 });
+    const field = held.tokens.items[0..1];
+    const function = held.tokens.items[1..2];
+    try testing.expectEqualSlices(Tagged, field, held.row(.none, 10, 2));
+    try testing.expectEqual(0, held.row(.none, 10, 3).len);
+    try testing.expectEqualSlices(Tagged, function, held.row(.none, 10, 4));
+    try testing.expectEqual(0, held.row(.none, 10, 1).len);
+    try testing.expectEqual(0, held.row(.none, 10, 5).len);
+    // Two rows added in row 3: row 2 stays, row 4 moves to 6, and row 3,
+    // now rows 3 to 5, has none.
+    const added: ChangedRows = .{ .lines = .{ .first = 3, .unchanged = 7, .rows = 10 } };
+    try testing.expectEqualSlices(Tagged, field, held.row(added, 12, 2));
+    try testing.expectEqual(0, held.row(added, 12, 4).len);
+    try testing.expectEqualSlices(Tagged, function, held.row(added, 12, 6));
+    // The set's own record, from a sync, composes with the buffer's.
+    held.changed = added;
+    const typed: ChangedRows = .{ .lines = .{ .first = 2, .unchanged = 10, .rows = 12 } };
+    try testing.expectEqual(0, held.row(typed, 12, 2).len);
+    try testing.expectEqualSlices(Tagged, function, held.row(typed, 12, 6));
+    try testing.expectEqualSlices(Tagged, function, held.row(.none, 12, 6));
+    // A new buffer's text is all changed.
+    try testing.expectEqual(0, held.row(.whole, 12, 6).len);
 }
