@@ -9,6 +9,7 @@ pub const finder = @import("finder/finder.zig");
 pub const frame = @import("terminal/frame.zig");
 pub const jobs = @import("finder/jobs.zig");
 pub const motion = @import("text/motion.zig");
+pub const protocol = @import("lsp/protocol.zig");
 pub const search = @import("text/search.zig");
 pub const session = @import("files/session.zig");
 pub const syntax = @import("text/syntax.zig");

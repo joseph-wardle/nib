@@ -37,7 +37,7 @@ const rules = [_]struct { importer: []const u8, allowed: []const []const u8 }{
     .{ .importer = "main.zig", .allowed = &.{ "app.zig", "finder/", "terminal/" } },
     .{
         .importer = "nib.zig",
-        .allowed = &.{ "text/", "edit/", "files/", "finder/", "terminal/", "views/" },
+        .allowed = &.{ "text/", "edit/", "files/", "finder/", "terminal/", "views/", "lsp/" },
     },
 };
 

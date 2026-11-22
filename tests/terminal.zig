@@ -104,6 +104,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "finderQuit", finderQuit },
         .{ "navigationWorkflow", navigationWorkflow },
         .{ "navigationWaiting", navigationWaiting },
+        .{ "semanticColours", semanticColours },
+        .{ "incrementalNavigation", incrementalNavigation },
+        .{ "missingServerColours", missingServerColours },
     };
     inline for (checks) |check| {
         check[1](executable) catch |err| {
@@ -172,6 +175,8 @@ const Options = struct {
     nonblocking_output: bool = false,
     /// Working directory for the child.
     cwd: ?[:0]const u8 = null,
+    /// The child's `PATH=` entry, instead of the harness's.
+    path_entry: ?[:0]const u8 = null,
 };
 
 const Process = struct {
@@ -229,7 +234,8 @@ const Process = struct {
             const limit: linux.rlimit = .{ .cur = 3, .max = 3 };
             _ = try checked(linux.setrlimit(.NOFILE, &limit));
         }
-        const env = [_:null]?[*:0]const u8{ "PS1=" ++ prompt, search_path, "TERM=xterm-256color" };
+        const path_entry = options.path_entry orelse search_path;
+        const env = [_:null]?[*:0]const u8{ "PS1=" ++ prompt, path_entry, "TERM=xterm-256color" };
         const argv = [_:null]?[*:0]const u8{ executable.ptr, if (options.missing_argument) null else (options.path orelse fixture).ptr, if (options.extra_argument) "extra" else null };
         const shell_argv = [_:null]?[*:0]const u8{ helpers.zsh, "-dfi" };
         const program = if (options.shell) helpers.zsh else executable;
@@ -2361,4 +2367,138 @@ fn navigationWaiting(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try gone(pid);
+}
+
+// Covers ZLS's colours arriving without a key: on opening, a field in 31 and a
+// function in 34; a line typed in insert mode drawn at once in the lexer's
+// looks, then in ZLS's; and rows first shown by `G` likewise.
+fn semanticColours(executable: [:0]const u8) !void {
+    var storage: [128]u8 = undefined;
+    const directory = try std.fmt.bufPrintSentinel(&storage, "/tmp/nib-semantic-{d}", .{linux.getpid()}, 0);
+    _ = try checked(linux.mkdir(directory, 0o700));
+    defer spawn(&.{ helpers.rm, "-rf", directory, null }) catch {};
+    var path_storage: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_storage, "{s}/main.zig", .{directory}, 0);
+    var text: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&text);
+    try writer.writeAll(
+        \\const S = struct { field: u8 };
+        \\pub fn main() void {
+        \\    var s: S = .{ .field = 1 };
+        \\    s.field = 2;
+        \\}
+        \\
+    );
+    for (0..40) |number| try writer.print("// filler {d}\n", .{number});
+    try writer.writeAll(
+        \\fn last(t: S) u8 {
+        \\    return t.field;
+        \\}
+        \\
+    );
+    try putFile(path, writer.buffered());
+    var process = try Process.start(executable, .{ .path = path, .cwd = directory, .size = .{ 12, 80 } });
+    defer process.close();
+    try process.until("\x1b[0;34mmain\x1b[m");
+    try process.until("s.\x1b[0;31mfield\x1b[m = \x1b[0;36m2\x1b[m;");
+    try process.ready();
+    try editingKeys(&process, "jjj$ha");
+    try process.send("3");
+    // The changed line in the lexer's looks, at once.
+    try process.until("    s.field = \x1b[0;36m23\x1b[m;");
+    try process.until("    s.\x1b[0;31mfield\x1b[m = \x1b[0;36m23\x1b[m;");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("NORMAL [+] | 4:");
+    try process.ready();
+    try process.send("G");
+    try process.until("t.field;");
+    try process.until("t.\x1b[0;31mfield\x1b[m;");
+    try process.ready();
+    try process.send(":q!\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+}
+
+// Covers edits that add and remove lines, sent to ZLS as changed lines: `gd`
+// at a call that moved still lands on its definition, and `grr` lists the
+// one call left where Nib has it.
+fn incrementalNavigation(executable: [:0]const u8) !void {
+    var project: ZigProject = .{};
+    try project.create("incremental");
+    defer project.remove();
+    var process = try Process.start(executable, .{ .path = project.a, .cwd = project.directory });
+    defer process.close();
+    // ZLS has the text once its colours show, so each edit is sent as lines.
+    try process.until("\x1b[0;34mmain\x1b[m");
+    try process.ready();
+    // Two lines added below line 2, then the second call removed.
+    try editingKeys(&process, "jo");
+    try editingKeys(&process, "const x = 1;\r_ = x;");
+    try process.send("\x1b");
+    try process.until("NORMAL [+] | 4:");
+    try process.ready();
+    try editingKeys(&process, "jjdd");
+    try editingKeys(&process, "ggjjjjww");
+    try process.send("w");
+    try process.until("NORMAL [+] | 5:7 | ");
+    try process.ready();
+    try process.send("gd");
+    try process.until("Asking zls...");
+    try process.ready();
+    try landed(&process, "1:8", "b.zig");
+    // ZLS reports the one call left where Nib has it.
+    try process.send("\x0f");
+    try process.until("NORMAL [+] | 5:7 | ");
+    try process.ready();
+    try process.send("grr");
+    try process.until("[Locations]");
+    try process.until("2/2 rows");
+    try process.until("a.zig:5:7  b.target();");
+    try process.ready();
+    try process.send("\x03");
+    try process.until("LIST | ");
+    try process.ready();
+    try process.send(":");
+    try process.until("\x1b[0;7m:");
+    try process.ready();
+    try process.send("qa!\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
+}
+
+// Covers a missing zls: the lexer's colours show and nothing is said until a
+// navigation key asks for it.
+fn missingServerColours(executable: [:0]const u8) !void {
+    var project: ZigProject = .{};
+    try project.create("missing");
+    defer project.remove();
+    // A `PATH` holding only Git, for the finder's root.
+    var bin_storage: [160]u8 = undefined;
+    const bin = try std.fmt.bufPrintSentinel(&bin_storage, "{s}/bin", .{project.directory}, 0);
+    _ = try checked(linux.mkdir(bin, 0o700));
+    var git_storage: [192]u8 = undefined;
+    const git = try std.fmt.bufPrintSentinel(&git_storage, "{s}/git", .{bin}, 0);
+    _ = try checked(linux.symlink(helpers.git, git));
+    var entry_storage: [192]u8 = undefined;
+    const entry = try std.fmt.bufPrintSentinel(&entry_storage, "PATH={s}", .{bin}, 0);
+    var process = try Process.start(executable, .{
+        .path = project.a,
+        .cwd = project.directory,
+        .path_entry = entry,
+    });
+    defer process.close();
+    try process.until("\x1b[0;35mconst\x1b[m b = \x1b[0;34m@import\x1b[m");
+    try process.ready();
+    _ = try process.read(300);
+    try process.excludes("zls");
+    try process.send("gd");
+    try process.until("zls not found");
+    try process.ready();
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }

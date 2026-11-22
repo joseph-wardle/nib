@@ -86,16 +86,20 @@ pub fn main(init: std.process.Init) !void {
             // every content row and the status row, then again with every
             // visible row selected by `V`.
             buffer.cursor = origin;
-            try render(init.gpa, init.io, &buffer, "fixture.zig", null, false, "render 50x200");
+            try render(init.gpa, init.io, &buffer, "fixture.zig", null, .none, "render 50x200");
             const tagged = "render 50x200, server tokens";
-            try render(init.gpa, init.io, &buffer, "fixture.zig", null, true, tagged);
+            try render(init.gpa, init.io, &buffer, "fixture.zig", null, .current, tagged);
+            const shifted = "render 50x200, server tokens shifted a row";
+            try render(init.gpa, init.io, &buffer, "fixture.zig", null, .shifted, shifted);
             const plain = "render 50x200, plain text";
-            try render(init.gpa, init.io, &buffer, "fixture.txt", null, false, plain);
+            try render(init.gpa, init.io, &buffer, "fixture.txt", null, .none, plain);
             const selected = "render 50x200, all selected";
-            try render(init.gpa, init.io, &buffer, "fixture.zig", 0, false, selected);
+            try render(init.gpa, init.io, &buffer, "fixture.zig", 0, .none, selected);
             for ([_][]const u8{ line.found, line.missing }) |query| {
                 incremental(init.io, &buffer, origin, query);
             }
+            try decode(init.gpa, init.io, &buffer);
+            if (!long) try change(init.gpa, init.io, &buffer);
         }
     }
     // The largest file Nib loads; the missing query's first letter is common.
@@ -105,14 +109,16 @@ pub fn main(init: std.process.Init) !void {
     defer buffer.deinit(init.gpa);
     std.debug.print("ASCII 8 MiB source, {d} bytes, cursor at the start:\n", .{large.len});
     incremental(init.io, &buffer, 0, lines[0].missing);
+    try change(init.gpa, init.io, &buffer);
 }
 
 /// One frame of the editor view at `rows` content rows by `columns` of a
 /// document at `path`, which decides its colours, the cursor where `buffer` has
 /// it and the view following it as the app does. With an `anchor`, a linewise
-/// selection runs from it to the cursor. With `tokens`, every identifier in
-/// view has a server token, in turn a field, a function and plain, as a range
-/// answer would. Reports the frame's bytes; nothing is
+/// selection runs from it to the cursor. With server `tokens`, every identifier
+/// in view has one, in turn a field, a function and plain, as a range answer
+/// would; shifted, they are a row behind the text, as after an edit that joined
+/// the top row with the one below before the next answer. Reports the frame's bytes; nothing is
 /// written to a terminal.
 fn render(
     gpa: std.mem.Allocator,
@@ -120,7 +126,7 @@ fn render(
     buffer: *const Buffer,
     path: []const u8,
     anchor: ?usize,
-    tokens: bool,
+    tokens: Tokens,
     name: []const u8,
 ) !void {
     const size: nib.terminal.Size = .{ .rows = rows + 1, .columns = columns + 1 };
@@ -134,7 +140,17 @@ fn render(
     };
     entry.viewport.follow(buffer, rows, nib.editor_view.contentWidth(size, buffer), false);
     defer entry.tokens.deinit(gpa);
-    if (tokens) try tag(gpa, buffer, &entry);
+    if (tokens != .none) try tag(gpa, buffer, &entry);
+    if (tokens == .shifted) {
+        // The top row was two rows when the tokens were asked; the rest moved up.
+        const count = buffer.insertionRows();
+        const top = entry.viewport.top;
+        entry.document.buffer.changed_rows = .{ .lines = .{
+            .first = top,
+            .unchanged = count - top - 1,
+            .rows = count + 1,
+        } };
+    }
     var editor: Editor = .{};
     if (anchor) |offset| {
         editor.parser.visual = .linewise;
@@ -181,6 +197,9 @@ fn incremental(io: std.Io, buffer: *Buffer, origin: usize, query: []const u8) vo
     var name: [64]u8 = undefined;
     summary(std.fmt.bufPrint(&name, "search \"{s}\"", .{query}) catch unreachable, &times);
 }
+
+/// A frame's server tokens: none, matching the text, or a row behind it.
+const Tokens = enum { none, current, shifted };
 
 const samples = 1000;
 const rows = 50;
@@ -232,4 +251,95 @@ fn tag(gpa: std.mem.Allocator, buffer: *const Buffer, entry: *session.Entry) !vo
     }
     // The buffer's text is the tokens' text.
     entry.document.buffer.changed_rows = .none;
+}
+
+/// Decoding a range answer for the rows in view, as the app does when it
+/// arrives: every identifier a token, in turn a property, a function and a
+/// variable, encoded as ZLS sends them. Reports the answer's bytes.
+fn decode(gpa: std.mem.Allocator, io: std.Io, buffer: *const Buffer) !void {
+    var viewport: Viewport = .{};
+    viewport.follow(buffer, rows, columns, false);
+    const top = viewport.top;
+    const bottom = @min(buffer.insertionRows(), top + rows);
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const writer = &body.writer;
+    try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"data\":[");
+    var count: usize = 0;
+    var line: usize = 0;
+    var start: usize = 0;
+    for (top..bottom) |row| {
+        const text = buffer.line(row);
+        var position: usize = 0;
+        while (position < text.len) {
+            const first = position;
+            while (position < text.len and std.ascii.isAlphabetic(text[position])) position += 1;
+            if (position == first) {
+                position += 1;
+                continue;
+            }
+            const lines = row - line;
+            const column = if (lines == 0) first - start else first;
+            if (count != 0) try writer.writeByte(',');
+            try writer.print("{d},{d},{d},{d},0", .{ lines, column, position - first, count % 3 });
+            line = row;
+            start = first;
+            count += 1;
+        }
+    }
+    try writer.writeAll("]}}");
+    const legend: nib.protocol.Legend = .init(&.{ "property", "function", "variable" });
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var times: [samples]i96 = undefined;
+    for (&times) |*elapsed| {
+        _ = arena.reset(.retain_capacity);
+        const before = std.Io.Timestamp.now(io, .awake);
+        var held = (try nib.protocol.tokensReply(
+            gpa,
+            arena.allocator(),
+            body.written(),
+            &legend,
+            .utf8,
+            buffer,
+            .none,
+            top,
+            bottom,
+        )).?;
+        const after = std.Io.Timestamp.now(io, .awake);
+        held.deinit(gpa);
+        elapsed.* = before.durationTo(after).toNanoseconds();
+    }
+    var label: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&label, "decode {d} tokens, {d} bytes", .{ count, body.written().len });
+    summary(name catch unreachable, &times);
+}
+
+/// Queueing the `didChange` for an edit of one middle line, as changed
+/// lines and as the whole text. Reports each message's bytes.
+fn change(gpa: std.mem.Allocator, io: std.Io, buffer: *const Buffer) !void {
+    const count = buffer.insertionRows();
+    const middle = count / 2;
+    const record: nib.buffer.ChangedRows = .{ .lines = .{
+        .first = middle,
+        .unchanged = count - middle - 1,
+        .rows = count,
+    } };
+    var queue: std.ArrayList(u8) = .empty;
+    defer queue.deinit(gpa);
+    for ([_]nib.buffer.ChangedRows{ record, .whole }) |changed| {
+        var times: [samples]i96 = undefined;
+        for (&times) |*elapsed| {
+            queue.clearRetainingCapacity();
+            const before = std.Io.Timestamp.now(io, .awake);
+            const text = nib.protocol.textChange(buffer, changed).?;
+            try nib.protocol.didChange(gpa, &queue, "/p/fixture.zig", 1, text);
+            const after = std.Io.Timestamp.now(io, .awake);
+            elapsed.* = before.durationTo(after).toNanoseconds();
+        }
+        var label: [64]u8 = undefined;
+        const kind = if (changed == .whole) "whole text" else "changed line";
+        const name = std.fmt.bufPrint(&label, "didChange, {s}, {d} bytes", .{ kind, queue.items.len });
+        summary(name catch unreachable, &times);
+    }
 }
