@@ -10,21 +10,42 @@ pub const Position = struct { line: u32, character: u32 };
 /// character boundary that `character` names. A column past the text gives its
 /// end, and one inside a character gives that character's start.
 pub fn column(line: []const u8, character: u32, encoding: Encoding) usize {
-    switch (encoding) {
-        .utf8 => return char.start(line, @min(character, line.len)),
-        .utf16 => {
-            var cursor: usize = 0;
-            var units: usize = 0;
-            while (cursor < line.len) {
-                const decoded = char.decode(line, cursor);
-                units += units16(decoded);
-                if (units > character) break;
-                cursor += decoded.len;
-            }
-            return cursor;
-        },
-    }
+    var columns: Columns = .init(line, encoding);
+    return columns.at(character);
 }
+
+/// Finds columns in one line as `column` does, each UTF-16 one counted on
+/// from the last found, so columns found in order cost one walk over the
+/// line. Borrows `line`.
+pub const Columns = struct {
+    line: []const u8,
+    encoding: Encoding,
+    /// The last boundary found, and the UTF-16 units before it.
+    byte: usize = 0,
+    units: usize = 0,
+
+    pub fn init(line: []const u8, encoding: Encoding) Columns {
+        return .{ .line = line, .encoding = encoding };
+    }
+
+    pub fn at(self: *Columns, character: u32) usize {
+        const line = self.line;
+        switch (self.encoding) {
+            .utf8 => return char.start(line, @min(character, line.len)),
+            .utf16 => {
+                if (character < self.units) self.* = .init(line, .utf16);
+                while (self.byte < line.len) {
+                    const decoded = char.decode(line, self.byte);
+                    const units = units16(decoded);
+                    if (self.units + units > character) break;
+                    self.units += units;
+                    self.byte += decoded.len;
+                }
+                return self.byte;
+            },
+        }
+    }
+};
 
 /// The position of a character boundary `at` in `buffer`.
 pub fn position(buffer: *const Buffer, at: usize, encoding: Encoding) Position {
@@ -156,5 +177,15 @@ test "a column is found from one line's text alone" {
     for ([_]Encoding{ .utf8, .utf16 }) |encoding| {
         try testing.expectEqual(@as(usize, 0), column("", 5, encoding));
         try testing.expectEqual(@as(usize, 2), column("\xff\xfex", 2, encoding));
+    }
+}
+
+test "columns found in order or out of order agree with columns found alone" {
+    const line = "a\xc3\xa9\xf0\x9f\x98\x80b\tc";
+    for ([_]Encoding{ .utf8, .utf16 }) |encoding| {
+        var columns: Columns = .init(line, encoding);
+        for ([_]u32{ 0, 1, 2, 3, 3, 4, 9, 2, 0, 5, 99, 6 }) |character| {
+            try testing.expectEqual(column(line, character, encoding), columns.at(character));
+        }
     }
 }

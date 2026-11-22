@@ -252,7 +252,7 @@ pub const Client = struct {
         for (self.documents.items) |*document| {
             if (document.key != key) continue;
             if (document.version == version) return;
-            try protocol.didChange(gpa, &self.queue, path, version, text);
+            try protocol.didChange(gpa, &self.queue, path, version, .{ .range = null, .text = text });
             document.version = version;
             return self.flush(gpa, io);
         }
