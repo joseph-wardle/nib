@@ -428,11 +428,12 @@ const App = struct {
             const document = &entry.document;
             const path = document.source.path;
             if (!document.buffer.editable or client.serverFor(path) != index) continue;
-            const buffer = &document.buffer;
             const key = @backingInt(entry.id);
-            server.sync(self.gpa, self.io, key, path, buffer.changes, buffer.bytes()) catch {
+            const taken = server.sync(self.gpa, self.io, key, path, &document.buffer) catch {
                 return false;
             };
+            // The held tokens now trail the buffer by this as well.
+            entry.tokens.changed = entry.tokens.changed.then(taken);
         }
         return true;
     }

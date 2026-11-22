@@ -396,6 +396,8 @@ pub fn classify(arena: Allocator, body: []const u8) Error!Message {
 pub const Capabilities = struct {
     encoding: Encoding,
     offers: std.EnumSet(Navigation),
+    /// Whether it takes changed lines; otherwise each change is the whole text.
+    incremental: bool = false,
     /// How its token types draw, when it offers tokens for a range of rows.
     legend: ?Legend = null,
 };
@@ -413,6 +415,7 @@ pub fn initializeReply(arena: Allocator, body: []const u8) Error!Initialized {
         typeDefinitionProvider: Provider = .{},
         implementationProvider: Provider = .{},
         referencesProvider: Provider = .{},
+        textDocumentSync: ?std.json.Value = null,
         semanticTokensProvider: ?std.json.Value = null,
     };
     const Reply = struct {
@@ -437,7 +440,22 @@ pub fn initializeReply(arena: Allocator, body: []const u8) Error!Initialized {
         .references = offered.referencesProvider.offered,
     });
     const legend = if (offered.semanticTokensProvider) |tokens| offeredLegend(tokens) else null;
-    return .{ .capabilities = .{ .encoding = encoding, .offers = offers, .legend = legend } };
+    return .{ .capabilities = .{
+        .encoding = encoding,
+        .offers = offers,
+        .incremental = if (offered.textDocumentSync) |sync| offersIncremental(sync) else false,
+        .legend = legend,
+    } };
+}
+
+/// Whether a `textDocumentSync`, a kind or options naming one, is
+/// incremental (2). Any other value gets whole texts, which every kind takes.
+fn offersIncremental(sync: std.json.Value) bool {
+    const kind = switch (sync) {
+        .object => |options| options.get("change") orelse return false,
+        else => sync,
+    };
+    return kind == .integer and kind.integer == 2;
 }
 
 /// The legend of a `semanticTokensProvider` that offers ranges, or null for
@@ -491,7 +509,7 @@ pub const Legend = struct {
 
     pub const max_kinds = 64;
 
-    fn init(names: []const []const u8) Legend {
+    pub fn init(names: []const []const u8) Legend {
         var legend: Legend = .{};
         const count = @min(names.len, max_kinds);
         for (names[0..count], legend.kinds[0..count]) |name, *slot| {
@@ -1072,15 +1090,31 @@ test "initialize replies give the position encoding and the offered navigation" 
     try testing.expect(zls.capabilities.offers.contains(.definition));
     try testing.expect(!zls.capabilities.offers.contains(.implementation));
     try testing.expect(zls.capabilities.offers.contains(.references));
+    try testing.expect(zls.capabilities.incremental);
     // As slangd 1.8 answers, abridged: UTF-16 by name, definitions as options.
     const slangd = try initializeReply(gpa,
-        \\{"id":1,"result":{"capabilities":{"positionEncoding":"utf-16","definitionProvider":{"workDoneProgress":false},"declarationProvider":null}}}
+        \\{"id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"change":2},"definitionProvider":{"workDoneProgress":false},"declarationProvider":null}}}
     );
     try testing.expectEqual(Encoding.utf16, slangd.capabilities.encoding);
     try testing.expect(slangd.capabilities.offers.eql(.initOne(.definition)));
+    try testing.expect(slangd.capabilities.incremental);
     const unnamed = try initializeReply(gpa, "{\"id\":1,\"result\":{\"capabilities\":{}}}");
     try testing.expectEqual(Encoding.utf16, unnamed.capabilities.encoding);
     try testing.expect(unnamed.capabilities.offers.eql(.empty));
+    try testing.expect(!unnamed.capabilities.incremental);
+    // A bare kind counts; full (1), none (0) and odd values get whole texts.
+    const cases = [_]struct { []const u8, bool }{
+        .{ "2", true },               .{ "1", false },                    .{ "0", false },
+        .{ "{\"change\":1}", false }, .{ "{\"openClose\":true}", false }, .{ "\"2\"", false },
+        .{ "null", false },
+    };
+    for (cases) |case| {
+        const body = try std.fmt.allocPrint(gpa,
+            \\{{"id":1,"result":{{"capabilities":{{"textDocumentSync":{s}}}}}}}
+        , .{case[0]});
+        const reply = try initializeReply(gpa, body);
+        try testing.expectEqual(case[1], reply.capabilities.incremental);
+    }
     const failed = try initializeReply(gpa,
         \\{"id":1,"error":{"code":-32603,"message":"no root"}}
     );

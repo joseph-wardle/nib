@@ -5,6 +5,9 @@ const linux = std.os.linux;
 const posix = std.posix;
 const protocol = @import("protocol.zig");
 const Position = @import("position.zig").Position;
+const Buffer = @import("../text/buffer.zig").Buffer;
+const ChangedRows = @import("../text/buffer.zig").ChangedRows;
+const syntax = @import("../text/syntax.zig");
 
 /// A language's server, fixed in the source.
 pub const Server = struct {
@@ -40,6 +43,9 @@ pub const Change = struct {
     initialized: bool = false,
     /// The pending request was answered; see `answer`.
     answered: bool = false,
+    /// The token request was answered, so another may be sent; `tokens`
+    /// decodes the answer unless it was dropped as stale.
+    tokens: bool = false,
     /// The server is gone and has been reaped.
     exited: bool = false,
 };
@@ -63,6 +69,19 @@ pub const Document = struct {
     version: u64,
 };
 
+/// A token request: rows `top` up to `bottom` of document `key` at the
+/// version the server had when it was asked.
+pub const TokenRequest = struct {
+    id: u32,
+    key: u64,
+    version: u64,
+    top: usize,
+    bottom: usize,
+    /// Its document was closed on the server since, so the answer is dropped
+    /// even if the key opens again at the same version.
+    closed: bool = false,
+};
+
 /// Owns its process and buffers. Call `deinit`, which kills the server.
 pub const Client = struct {
     server: *const Server,
@@ -79,6 +98,11 @@ pub const Client = struct {
     /// The last answer to a pending request
     answer: ?protocol.Answer = null,
     answer_memory: std.heap.ArenaAllocator.State = .init,
+    /// The one token request awaiting an answer, independent of `pending`.
+    token_request: ?TokenRequest = null,
+    /// The request whose answer is in `token_reply`, until `tokens` takes it.
+    token_answered: ?TokenRequest = null,
+    token_reply: std.ArrayList(u8) = .empty,
     /// What the running server has open; empty until initialized.
     documents: std.ArrayList(Document) = .empty,
 
@@ -87,6 +111,7 @@ pub const Client = struct {
         self.queue.deinit(gpa);
         self.reader.deinit(gpa);
         self.answer_memory.promote(gpa).deinit();
+        self.token_reply.deinit(gpa);
         self.forgetAll(gpa);
         self.documents.deinit(gpa);
         self.* = undefined;
@@ -224,6 +249,11 @@ pub const Client = struct {
                         self.answer = try protocol.navigationReply(memory.allocator(), body);
                         self.pending = null;
                         result.answered = true;
+                    } else if (self.token_request) |request| {
+                        if (request.id != id) continue;
+                        self.token_request = null;
+                        result.tokens = true;
+                        if (self.current(request)) self.keepTokens(gpa, request, body);
                     }
                 },
             }
@@ -231,37 +261,97 @@ pub const Client = struct {
         return result;
     }
 
+    /// Whether the server still has the text `request` was asked about.
+    fn current(self: *const Client, request: TokenRequest) bool {
+        if (request.closed) return false;
+        for (self.documents.items) |document| {
+            if (document.key == request.key) return document.version == request.version;
+        }
+        return false;
+    }
+
+    /// Keeps a token answer for `tokens`. Tokens are optional, so without
+    /// memory the answer is dropped and the server kept.
+    fn keepTokens(self: *Client, gpa: Allocator, request: TokenRequest, body: []const u8) void {
+        self.token_answered = null;
+        self.token_reply.clearRetainingCapacity();
+        self.token_reply.appendSlice(gpa, body) catch return;
+        self.token_answered = request;
+    }
+
+    /// Decodes the token answer for `buffer`, the text of the document it
+    /// was asked about, into a new set in the server's rows, which
+    /// `Held.row` maps through the buffer's record; and gives up the answer.
+    /// Null when there is no answer or the server failed the request. Call
+    /// it before that document is synced again.
+    pub fn tokens(self: *Client, gpa: Allocator, buffer: *const Buffer) protocol.Error!?syntax.Held {
+        const request = self.token_answered orelse return null;
+        defer {
+            self.token_answered = null;
+            // Keep a small answer's memory; give back a large one's.
+            if (self.token_reply.capacity > 1024 * 1024) self.token_reply.clearAndFree(gpa);
+        }
+        const capabilities = self.capabilities.?;
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        // No sync since the request, so the buffer's record holds every
+        // change since the server's text.
+        return protocol.tokensReply(
+            gpa,
+            scratch.allocator(),
+            self.token_reply.items,
+            &capabilities.legend.?,
+            capabilities.encoding,
+            buffer,
+            buffer.changed_rows,
+            request.top,
+            request.bottom,
+        );
+    }
+
     // The writers below need an initialized server. Each queues a message
     // and writes what the server takes now; on running out of memory the
     // queue is unchanged and the error is returned. A server that dies on
     // the write is stopped, so the caller checks `state` afterwards.
 
-    /// Opens the document `key` names, or sends its text again when
-    /// `version` differs from what the server has. On running out of memory
-    /// nothing is sent or recorded.
+    /// Opens the document `key` names with `buffer`'s text, or, when the
+    /// buffer's `changes` differ from the version the server has, sends the
+    /// lines its record names, or its whole text to a server that takes no
+    /// lines. Then resets the record and returns what it held, for records
+    /// of the server's text kept elsewhere. On running out of memory nothing
+    /// is sent, reset or recorded.
     pub fn sync(
         self: *Client,
         gpa: Allocator,
         io: std.Io,
         key: u64,
         path: []const u8,
-        version: u64,
-        text: []const u8,
-    ) Allocator.Error!void {
-        std.debug.assert(self.capabilities != null);
+        buffer: *Buffer,
+    ) Allocator.Error!ChangedRows {
+        const capabilities = self.capabilities.?;
+        const version = buffer.changes;
+        const taken = buffer.changed_rows;
         for (self.documents.items) |*document| {
             if (document.key != key) continue;
-            if (document.version == version) return;
-            try protocol.didChange(gpa, &self.queue, path, version, .{ .range = null, .text = text });
+            if (document.version == version) return .none;
+            const changed: ChangedRows = if (capabilities.incremental) taken else .whole;
+            if (protocol.textChange(buffer, changed)) |change| {
+                try protocol.didChange(gpa, &self.queue, path, version, change);
+            }
             document.version = version;
-            return self.flush(gpa, io);
+            buffer.changed_rows = .none;
+            self.flush(gpa, io);
+            return taken;
         }
         try self.documents.ensureUnusedCapacity(gpa, 1);
         const owned = try gpa.dupe(u8, path);
         errdefer gpa.free(owned);
-        try protocol.didOpen(gpa, &self.queue, path, self.server.language, version, text);
+        const language = self.server.language;
+        try protocol.didOpen(gpa, &self.queue, path, language, version, buffer.bytes());
         self.documents.appendAssumeCapacity(.{ .key = key, .path = owned, .version = version });
+        buffer.changed_rows = .none;
         self.flush(gpa, io);
+        return taken;
     }
 
     /// Closes `documents[index]` on the server and forgets it. On running out
@@ -272,6 +362,38 @@ pub const Client = struct {
         try protocol.didClose(gpa, &self.queue, document.path);
         gpa.free(document.path);
         _ = self.documents.swapRemove(index);
+        if (self.token_request) |*request| {
+            if (request.key == document.key) request.closed = true;
+        }
+        self.flush(gpa, io);
+    }
+
+    /// Asks for the tokens of rows `top` up to `bottom` of the open document
+    /// `key`, whose text has `rows` rows, as the server has it. The server
+    /// must offer a legend, and no token request may be awaiting an answer.
+    pub fn requestTokens(
+        self: *Client,
+        gpa: Allocator,
+        io: std.Io,
+        key: u64,
+        top: usize,
+        bottom: usize,
+        rows: usize,
+    ) Allocator.Error!void {
+        std.debug.assert(self.capabilities.?.legend != null and self.token_request == null);
+        const document = for (self.documents.items) |document| {
+            if (document.key == key) break document;
+        } else unreachable;
+        const id = self.next_id;
+        try protocol.semanticTokens(gpa, &self.queue, id, document.path, top, bottom, rows);
+        self.next_id += 1;
+        self.token_request = .{
+            .id = id,
+            .key = key,
+            .version = document.version,
+            .top = top,
+            .bottom = bottom,
+        };
         self.flush(gpa, io);
     }
 
@@ -313,6 +435,8 @@ pub const Client = struct {
         self.state = .exited;
         self.capabilities = null;
         self.pending = null;
+        self.token_request = null;
+        self.token_answered = null;
     }
 
     fn exit(self: *Client, io: std.Io) Change {
@@ -353,6 +477,8 @@ pub const Client = struct {
         self.next_id = initialize_id + 1;
         self.pending = null;
         self.answer = null;
+        self.token_request = null;
+        self.token_answered = null;
         self.forgetAll(gpa);
     }
 
@@ -456,45 +582,219 @@ test "a server that refuses to initialize is reported" {
     )));
 }
 
-test "sync opens a document once, resends it only at a new version, and forget closes it" {
+/// Capabilities as ZLS's, with a two-kind legend.
+const test_capabilities: protocol.Capabilities = .{
+    .encoding = .utf8,
+    .offers = .initOne(.definition),
+    .incremental = true,
+    .legend = .init(&.{ "function", "property" }),
+};
+
+test "sync opens a document whole once, then sends its changed lines at each new version" {
     var client: Client = .{ .server = &servers[0] };
     defer client.deinit(testing.allocator, testing.io);
-    client.capabilities = .{ .encoding = .utf8, .offers = .empty };
+    client.capabilities = test_capabilities;
+    var buffer = try Buffer.fromBytes(testing.allocator, "a\nb\n");
+    defer buffer.deinit(testing.allocator);
     var storage: [4096]u8 = undefined;
-    try client.sync(testing.allocator, testing.io, 7, "/p/a.zig", 0, "a");
-    try client.sync(testing.allocator, testing.io, 7, "/p/a.zig", 0, "a");
-    try client.sync(testing.allocator, testing.io, 7, "/p/a.zig", 2, "ab");
-    try client.forget(testing.allocator, testing.io, 0);
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try testing.expectEqual(ChangedRows.whole, try client.sync(gpa, io, 7, "/p/a.zig", &buffer));
+    try testing.expectEqual(ChangedRows.none, buffer.changed_rows);
+    try testing.expectEqual(ChangedRows.none, try client.sync(gpa, io, 7, "/p/a.zig", &buffer));
+    try buffer.replace(gpa, .{ .start = 2, .end = 3 }, "c", 3);
+    const one: ChangedRows = .{ .lines = .{ .first = 1, .unchanged = 1, .rows = 3 } };
+    try testing.expectEqual(one, try client.sync(gpa, io, 7, "/p/a.zig", &buffer));
+    try testing.expectEqual(ChangedRows.none, buffer.changed_rows);
+    // A server that takes no lines gets the whole text, and the record is
+    // still taken.
+    client.capabilities.?.incremental = false;
+    try buffer.replace(gpa, .{ .start = 0, .end = 1 }, "d", 1);
+    const first: ChangedRows = .{ .lines = .{ .first = 0, .unchanged = 2, .rows = 3 } };
+    try testing.expectEqual(first, try client.sync(gpa, io, 7, "/p/a.zig", &buffer));
+    try client.forget(gpa, io, 0);
     try testing.expectEqualStrings(
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///p/a.zig","languageId":"zig","version":0,"text":"a"}}}
-        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///p/a.zig","version":2},"contentChanges":[{"text":"ab"}]}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///p/a.zig","languageId":"zig","version":0,"text":"a\nb\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///p/a.zig","version":1},"contentChanges":[{"range":{"start":{"line":1,"character":0},"end":{"line":2,"character":0}},"text":"c\n"}]}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///p/a.zig","version":2},"contentChanges":[{"text":"d\nc\n"}]}}
         \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///p/a.zig"}}}
         \\
     , try queued(&client, &storage));
     try testing.expectEqual(@as(usize, 0), client.documents.items.len);
 }
 
-test "a sync that runs out of memory sends and records nothing" {
+test "a sync that runs out of memory sends, resets and records nothing" {
     const Case = struct {
         fn run(gpa: Allocator) !void {
             var client: Client = .{ .server = &servers[0] };
             defer client.deinit(gpa, testing.io);
-            client.capabilities = .{ .encoding = .utf8, .offers = .empty };
-            try client.sync(gpa, testing.io, 1, "/p/a.zig", 0, "a");
+            client.capabilities = test_capabilities;
+            var a = try Buffer.fromBytes(gpa, "a\nb\n");
+            defer a.deinit(gpa);
+            var b = try Buffer.fromBytes(gpa, "b");
+            defer b.deinit(gpa);
+            _ = try client.sync(gpa, testing.io, 1, "/p/a.zig", &a);
             const before = client.queue.items.len;
-            client.sync(gpa, testing.io, 2, "/p/b.zig", 0, "b") catch |err| {
+            _ = client.sync(gpa, testing.io, 2, "/p/b.zig", &b) catch |err| {
                 try testing.expectEqual(before, client.queue.items.len);
                 try testing.expectEqual(@as(usize, 1), client.documents.items.len);
+                try testing.expectEqual(ChangedRows.whole, b.changed_rows);
                 return err;
             };
-            client.sync(gpa, testing.io, 1, "/p/a.zig", 1, "aa") catch |err| {
+            try a.replace(gpa, .{ .start = 2, .end = 3 }, "c", 3);
+            const record = a.changed_rows;
+            // No room kept, so queueing the change must allocate.
+            client.queue.clearAndFree(gpa);
+            const changed = client.queue.items.len;
+            _ = client.sync(gpa, testing.io, 1, "/p/a.zig", &a) catch |err| {
+                try testing.expectEqual(changed, client.queue.items.len);
                 try testing.expectEqual(@as(u64, 0), client.documents.items[0].version);
+                try testing.expectEqual(record, a.changed_rows);
                 return err;
             };
             client.forget(gpa, testing.io, 0) catch |err| {
                 try testing.expectEqual(@as(usize, 2), client.documents.items.len);
                 return err;
             };
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
+}
+
+test "a sync that ran out of memory sends the same lines when tried again" {
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(gpa, testing.io);
+    client.capabilities = test_capabilities;
+    var buffer = try Buffer.fromBytes(gpa, "a\nb\nc\n");
+    defer buffer.deinit(gpa);
+    _ = try client.sync(gpa, testing.io, 1, "/p/a.zig", &buffer);
+    try buffer.replace(gpa, .{ .start = 2, .end = 3 }, "x", 3);
+    client.queue.clearAndFree(gpa);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try testing.expectError(error.OutOfMemory, client.sync(gpa, testing.io, 1, "/p/a.zig", &buffer));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    _ = try client.sync(gpa, testing.io, 1, "/p/a.zig", &buffer);
+    var storage: [1024]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///p/a.zig","version":1},"contentChanges":[{"range":{"start":{"line":1,"character":0},"end":{"line":2,"character":0}},"text":"x\n"}]}}
+        \\
+    , try queued(&client, &storage));
+}
+
+test "the token lane and the navigation lane each get only their own answers" {
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(testing.allocator, testing.io);
+    client.capabilities = test_capabilities;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var buffer = try Buffer.fromBytes(gpa, "ab cd\nef\n");
+    defer buffer.deinit(gpa);
+    _ = try client.sync(gpa, io, 7, "/p/a.zig", &buffer);
+    client.queue.clearRetainingCapacity();
+    try client.requestTokens(gpa, io, 7, 0, 3, 3);
+    try client.navigate(gpa, io, .definition, "/p/a.zig", .{ .line = 0, .character = 0 });
+    var storage: [4096]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/semanticTokens/range","params":{"textDocument":{"uri":"file:///p/a.zig"},"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":2147483647}}}}
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///p/a.zig"},"position":{"line":0,"character":0}}}
+        \\
+    , try queued(&client, &storage));
+    // Cancelling navigation leaves the token request waiting.
+    client.cancel(gpa, io);
+    try testing.expectEqual(@as(u32, 2), client.token_request.?.id);
+    try testing.expectEqual(Change{}, try client.receive(gpa, framed(
+        \\{"jsonrpc":"2.0","id":3,"result":null}
+    )));
+    try client.navigate(gpa, io, .definition, "/p/a.zig", .{ .line = 1, .character = 0 });
+    // Edits after the request, not yet synced, move the answer's rows.
+    try buffer.replace(gpa, .{ .start = 0, .end = 0 }, "new\n", 4);
+    // "ab" a function on row 0, "ef" a property on row 1.
+    const tokens = try client.receive(gpa, framed(
+        \\{"jsonrpc":"2.0","id":2,"result":{"data":[0,0,2,0,0,1,0,2,1,0]}}
+    ));
+    try testing.expectEqual(Change{ .tokens = true }, tokens);
+    try testing.expectEqual(@as(?u32, 4), client.pending);
+    try testing.expectEqual(null, client.token_request);
+    var held = (try client.tokens(gpa, &buffer)).?;
+    defer held.deinit(gpa);
+    try testing.expectEqual(null, try client.tokens(gpa, &buffer));
+    const rows = buffer.insertionRows();
+    // The first row was rewritten; the second moved down one.
+    try testing.expectEqual(@as(usize, 0), held.row(buffer.changed_rows, rows, 0).len);
+    try testing.expectEqual(@as(usize, 0), held.row(buffer.changed_rows, rows, 1).len);
+    const moved = held.row(buffer.changed_rows, rows, 2);
+    try testing.expectEqual(@as(usize, 1), moved.len);
+    try testing.expectEqual(syntax.Tagged{ .start = 0, .end = 2, .kind = .field }, moved[0]);
+    try testing.expectEqual(Change{ .answered = true }, try client.receive(gpa, framed(
+        \\{"jsonrpc":"2.0","id":4,"result":null}
+    )));
+    // An error answer frees the lane and decodes to none.
+    try client.requestTokens(gpa, io, 7, 0, 1, 3);
+    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, framed(
+        \\{"jsonrpc":"2.0","id":5,"error":{"code":-32801,"message":"content modified"}}
+    )));
+    try testing.expectEqual(null, try client.tokens(gpa, &buffer));
+}
+
+test "a token answer is dropped once a newer version or another document was sent" {
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(testing.allocator, testing.io);
+    client.capabilities = test_capabilities;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var buffer = try Buffer.fromBytes(gpa, "ab\n");
+    defer buffer.deinit(gpa);
+    _ = try client.sync(gpa, io, 7, "/p/a.zig", &buffer);
+    const reply = "\"result\":{\"data\":[0,0,2,0,0]}}";
+    // Newer text sent after the request.
+    try client.requestTokens(gpa, io, 7, 0, 1, 2);
+    try buffer.replace(gpa, .{ .start = 0, .end = 0 }, "x", 1);
+    _ = try client.sync(gpa, io, 7, "/p/a.zig", &buffer);
+    const newer = framed("{\"jsonrpc\":\"2.0\",\"id\":2," ++ reply);
+    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, newer));
+    try testing.expectEqual(null, client.token_answered);
+    try testing.expectEqual(null, try client.tokens(gpa, &buffer));
+    // Closed, then opened again under the same key at the same version.
+    try client.requestTokens(gpa, io, 7, 0, 1, 2);
+    try client.forget(gpa, io, 0);
+    _ = try client.sync(gpa, io, 7, "/p/b.zig", &buffer);
+    const reopened = framed("{\"jsonrpc\":\"2.0\",\"id\":3," ++ reply);
+    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, reopened));
+    try testing.expectEqual(null, client.token_answered);
+    // The same document at the same version keeps its answer.
+    try client.requestTokens(gpa, io, 7, 0, 1, 2);
+    const kept = framed("{\"jsonrpc\":\"2.0\",\"id\":4," ++ reply);
+    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, kept));
+    var held = (try client.tokens(gpa, &buffer)).?;
+    defer held.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), held.tokens.items.len);
+}
+
+test "decoding a token answer that runs out of memory gives it up and frees the set" {
+    const Case = struct {
+        fn run(gpa: Allocator) !void {
+            var client: Client = .{ .server = &servers[0] };
+            defer client.deinit(gpa, testing.io);
+            client.capabilities = test_capabilities;
+            var buffer = try Buffer.fromBytes(gpa, "ab cd\nef\n");
+            defer buffer.deinit(gpa);
+            _ = try client.sync(gpa, testing.io, 7, "/p/a.zig", &buffer);
+            try client.requestTokens(gpa, testing.io, 7, 0, 3, 3);
+            const change = try client.receive(gpa, framed(
+                \\{"jsonrpc":"2.0","id":2,"result":{"data":[0,0,2,0,0,0,3,2,0,0,1,0,2,1,0]}}
+            ));
+            try testing.expect(change.tokens);
+            // Keeping the answer gives it up without memory, quietly.
+            if (client.token_answered == null) return error.OutOfMemory;
+            var held = (client.tokens(gpa, &buffer) catch |err| {
+                try testing.expectEqual(null, client.token_answered);
+                return err;
+            }) orelse return;
+            held.deinit(gpa);
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
@@ -516,6 +816,7 @@ fn settle(client: *Client, wanted: *const fn (Change) bool) !Change {
         const change = client.ready(testing.allocator, testing.io, polled);
         seen.initialized = seen.initialized or change.initialized;
         seen.answered = seen.answered or change.answered;
+        seen.tokens = seen.tokens or change.tokens;
         seen.exited = seen.exited or change.exited;
     }
     return seen;
@@ -527,6 +828,10 @@ fn isInitialized(change: Change) bool {
 
 fn isAnswered(change: Change) bool {
     return change.answered;
+}
+
+fn isTokens(change: Change) bool {
+    return change.tokens;
 }
 
 fn isExited(change: Change) bool {
@@ -590,7 +895,9 @@ test "zls initializes with UTF-8 and answers definitions and references" {
     var b_storage: [4096]u8 = undefined;
     const a = try project.path("a.zig", &a_storage);
     const b = try project.path("b.zig", &b_storage);
-    try client.sync(testing.allocator, testing.io, 0, a, 0, Project.a);
+    var buffer = try Buffer.fromBytes(testing.allocator, Project.a);
+    defer buffer.deinit(testing.allocator);
+    _ = try client.sync(testing.allocator, testing.io, 0, a, &buffer);
     // On `target` in the first call.
     const call: Position = .{ .line = 2, .character = 6 };
     try client.navigate(testing.allocator, testing.io, .definition, a, call);
@@ -612,6 +919,68 @@ test "zls initializes with UTF-8 and answers definitions and references" {
     }
 }
 
+test "zls follows changed lines, and answers tokens for a range of them" {
+    var project: Project = undefined;
+    try project.init();
+    defer project.temp.cleanup();
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(testing.allocator, testing.io);
+    try startZls(&client, &project);
+    try testing.expect(client.capabilities.?.incremental);
+    try testing.expect(client.capabilities.?.legend != null);
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var a_storage: [4096]u8 = undefined;
+    var b_storage: [4096]u8 = undefined;
+    const a = try project.path("a.zig", &a_storage);
+    const b = try project.path("b.zig", &b_storage);
+    var buffer = try Buffer.fromBytes(gpa, Project.a);
+    defer buffer.deinit(gpa);
+    _ = try client.sync(gpa, io, 0, a, &buffer);
+    // Two lines added above the first call, synced apart; then the second
+    // call removed, with the text's last line, and synced.
+    const second = buffer.lineStart(3);
+    try buffer.replace(gpa, .{ .start = second, .end = buffer.bytes().len }, "}", second);
+    try buffer.replace(gpa, .{ .start = buffer.lineStart(2), .end = buffer.lineStart(2) }, "    // one\n", 0);
+    _ = try client.sync(gpa, io, 0, a, &buffer);
+    try buffer.replace(gpa, .{ .start = buffer.lineStart(3), .end = buffer.lineStart(3) }, "    // two\n", 0);
+    _ = try client.sync(gpa, io, 0, a, &buffer);
+    try testing.expectEqualStrings(
+        \\const b = @import("b.zig");
+        \\pub fn main() void {
+        \\    // one
+        \\    // two
+        \\    b.target();
+        \\}
+    , buffer.bytes());
+    const call: Position = .{ .line = 4, .character = 6 };
+    try client.navigate(gpa, io, .definition, a, call);
+    _ = try settle(&client, isAnswered);
+    const definition = client.answer.?.locations;
+    try testing.expectEqual(@as(usize, 1), definition.len);
+    try testing.expectEqualStrings(b, definition[0].path.?);
+    const rows = buffer.insertionRows();
+    try client.requestTokens(gpa, io, 0, 1, rows, rows);
+    _ = try settle(&client, isTokens);
+    var held = (try client.tokens(gpa, &buffer)).?;
+    defer held.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), held.top);
+    try testing.expectEqual(rows - 1, held.ends.items.len);
+    // `main` and `target` are functions, the comments comments.
+    const expected = [_]struct { usize, []const u8, syntax.Kind }{
+        .{ 1, "main", .function },
+        .{ 2, "// one", .comment },
+        .{ 4, "target", .function },
+    };
+    for (expected) |case| {
+        const line = buffer.line(case[0]);
+        const found = for (held.row(buffer.changed_rows, rows, case[0])) |token| {
+            if (std.mem.eql(u8, line[token.start..token.end], case[1])) break token;
+        } else return error.TestExpectedToken;
+        try testing.expectEqual(@as(?syntax.Kind, case[2]), found.kind);
+    }
+}
+
 test "a server killed mid-request is reported, and starts again" {
     var project: Project = undefined;
     try project.init();
@@ -621,13 +990,17 @@ test "a server killed mid-request is reported, and starts again" {
     try startZls(&client, &project);
     var storage: [4096]u8 = undefined;
     const a = try project.path("a.zig", &storage);
-    try client.sync(testing.allocator, testing.io, 0, a, 0, Project.a);
+    var buffer = try Buffer.fromBytes(testing.allocator, Project.a);
+    defer buffer.deinit(testing.allocator);
+    _ = try client.sync(testing.allocator, testing.io, 0, a, &buffer);
     const call: Position = .{ .line = 2, .character = 6 };
     try client.navigate(testing.allocator, testing.io, .definition, a, call);
+    try client.requestTokens(testing.allocator, testing.io, 0, 0, 1, buffer.insertionRows());
     _ = linux.kill(-client.state.running.id.?, .KILL);
     _ = try settle(&client, isExited);
     try testing.expect(client.state == .exited);
     try testing.expectEqual(null, client.pending);
+    try testing.expectEqual(null, client.token_request);
     try startZls(&client, &project);
     try testing.expect(client.state == .running);
 }
@@ -647,7 +1020,9 @@ test "a write to a server that has died stops it instead of killing Nib" {
     while (output[0].revents & linux.POLL.HUP == 0) _ = linux.poll(&output, 1, 10_000);
     // Larger than a pipe holds, so the write reaches the closed end.
     const text: [256 * 1024]u8 = @splat('x');
-    try client.sync(testing.allocator, testing.io, 0, "/p/a.zig", 0, &text);
+    var buffer = try Buffer.fromBytes(testing.allocator, &text);
+    defer buffer.deinit(testing.allocator);
+    _ = try client.sync(testing.allocator, testing.io, 0, "/p/a.zig", &buffer);
     try testing.expect(client.state == .exited);
 }
 
