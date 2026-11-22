@@ -189,32 +189,34 @@ const App = struct {
     }
 
     /// Acts on what server `index` just did: reports once, by name, a server
-    /// that exited or refused to start, applies a token answer, sends a
-    /// request that waited for initialization, applies a navigation answer,
-    /// then asks for tokens if they are due. Nothing else is drawn.
+    /// that exited or refused to start, and forgets what its documents were
+    /// last asked for; applies a token answer, sends a request that waited
+    /// for initialization and applies a navigation answer.
+    /// Nothing else is drawn. The loop asks for tokens afterwards.
     fn serverChanged(self: *App, index: usize, change: client.Change) void {
         const server = &self.servers[index];
         const asked = if (self.waiting) |waiting| waiting.server == index else false;
         if (change.exited) {
             if (asked) self.waiting = null;
+            for (self.documents.entries.items) |*entry| {
+                if (client.serverFor(entry.document.source.path) == index) entry.tokens_asked = null;
+            }
             self.unavailable(server);
             self.redraw = true;
             return;
         }
         // Before any sync, which the answer's rows depend on.
-        if (change.tokens) self.applyTokens(server);
-        if (asked) {
-            // A server initializes once per start, before any request is sent.
-            if (change.initialized) {
-                self.send();
-                self.redraw = true;
-            }
-            if (change.answered) {
-                self.arrive(server);
-                self.redraw = true;
-            }
+        self.applyTokens(server);
+        if (!asked) return;
+        // A server initializes once per start, before any request is sent.
+        if (change.initialized) {
+            self.send();
+            self.redraw = true;
         }
-        if (change.initialized or change.tokens) self.askTokens();
+        if (change.answered) {
+            self.arrive(server);
+            self.redraw = true;
+        }
     }
 
     /// Asks the active document's server for the tokens of the rows in
@@ -2150,7 +2152,8 @@ const Navigating = struct {
         try self.feed(try std.fmt.bufPrint(&body, text, .{ id, result }));
     }
 
-    /// Delivers one message from zls, as `serverChanged` gets it from a read.
+    /// Delivers one message from zls, as `serverChanged` gets it from a read,
+    /// then asks for tokens, as the loop does after any event.
     fn feed(self: *Navigating, body: []const u8) !void {
         var message: [4200]u8 = undefined;
         const framed = try std.fmt.bufPrint(&message, "Content-Length: {d}\r\n\r\n{s}", .{
@@ -2159,6 +2162,7 @@ const Navigating = struct {
         });
         const change = try self.app.servers[0].receive(std.testing.allocator, framed);
         self.app.serverChanged(0, change);
+        self.app.askTokens();
     }
 };
 
@@ -3193,4 +3197,34 @@ test "running out of memory while applying a token answer keeps the earlier toke
     }
     try testing.expect(index > 0);
     try testing.expectEqualStrings("const", try fixture.heldText(0, &storage));
+}
+
+test "a server that exits while asked for tokens is asked again once it restarts" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const server = &app.servers[0];
+    fixture.offerTokens();
+    app.askTokens();
+    try fixture.replyTokens("[1,7,4,0,0]");
+    // An edit is asked about, and the server dies before it answers.
+    fixture.keys("dl");
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 2), fixture.tokenRequests());
+    server.state = .exited;
+    server.capabilities = null;
+    server.token_request = null;
+    app.serverChanged(0, .{ .exited = true });
+    // As after a restart: nothing open on a new server, which initializes.
+    for (server.documents.items) |document| testing.allocator.free(document.path);
+    server.documents.clearRetainingCapacity();
+    server.queue.clearRetainingCapacity();
+    server.state = .idle;
+    server.capabilities = .{ .encoding = .utf8, .offers = .full };
+    fixture.offerTokens();
+    app.askTokens();
+    try testing.expectEqual(@as(usize, 1), fixture.tokenRequests());
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), "didOpen") != null);
 }

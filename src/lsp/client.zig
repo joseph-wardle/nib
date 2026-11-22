@@ -43,9 +43,6 @@ pub const Change = struct {
     initialized: bool = false,
     /// The pending request was answered; see `answer`.
     answered: bool = false,
-    /// The token request was answered, so another may be sent; `tokens`
-    /// decodes the answer unless it was dropped as stale.
-    tokens: bool = false,
     /// The server is gone and has been reaped.
     exited: bool = false,
 };
@@ -252,7 +249,6 @@ pub const Client = struct {
                     } else if (self.token_request) |request| {
                         if (request.id != id) continue;
                         self.token_request = null;
-                        result.tokens = true;
                         if (self.current(request)) self.keepTokens(gpa, request, body);
                     }
                 },
@@ -716,7 +712,7 @@ test "the token lane and the navigation lane each get only their own answers" {
     const tokens = try client.receive(gpa, framed(
         \\{"jsonrpc":"2.0","id":2,"result":{"data":[0,0,2,0,0,1,0,2,1,0]}}
     ));
-    try testing.expectEqual(Change{ .tokens = true }, tokens);
+    try testing.expectEqual(Change{}, tokens);
     try testing.expectEqual(@as(?u32, 4), client.pending);
     try testing.expectEqual(null, client.token_request);
     var held = (try client.tokens(gpa, &buffer)).?;
@@ -734,7 +730,7 @@ test "the token lane and the navigation lane each get only their own answers" {
     )));
     // An error answer frees the lane and decodes to none.
     try client.requestTokens(gpa, io, 7, 0, 1, 3);
-    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, framed(
+    try testing.expectEqual(Change{}, try client.receive(gpa, framed(
         \\{"jsonrpc":"2.0","id":5,"error":{"code":-32801,"message":"content modified"}}
     )));
     try testing.expectEqual(null, try client.tokens(gpa, &buffer));
@@ -755,7 +751,7 @@ test "a token answer is dropped once a newer version or another document was sen
     try buffer.replace(gpa, .{ .start = 0, .end = 0 }, "x", 1);
     _ = try client.sync(gpa, io, 7, "/p/a.zig", &buffer);
     const newer = framed("{\"jsonrpc\":\"2.0\",\"id\":2," ++ reply);
-    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, newer));
+    try testing.expectEqual(Change{}, try client.receive(gpa, newer));
     try testing.expectEqual(null, client.token_answered);
     try testing.expectEqual(null, try client.tokens(gpa, &buffer));
     // Closed, then opened again under the same key at the same version.
@@ -763,12 +759,12 @@ test "a token answer is dropped once a newer version or another document was sen
     try client.forget(gpa, io, 0);
     _ = try client.sync(gpa, io, 7, "/p/b.zig", &buffer);
     const reopened = framed("{\"jsonrpc\":\"2.0\",\"id\":3," ++ reply);
-    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, reopened));
+    try testing.expectEqual(Change{}, try client.receive(gpa, reopened));
     try testing.expectEqual(null, client.token_answered);
     // The same document at the same version keeps its answer.
     try client.requestTokens(gpa, io, 7, 0, 1, 2);
     const kept = framed("{\"jsonrpc\":\"2.0\",\"id\":4," ++ reply);
-    try testing.expectEqual(Change{ .tokens = true }, try client.receive(gpa, kept));
+    try testing.expectEqual(Change{}, try client.receive(gpa, kept));
     var held = (try client.tokens(gpa, &buffer)).?;
     defer held.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), held.tokens.items.len);
@@ -784,10 +780,10 @@ test "decoding a token answer that runs out of memory gives it up and frees the 
             defer buffer.deinit(gpa);
             _ = try client.sync(gpa, testing.io, 7, "/p/a.zig", &buffer);
             try client.requestTokens(gpa, testing.io, 7, 0, 3, 3);
-            const change = try client.receive(gpa, framed(
+            _ = try client.receive(gpa, framed(
                 \\{"jsonrpc":"2.0","id":2,"result":{"data":[0,0,2,0,0,0,3,2,0,0,1,0,2,1,0]}}
             ));
-            try testing.expect(change.tokens);
+            try testing.expectEqual(null, client.token_request);
             // Keeping the answer gives it up without memory, quietly.
             if (client.token_answered == null) return error.OutOfMemory;
             var held = (client.tokens(gpa, &buffer) catch |err| {
@@ -800,12 +796,12 @@ test "decoding a token answer that runs out of memory gives it up and frees the 
     try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
 }
 
-/// Polls `client` until `wanted` holds of everything that changed, failing
-/// after ten seconds.
-fn settle(client: *Client, wanted: *const fn (Change) bool) !Change {
+/// Polls `client` until `wanted` holds of it and everything that changed,
+/// failing after ten seconds.
+fn settle(client: *Client, wanted: *const fn (*const Client, Change) bool) !Change {
     var seen: Change = .{};
     var remaining: i32 = 10_000;
-    while (!wanted(seen)) {
+    while (!wanted(client, seen)) {
         var polled = client.descriptors();
         const started = std.Io.Clock.awake.now(testing.io);
         const result = linux.poll(&polled, polled.len, remaining);
@@ -816,25 +812,24 @@ fn settle(client: *Client, wanted: *const fn (Change) bool) !Change {
         const change = client.ready(testing.allocator, testing.io, polled);
         seen.initialized = seen.initialized or change.initialized;
         seen.answered = seen.answered or change.answered;
-        seen.tokens = seen.tokens or change.tokens;
         seen.exited = seen.exited or change.exited;
     }
     return seen;
 }
 
-fn isInitialized(change: Change) bool {
+fn isInitialized(_: *const Client, change: Change) bool {
     return change.initialized;
 }
 
-fn isAnswered(change: Change) bool {
+fn isAnswered(_: *const Client, change: Change) bool {
     return change.answered;
 }
 
-fn isTokens(change: Change) bool {
-    return change.tokens;
+fn isTokenAnswered(client: *const Client, _: Change) bool {
+    return client.token_request == null;
 }
 
-fn isExited(change: Change) bool {
+fn isExited(_: *const Client, change: Change) bool {
     return change.exited;
 }
 
@@ -961,7 +956,7 @@ test "zls follows changed lines, and answers tokens for a range of them" {
     try testing.expectEqualStrings(b, definition[0].path.?);
     const rows = buffer.insertionRows();
     try client.requestTokens(gpa, io, 0, 1, rows, rows);
-    _ = try settle(&client, isTokens);
+    _ = try settle(&client, isTokenAnswered);
     var held = (try client.tokens(gpa, &buffer)).?;
     defer held.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), held.top);
