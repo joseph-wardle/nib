@@ -12,6 +12,7 @@ const jobs = nib.jobs;
 // over generated fixtures of about 1k, 10k and 100k paths, with and without
 // Git. Times are from the request to the completion being applied. "UI" is
 // time spent on the calling thread, which the event loop would also spend.
+// Last, a symbols answer is applied to the finder, as `gO`'s is.
 // Nothing here is a pass/fail gate.
 pub fn main(init: std.process.Init) !void {
     var counting: Counting = .{ .parent = init.gpa };
@@ -25,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
             try cancellation(gpa, io, &fixture, listing);
         }
     }
+    try symbols(gpa, io);
     var usage: linux.rusage = undefined;
     _ = linux.getrusage(linux.rusage.SELF, &usage);
     std.debug.print("process max RSS {d} KiB (all fixtures, excluding Git helpers)\n", .{usage.maxrss});
@@ -341,6 +343,111 @@ const Counting = struct {
         _ = self.live.fetchSub(memory.len, .monotonic);
     }
 };
+
+/// Applying a symbols answer as the app does when it arrives: classifying
+/// and decoding a ZLS-shaped tree (types of ten fields and functions each),
+/// converting each column against its line, and listing the rows in Symbols.
+/// About 240 symbols is `src/app.zig`'s answer; the larger ones are for scale.
+fn symbols(gpa: Allocator, io: Io) !void {
+    std.debug.print("Symbols, from a ZLS-shaped answer to the finder's rows:\n", .{});
+    for ([_]usize{ 24, 240, 2_400 }) |types| {
+        const count = types * 11;
+        var text: std.Io.Writer.Allocating = .init(gpa);
+        defer text.deinit();
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        const reply = &body.writer;
+        try reply.writeAll("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":[");
+        var line: u32 = 0;
+        for (0..types) |type_index| {
+            try text.writer.print("const Type{d} = struct {{\n", .{type_index});
+            if (type_index != 0) try reply.writeByte(',');
+            try symbolJson(reply, "Type", type_index, 14, line, 6);
+            try reply.writeAll(",\"children\":[");
+            for (0..10) |member| {
+                line += 1;
+                try text.writer.print("    pub fn member{d}() void {{}}\n", .{member});
+                if (member != 0) try reply.writeByte(',');
+                try symbolJson(reply, "member", member, 12, line, 11);
+                try reply.writeAll(",\"children\":[]}");
+            }
+            try reply.writeAll("]}");
+            line += 1;
+            try text.writer.writeAll("};\n");
+        }
+        try reply.writeAll("]}");
+        var buffer = try nib.buffer.Buffer.fromBytes(gpa, text.written());
+        defer buffer.deinit(gpa);
+        var background: jobs.Jobs = try .init();
+        defer background.deinit(gpa, io);
+        var finder: Finder = .{};
+        defer finder.deinit(gpa, io);
+        const path = "/p/fixture.zig";
+        const document: nib.finder.DocumentId = @fromBackingInt(@intCast(1));
+        const open = [_]nib.finder.OpenFile{.{ .id = document, .path = path, .used = 1 }};
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var decoding: [samples]u64 = undefined;
+        var listing: [samples]u64 = undefined;
+        for (&decoding, &listing) |*decoded, *listed| {
+            _ = arena.reset(.retain_capacity);
+            const memory = arena.allocator();
+            const start = now(io);
+            // As the client does: once for the id, once for the answer.
+            _ = try nib.protocol.classify(memory, body.written());
+            const answer = try nib.protocol.symbolsReply(memory, body.written());
+            const middle = now(io);
+            const rows = try memory.alloc(nib.finder.Symbol, answer.symbols.len);
+            for (answer.symbols, rows) |symbol, *row| {
+                const at = buffer.line(symbol.at.line);
+                row.* = .{
+                    .name = symbol.name,
+                    .kind = nib.protocol.kindName(symbol.kind),
+                    .line = symbol.at.line,
+                    .column = @intCast(nib.position.column(at, symbol.at.character, .utf8)),
+                    .start = buffer.lineStart(symbol.at.line),
+                };
+            }
+            try finder.outline(gpa, io, &background, path, rows, 0, &open);
+            const end = now(io);
+            decoded.* = middle - start;
+            listed.* = end - middle;
+        }
+        std.debug.assert(finder.matches.len == count);
+        std.debug.print("  {d} symbols, {d} bytes:\n", .{ count, body.written().len });
+        report("decode", &decoding);
+        report("rows and list", &listing);
+    }
+}
+
+const samples = 200;
+
+fn symbolJson(
+    writer: *std.Io.Writer,
+    prefix: []const u8,
+    index: usize,
+    kind: u32,
+    line: u32,
+    column: u32,
+) !void {
+    const end = column + 8;
+    const at = "{{\"line\":{d},\"character\":{d}}}";
+    const range = "{{\"start\":" ++ at ++ ",\"end\":" ++ at ++ "}}";
+    const json = "{{\"name\":\"{s}{d}\",\"kind\":{d},\"range\":" ++ range ++
+        ",\"selectionRange\":" ++ range;
+    try writer.print(json, .{ prefix, index, kind, line, 0, line, end, line, column, line, end });
+}
+
+fn report(name: []const u8, times: *[samples]u64) void {
+    std.mem.sort(u64, times, {}, std.sort.asc(u64));
+    std.debug.print("    {s}: p50/p99/max {d:.3}/{d:.3}/{d:.3} ms over {d} samples\n", .{
+        name,
+        ms(times[samples / 2]),
+        ms(times[samples * 99 / 100]),
+        ms(times[samples - 1]),
+        samples,
+    });
+}
 
 fn now(io: Io) u64 {
     const stamp = Io.Timestamp.now(io, .awake);

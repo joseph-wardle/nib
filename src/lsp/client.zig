@@ -66,6 +66,10 @@ pub const Document = struct {
     version: u64,
 };
 
+/// A navigation or symbols request: its id, and what it asked for, which
+/// decides how its answer is decoded.
+pub const Pending = struct { id: u32, navigation: protocol.Navigation };
+
 /// A token request: rows `top` up to `bottom` of document `key` at the
 /// version the server had when it was asked.
 pub const TokenRequest = struct {
@@ -91,10 +95,7 @@ pub const Client = struct {
     capabilities: ?protocol.Capabilities = null,
     next_id: u32 = initialize_id + 1,
     /// The one navigation request awaiting an answer.
-    pending: ?u32 = null,
-    /// What the pending request asked for, which decides how its answer is
-    /// decoded.
-    asked: protocol.Navigation = .definition,
+    pending: ?Pending = null,
     /// The last answer to a pending request
     answer: ?protocol.Answer = null,
     answer_memory: std.heap.ArenaAllocator.State = .init,
@@ -242,11 +243,11 @@ pub const Client = struct {
                         };
                         try protocol.initialized(gpa, &self.queue);
                         result.initialized = true;
-                    } else if (self.pending == id) {
+                    } else if (self.pending != null and self.pending.?.id == id) {
                         var memory = self.answer_memory.promote(gpa);
                         defer self.answer_memory = memory.state;
                         _ = memory.reset(.retain_capacity);
-                        self.answer = if (self.asked == .symbols)
+                        self.answer = if (self.pending.?.navigation == .symbols)
                             try protocol.symbolsReply(memory.allocator(), body)
                         else
                             try protocol.navigationReply(memory.allocator(), body);
@@ -413,8 +414,7 @@ pub const Client = struct {
         const id = self.next_id;
         try protocol.navigate(gpa, &self.queue, id, navigation, path, at);
         self.next_id += 1;
-        self.pending = id;
-        self.asked = navigation;
+        self.pending = .{ .id = id, .navigation = navigation };
         self.answer = null;
         self.flush(gpa, io);
     }
@@ -422,9 +422,9 @@ pub const Client = struct {
     /// Asks the server to drop the pending request, whose answer is then
     /// ignored. Without memory for the message, the answer is still ignored.
     pub fn cancel(self: *Client, gpa: Allocator, io: std.Io) void {
-        const id = self.pending orelse return;
+        const pending = self.pending orelse return;
         self.pending = null;
-        protocol.cancel(gpa, &self.queue, id) catch return;
+        protocol.cancel(gpa, &self.queue, pending.id) catch return;
         self.flush(gpa, io);
     }
 
@@ -557,7 +557,7 @@ test "server requests are refused, notifications dropped, and only the pending a
         \\{"jsonrpc":"2.0","id":2,"result":{"uri":"file:///p/old.zig","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}}
     ));
     try testing.expectEqual(Change{}, late);
-    try testing.expectEqual(@as(?u32, 3), client.pending);
+    try testing.expectEqual(@as(u32, 3), client.pending.?.id);
     const answered = try client.receive(testing.allocator, framed(
         \\{"jsonrpc":"2.0","id":3,"result":[{"uri":"file:///p/b.zig","range":{"start":{"line":4,"character":2},"end":{"line":4,"character":3}}}]}
     ));
@@ -734,7 +734,7 @@ test "the token lane and the navigation lane each get only their own answers" {
         \\{"jsonrpc":"2.0","id":2,"result":{"data":[0,0,2,0,0,1,0,2,1,0]}}
     ));
     try testing.expectEqual(Change{}, tokens);
-    try testing.expectEqual(@as(?u32, 4), client.pending);
+    try testing.expectEqual(@as(u32, 4), client.pending.?.id);
     try testing.expectEqual(null, client.token_request);
     var held = (try client.tokens(gpa, &buffer)).?;
     defer held.deinit(gpa);

@@ -2196,7 +2196,7 @@ const Navigating = struct {
 
     /// Answers the pending request with `result`, JSON.
     fn reply(self: *Navigating, result: []const u8) !void {
-        try self.replyTo(self.app.servers[0].pending.?, result);
+        try self.replyTo(self.app.servers[0].pending.?.id, result);
     }
 
     fn replyTo(self: *Navigating, id: u32, result: []const u8) !void {
@@ -2574,7 +2574,7 @@ test "gO says when there are no symbols, none here, none offered or the server f
     var failure: [256]u8 = undefined;
     const refused = "{{\"jsonrpc\":\"2.0\",\"id\":{d}," ++
         "\"error\":{{\"code\":-32603,\"message\":\"no index\"}}}}";
-    try fixture.feed(try std.fmt.bufPrint(&failure, refused, .{app.servers[0].pending.?}));
+    try fixture.feed(try std.fmt.bufPrint(&failure, refused, .{app.servers[0].pending.?.id}));
     try testing.expectEqualStrings("zls failed: no index", app.status.text());
     // A cursor moved while waiting drops the answer.
     var storage: [1024]u8 = undefined;
@@ -2654,7 +2654,7 @@ test "none, one here, a location outside local files or an error says so" {
     try testing.expectEqualStrings(outside, app.status.text());
     fixture.keys("grD");
     var failure: [256]u8 = undefined;
-    const id = app.servers[0].pending.?;
+    const id = app.servers[0].pending.?.id;
     const refused = "{{\"jsonrpc\":\"2.0\",\"id\":{d}," ++
         "\"error\":{{\"code\":-32603,\"message\":\"no index\"}}}}";
     try fixture.feed(try std.fmt.bufPrint(&failure, refused, .{id}));
@@ -2724,7 +2724,7 @@ test "Escape and Ctrl-C cancel a request, a second key replaces it, and late ans
     const target = try fixture.location(&storage, "b.zig", 0, 7);
     for ([_]input.Event{ .escape, .{ .key = 3 } }) |cancel| {
         fixture.keys("gd");
-        const id = app.servers[0].pending.?;
+        const id = app.servers[0].pending.?.id;
         app.editorEvent(cancel);
         try testing.expectEqualStrings("", app.status.text());
         var cancelled: [128]u8 = undefined;
@@ -2737,9 +2737,9 @@ test "Escape and Ctrl-C cancel a request, a second key replaces it, and late ans
         try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
     }
     fixture.keys("gd");
-    const first = app.servers[0].pending.?;
+    const first = app.servers[0].pending.?.id;
     fixture.keys("grr");
-    const second = app.servers[0].pending.?;
+    const second = app.servers[0].pending.?.id;
     const replaced = "\"$/cancelRequest\",\"params\":{\"id\":";
     try testing.expect(std.mem.indexOf(u8, fixture.sent(), replaced) != null);
     try fixture.replyTo(first, target);

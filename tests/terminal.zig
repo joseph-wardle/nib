@@ -104,6 +104,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ "finderQuit", finderQuit },
         .{ "navigationWorkflow", navigationWorkflow },
         .{ "navigationWaiting", navigationWaiting },
+        .{ "symbolsWorkflow", symbolsWorkflow },
         .{ "semanticColours", semanticColours },
         .{ "incrementalNavigation", incrementalNavigation },
         .{ "missingServerColours", missingServerColours },
@@ -2318,6 +2319,58 @@ fn navigationWorkflow(executable: [:0]const u8) !void {
     try process.until(leave);
     try process.restored();
     try gone(pid);
+}
+
+// Covers gO listing a.zig's symbols through real zls beside Locations,
+// the place and kind of the selection, a search matching names only, Enter
+// landing on a name, Ctrl-O returning and Ctrl-P resuming Symbols.
+fn symbolsWorkflow(executable: [:0]const u8) !void {
+    var project: ZigProject = .{};
+    try project.create("symbols");
+    defer project.remove();
+    var process = try Process.start(executable, .{ .path = project.a, .cwd = project.directory });
+    defer process.close();
+    try process.until("b.target();");
+    try process.ready();
+    try editingKeys(&process, "jjww");
+    try process.send("w");
+    try landed(&process, "3:7", "a.zig");
+    try process.send("grr");
+    try process.until("[Locations]");
+    try process.until("3/3 rows");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("LIST |");
+    try process.ready();
+    try process.send("\x1b");
+    try landed(&process, "3:7", "a.zig");
+    try process.send("gO");
+    try process.until("Locations [Symbols]");
+    try process.until("2/2 symbols in a.zig");
+    try process.until("a.zig:1:7  constant");
+    try process.ready();
+    // "in" is in a.zig and in "function", but only main's name holds it.
+    try process.send("in");
+    try process.until("1/2 symbols in a.zig");
+    try process.until("a.zig:2:8  function");
+    try process.ready();
+    try process.send("\r");
+    try landed(&process, "2:8", "a.zig");
+    try process.send("\x0f");
+    try landed(&process, "3:7", "a.zig");
+    try process.send("\x10");
+    try process.until("[Symbols]");
+    try process.until("1/2 symbols in a.zig");
+    try process.ready();
+    try process.send("\x1b");
+    try process.until("LIST |");
+    try process.ready();
+    try process.send("\x1b");
+    try landed(&process, "3:7", "a.zig");
+    try process.send(":qa\r");
+    try equal(@as(u8, 0), try process.wait(false));
+    try process.until(leave);
+    try process.restored();
 }
 
 // Covers a request kept through Ctrl-Z and resume, and SIGTERM while one

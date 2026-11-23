@@ -538,14 +538,53 @@ pub const Symbol = struct {
 /// Decodes the reply to a symbols request: null, a tree of
 /// `DocumentSymbol` or a flat array of `SymbolInformation`. A tree is
 /// flattened in document order, each symbol before its children; a flat
-/// array keeps the server's order. Allocates in `arena`.
+/// array keeps the server's order. A reply nested deeper than `max_nesting` fails
+/// without being decoded. Allocates in `arena`.
 pub fn symbolsReply(arena: Allocator, body: []const u8) Error!Answer {
+    // `std.json` decodes the recursive `Listed` by recursion, so a deep tree
+    // would overflow the stack: 20,000 levels do in ReleaseFast.
+    if (nesting(body) > max_nesting) return .{ .failed = "symbols nested too deeply" };
     const Reply = struct { result: ?[]const Listed = null, @"error": ?Failure = null };
     const reply = try parse(Reply, arena, body);
     if (reply.@"error") |failure| return .{ .failed = failure.message };
     var symbols: std.ArrayList(Symbol) = .empty;
     try flatten(arena, &symbols, reply.result orelse &.{}, "");
     return .{ .symbols = symbols.items };
+}
+
+/// Brackets a symbols reply may nest: about 60 levels of symbols, each an
+/// array and an object, where real trees have a few.
+const max_nesting = 128;
+
+/// The deepest nesting of arrays and objects in `body`, outside strings,
+/// whether or not it is valid JSON.
+fn nesting(body: []const u8) usize {
+    var depth: usize = 0;
+    var deepest: usize = 0;
+    var quoted = false;
+    var escaped = false;
+    for (body) |byte| {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == '"') {
+                quoted = false;
+            }
+            continue;
+        }
+        switch (byte) {
+            '"' => quoted = true,
+            '[', '{' => {
+                depth += 1;
+                deepest = @max(deepest, depth);
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
+    }
+    return deepest;
 }
 
 /// One `DocumentSymbol` (`selectionRange`, `children`) or
@@ -1634,4 +1673,36 @@ test "malformed token data is refused, and every allocation failure frees the se
             try testing.expectEqual(2, held.tokens.items.len);
         }
     }.run, .{&buffer});
+}
+
+/// A symbols reply whose tree is `levels` deep, each symbol named `a`.
+fn nestedSymbols(gpa: Allocator, levels: usize) ![]u8 {
+    const range = "{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}}";
+    const symbol = "[{\"name\":\"a\",\"kind\":12,\"selectionRange\":" ++ range ++ ",\"children\":";
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    errdefer body.deinit();
+    try body.writer.writeAll("{\"id\":2,\"result\":");
+    for (0..levels) |_| try body.writer.writeAll(symbol);
+    try body.writer.writeAll("[]");
+    for (0..levels) |_| try body.writer.writeAll("}]");
+    try body.writer.writeAll("}");
+    return body.toOwnedSlice();
+}
+
+test "a symbols reply nested past the bound fails undecoded, however deep" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // Brackets in strings don't count, escaped quotes included.
+    try testing.expectEqual(@as(usize, 2), nesting("{\"a\":[\"[[{\\\"]]\"]}"));
+    try testing.expectEqual(@as(usize, 0), nesting("]]}"));
+    // Each level is an array and an object; the deepest selection adds two.
+    const deepest = (max_nesting - 3) / 2;
+    const kept = try symbolsReply(gpa, try nestedSymbols(gpa, deepest));
+    try testing.expectEqual(deepest, kept.symbols.len);
+    try testing.expectEqual(2 * deepest - 1, kept.symbols[deepest - 1].name.len);
+    for ([_]usize{ deepest + 1, 20_000 }) |levels| {
+        const refused = try symbolsReply(gpa, try nestedSymbols(gpa, levels));
+        try testing.expectEqualStrings("symbols nested too deeply", refused.failed);
+    }
 }
