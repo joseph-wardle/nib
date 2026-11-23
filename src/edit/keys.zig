@@ -59,7 +59,8 @@ pub const Request = union(enum) {
     command_line,
     /// Ctrl-O (`older`) or Ctrl-I, which is Tab (`newer`), with its count.
     travel: struct { direction: enum { older, newer }, count: usize },
-    /// `gd`, `grD`, `grt`, `gri` or `grr`, asked of the file's language server.
+    /// `gd`, `grD`, `grt`, `gri`, `grr` or `gO`, asked of the file's language
+    /// server.
     navigate: Navigation,
 };
 pub const Navigation = enum {
@@ -68,6 +69,7 @@ pub const Navigation = enum {
     type_definition,
     implementation,
     references,
+    symbols,
 };
 pub const Action = union(enum) {
     move: Movement,
@@ -343,7 +345,11 @@ pub const Parser = struct {
         }
         if (prefix != .none) {
             const navigation: Navigation = switch (prefix) {
-                .g => if (byte == 'd') .definition else return .invalid,
+                .g => switch (byte) {
+                    'd' => .definition,
+                    'O' => .symbols,
+                    else => return .invalid,
+                },
                 else => switch (byte) {
                     'D' => .declaration,
                     't' => .type_definition,
@@ -1104,7 +1110,7 @@ test "Ctrl-O and Tab ask to travel the jump list with a count, only from plain n
     try std.testing.expectEqual(Action.invalid, keys(&parser, "\x0f").?);
 }
 
-test "gd, grD, grt, gri and grr ask to navigate, only from plain normal mode" {
+test "gd, grD, grt, gri, grr and gO ask to navigate, only from plain normal mode" {
     var parser: Parser = .{};
     const cases = [_]struct { keys: []const u8, navigation: Navigation }{
         .{ .keys = "gd", .navigation = .definition },
@@ -1112,6 +1118,7 @@ test "gd, grD, grt, gri and grr ask to navigate, only from plain normal mode" {
         .{ .keys = "grt", .navigation = .type_definition },
         .{ .keys = "gri", .navigation = .implementation },
         .{ .keys = "grr", .navigation = .references },
+        .{ .keys = "gO", .navigation = .symbols },
     };
     for (cases) |case| {
         const navigate: Action = .{ .request = .{ .navigate = case.navigation } };

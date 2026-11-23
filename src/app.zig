@@ -18,6 +18,7 @@ const Category = @import("finder/finder.zig").Category;
 const OpenFile = @import("finder/finder.zig").OpenFile;
 const Location = @import("finder/finder.zig").Location;
 const Place = @import("finder/finder.zig").Place;
+const Symbol = @import("finder/finder.zig").Symbol;
 const preview = @import("finder/preview.zig");
 const Frame = @import("terminal/frame.zig").Frame;
 const setClipboard = @import("terminal/frame.zig").setClipboard;
@@ -388,6 +389,7 @@ const App = struct {
                 .type_definition => .type_definition,
                 .implementation => .implementation,
                 .references => .references,
+                .symbols => .symbols,
             }),
         }
     }
@@ -526,6 +528,7 @@ const App = struct {
         const locations = switch (server.answer.?) {
             .failed => |message| return self.status.print("{s} failed: {s}", .{ name, message }),
             .locations => |locations| locations,
+            .symbols => |symbols| return self.outline(server, symbols),
         };
         if (locations.len == 0) {
             return self.status.print("No {s} found", .{noun(waiting.navigation, 1)});
@@ -560,6 +563,55 @@ const App = struct {
         }
         if (notice.end != 0) text[0] = std.ascii.toUpper(text[0]);
         self.status.set(notice.buffered());
+    }
+
+    /// Opens Symbols, searching, on the answer's symbols in the asked
+    /// document, which `fresh` has kept active, in the server's order. The
+    /// editor stays where it is. Running out of memory leaves the finder
+    /// shut and any earlier rows as they were.
+    fn outline(self: *App, server: *const client.Client, symbols: []const protocol.Symbol) void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const listed = self.symbolRows(arena.allocator(), server, symbols) catch {
+            return self.status.set("Not enough memory; symbols not listed");
+        };
+        if (!listed) return self.status.set("No symbols found");
+        self.showFinder();
+        self.browsing = false;
+    }
+
+    /// Fills Symbols with the answer's symbols in the active document, each
+    /// column converted to bytes against its line. False when there are none.
+    fn symbolRows(
+        self: *App,
+        arena: Allocator,
+        server: *const client.Client,
+        symbols: []const protocol.Symbol,
+    ) Allocator.Error!bool {
+        const path = self.documents.current().?.document.source.path;
+        const encoding = server.capabilities.?.encoding;
+        const rows = try arena.alloc(Symbol, symbols.len);
+        var files: Files = .empty;
+        var count: usize = 0;
+        for (symbols) |symbol| {
+            // Only a flat answer names files, which may be other ones.
+            if (symbol.file) |elsewhere| if (!std.mem.eql(u8, elsewhere, path)) continue;
+            const row = try self.locationRow(arena, &files, path, symbol.at, encoding);
+            rows[count] = .{
+                .name = symbol.name,
+                .kind = protocol.kindName(symbol.kind),
+                .line = row.place.line,
+                .column = row.place.column,
+                .start = row.start,
+            };
+            count += 1;
+        }
+        if (count == 0) return false;
+        const omitted = symbols.len - count;
+        const open = try self.openFiles(arena);
+        const background = self.background;
+        try self.finder.outline(self.gpa, self.io, background, path, rows[0..count], omitted, open);
+        return true;
     }
 
     /// Opens Locations, searching, on the answer's locations in local files,
@@ -1194,6 +1246,7 @@ fn noun(navigation: protocol.Navigation, count: usize) []const u8 {
         .type_definition => if (one) "type definition" else "type definitions",
         .implementation => if (one) "implementation" else "implementations",
         .references => if (one) "reference" else "references",
+        .symbols => if (one) "symbol" else "symbols",
     };
 }
 
@@ -2417,6 +2470,163 @@ test "running out of memory while listing locations keeps the earlier rows and t
         "b.zig:1:8  pub fn target() void {}",
         "a.zig:3:7  b.target();",
     });
+}
+
+/// A tree symbol as JSON, in `storage`: `name` of `kind` at `line`, `character`.
+fn symbolJson(storage: []u8, name: []const u8, kind: u32, line: u32, character: u32) ![]const u8 {
+    const at = "{{\"line\":{d},\"character\":{d}}}";
+    const range = "{{\"start\":" ++ at ++ ",\"end\":" ++ at ++ "}}";
+    const json = "{{\"name\":\"{s}\",\"kind\":{d},\"range\":" ++ range ++
+        ",\"selectionRange\":" ++ range ++ "}}";
+    return std.fmt.bufPrint(storage, json, .{
+        name, kind, line, 0, line, character, line, character, line, character,
+    });
+}
+
+/// Checks the line under the finder's results, `expected` after the root.
+fn expectHeading(fixture: *Navigating, expected: []const u8) !void {
+    var spelled: [1024]u8 = undefined;
+    const full = try std.fmt.bufPrint(&spelled, "{s}/{s}", .{ fixture.root, expected });
+    try std.testing.expectEqualStrings(full, fixture.app.finder.selectedPath());
+}
+
+test "gO lists the document's symbols beside Locations, and a choice lands on the name" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    var storage: [3][1024]u8 = undefined;
+    try answerAll(&fixture, &.{
+        try fixture.location(&storage[0], "a.zig", 1, 4),
+        try fixture.location(&storage[1], "a.zig", 2, 6),
+    });
+    app.dismiss();
+    fixture.keys("gO");
+    try testing.expectEqualStrings("Asking zls...", app.status.text());
+    var asked: [1024]u8 = undefined;
+    const request = try std.fmt.bufPrint(&asked, "\"method\":\"textDocument/documentSymbol\"," ++
+        "\"params\":{{\"textDocument\":{{\"uri\":\"file://{s}/a.zig\"}}}}", .{fixture.root});
+    try testing.expect(std.mem.indexOf(u8, fixture.sent(), request) != null);
+    var several: [4096]u8 = undefined;
+    try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s},{s}]", .{
+        try symbolJson(&storage[0], "b", 14, 0, 6),
+        try symbolJson(&storage[1], "main", 12, 1, 7),
+        // A kind the protocol doesn't name shows without a word.
+        try symbolJson(&storage[2], "main.odd", 99, 2, 4),
+    }));
+    try testing.expect(app.finding and !app.browsing);
+    try testing.expectEqual(Category.symbols, app.finder.category);
+    try testing.expectEqualStrings("", app.status.text());
+    const rows = app.finder.matches;
+    try testing.expectEqual(@as(usize, 3), rows.len);
+    for ([_][]const u8{ "b", "main", "main.odd" }, rows) |label, result| {
+        try testing.expectEqualStrings(label, app.finder.row(result).label);
+    }
+    try expectHeading(&fixture, "a.zig:1:7  constant");
+    try testing.expect(app.finder.locations.filled());
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    try testing.expectEqual(@as(usize, 0), app.documents.jumps.len);
+    app.finderEvent(.{ .key = 0x0e });
+    app.finderEvent(.{ .key = 0x0e });
+    try expectHeading(&fixture, "a.zig:3:5");
+    app.finderEvent(.{ .key = 0x10 });
+    try expectHeading(&fixture, "a.zig:2:8  function");
+    // Enter lands on the name and records the departure; Ctrl-O returns.
+    app.finderEvent(.{ .key = '\r' });
+    try testing.expect(!app.finding);
+    try testing.expectEqual(a, app.documents.active.?);
+    try testing.expectEqual(fixture.buffer().lineStart(1) + 7, fixture.buffer().cursor);
+    const departure: session.Jump = .{ .id = a, .line = 2, .column = 6 };
+    try testing.expectEqual(departure, app.documents.jumps.items[0]);
+    fixture.keys("\x0f");
+    try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    // Ctrl-P reopens Symbols as it was left.
+    fixture.keys("\x10");
+    try testing.expectEqual(Category.symbols, app.finder.category);
+    try expectHeading(&fixture, "a.zig:2:8  function");
+}
+
+test "gO says when there are no symbols, none here, none offered or the server failed" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    for ([_][]const u8{ "null", "[]" }) |result| {
+        fixture.keys("gO");
+        try fixture.reply(result);
+        try testing.expectEqualStrings("No symbols found", app.status.text());
+        try testing.expect(!app.finding);
+    }
+    // A flat answer's symbols in another file are not this file's.
+    var other: [1024]u8 = undefined;
+    const elsewhere = "[{{\"name\":\"target\",\"kind\":12,\"location\":{s}}}]";
+    var flat: [2048]u8 = undefined;
+    fixture.keys("gO");
+    const location = try fixture.location(&other, "b.zig", 0, 7);
+    try fixture.reply(try std.fmt.bufPrint(&flat, elsewhere, .{location}));
+    try testing.expectEqualStrings("No symbols found", app.status.text());
+    try testing.expect(!app.finder.symbols.filled());
+    fixture.keys("gO");
+    var failure: [256]u8 = undefined;
+    const refused = "{{\"jsonrpc\":\"2.0\",\"id\":{d}," ++
+        "\"error\":{{\"code\":-32603,\"message\":\"no index\"}}}}";
+    try fixture.feed(try std.fmt.bufPrint(&failure, refused, .{app.servers[0].pending.?}));
+    try testing.expectEqualStrings("zls failed: no index", app.status.text());
+    // A cursor moved while waiting drops the answer.
+    var storage: [1024]u8 = undefined;
+    fixture.keys("gOl");
+    try fixture.reply(try std.fmt.bufPrint(&flat, "[{s}]", .{
+        try symbolJson(&storage, "main", 12, 1, 7),
+    }));
+    const dropped = "Dropped zls request; the cursor, text or file changed";
+    try testing.expectEqualStrings(dropped, app.status.text());
+    try testing.expect(!app.finding);
+    app.servers[0].capabilities.?.offers.remove(.symbols);
+    const before = fixture.sent().len;
+    fixture.keys("gO");
+    try testing.expectEqualStrings("zls has no symbols", app.status.text());
+    try testing.expectEqual(before, fixture.sent().len);
+}
+
+test "running out of memory while listing symbols keeps the earlier rows and the editor" {
+    const testing = std.testing;
+    var fixture: Navigating = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.app;
+    const a = app.documents.active.?;
+    var storage: [2][1024]u8 = undefined;
+    var several: [4096]u8 = undefined;
+    fixture.keys("gO");
+    try fixture.reply(try std.fmt.bufPrint(&several, "[{s}]", .{
+        try symbolJson(&storage[0], "b", 14, 0, 6),
+    }));
+    app.dismiss();
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        const config: std.testing.FailingAllocator.Config = .{ .fail_index = index };
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, config);
+        fixture.keys("gO");
+        app.gpa = failing.allocator();
+        try fixture.reply(try std.fmt.bufPrint(&several, "[{s},{s}]", .{
+            try symbolJson(&storage[0], "b", 14, 0, 6),
+            try symbolJson(&storage[1], "main", 12, 1, 7),
+        }));
+        app.gpa = testing.allocator;
+        if (app.finding) break;
+        try testing.expectEqualStrings("Not enough memory; symbols not listed", app.status.text());
+        const kept = app.finder.symbols.catalog.?;
+        try testing.expectEqual(@as(usize, 1), kept.entries.len);
+        try testing.expectEqualStrings("b", kept.entries[0].label);
+        try testing.expectEqual(a, app.documents.active.?);
+        try testing.expectEqual(@as(usize, Navigating.call), fixture.buffer().cursor);
+    }
+    try testing.expect(index > 2);
+    try testing.expectEqual(@as(usize, 2), app.finder.matches.len);
 }
 
 test "none, one here, a location outside local files or an error says so" {

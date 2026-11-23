@@ -29,6 +29,8 @@ pub const Navigation = enum {
     type_definition,
     implementation,
     references,
+    /// The document's symbols, asked with no position.
+    symbols,
 
     fn method(navigation: Navigation) []const u8 {
         return switch (navigation) {
@@ -37,6 +39,7 @@ pub const Navigation = enum {
             .type_definition => "textDocument/typeDefinition",
             .implementation => "textDocument/implementation",
             .references => "textDocument/references",
+            .symbols => "textDocument/documentSymbol",
         };
     }
 };
@@ -168,12 +171,15 @@ pub fn initialize(
             .rootUri = Uri{ .path = root },
             .capabilities = .{
                 .general = .{ .positionEncodings = [_][]const u8{ "utf-8", "utf-16" } },
-                .textDocument = .{ .semanticTokens = .{
-                    .requests = .{ .range = true, .full = false },
-                    .tokenTypes = token_names,
-                    .tokenModifiers = [_][]const u8{},
-                    .formats = [_][]const u8{"relative"},
-                } },
+                .textDocument = .{
+                    .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true },
+                    .semanticTokens = .{
+                        .requests = .{ .range = true, .full = false },
+                        .tokenTypes = token_names,
+                        .tokenModifiers = [_][]const u8{},
+                        .formats = [_][]const u8{"relative"},
+                    },
+                },
             },
         },
     });
@@ -277,6 +283,7 @@ pub fn didClose(gpa: Allocator, queue: *std.ArrayList(u8), path: []const u8) All
 }
 
 /// References leave out the declaration, so the first is a use.
+/// Symbols are asked of the whole document, so `at` goes unused.
 pub fn navigate(
     gpa: Allocator,
     queue: *std.ArrayList(u8),
@@ -286,6 +293,12 @@ pub fn navigate(
     at: Position,
 ) Allocator.Error!void {
     const document = .{ .uri = Uri{ .path = path } };
+    if (navigation == .symbols) return frame(gpa, queue, .{
+        .jsonrpc = "2.0",
+        .id = id,
+        .method = navigation.method(),
+        .params = .{ .textDocument = document },
+    });
     if (navigation == .references) return frame(gpa, queue, .{
         .jsonrpc = "2.0",
         .id = id,
@@ -415,6 +428,7 @@ pub fn initializeReply(arena: Allocator, body: []const u8) Error!Initialized {
         typeDefinitionProvider: Provider = .{},
         implementationProvider: Provider = .{},
         referencesProvider: Provider = .{},
+        documentSymbolProvider: Provider = .{},
         textDocumentSync: ?std.json.Value = null,
         semanticTokensProvider: ?std.json.Value = null,
     };
@@ -438,6 +452,7 @@ pub fn initializeReply(arena: Allocator, body: []const u8) Error!Initialized {
         .type_definition = offered.typeDefinitionProvider.offered,
         .implementation = offered.implementationProvider.offered,
         .references = offered.referencesProvider.offered,
+        .symbols = offered.documentSymbolProvider.offered,
     });
     const legend = if (offered.semanticTokensProvider) |tokens| offeredLegend(tokens) else null;
     return .{ .capabilities = .{
@@ -480,8 +495,12 @@ fn offeredLegend(provider: std.json.Value) ?Legend {
 /// local file.
 pub const Location = struct { path: ?[]const u8, at: Position };
 
-/// The reply to a navigation request, or a server error's message.
-pub const Answer = union(enum) { locations: []const Location, failed: []const u8 };
+/// The reply to a navigation or symbols request, or a server error's message.
+pub const Answer = union(enum) {
+    locations: []const Location,
+    symbols: []const Symbol,
+    failed: []const u8,
+};
 
 /// Decodes the reply to `navigate`: null, a `Location`, or an array of
 /// `Location` or `LocationLink`, in the server's order. Allocates in `arena`.
@@ -500,6 +519,86 @@ pub fn navigationReply(arena: Allocator, body: []const u8) Error!Answer {
         };
     }
     return .{ .locations = locations };
+}
+
+/// One of a document's symbols, flattened from the server's tree.
+pub const Symbol = struct {
+    /// Joined to its containers' names by dots, as `Finder.locate`.
+    name: []const u8,
+    /// The protocol's `SymbolKind`; see `kindName`.
+    kind: i64,
+    /// Where its name starts.
+    at: Position,
+    /// For a flat answer, the local file its URI names, empty for one that
+    /// names none; null in a tree, whose symbols are all in the asked
+    /// document.
+    file: ?[]const u8,
+};
+
+/// Decodes the reply to a symbols request: null, a tree of
+/// `DocumentSymbol` or a flat array of `SymbolInformation`. A tree is
+/// flattened in document order, each symbol before its children; a flat
+/// array keeps the server's order. Allocates in `arena`.
+pub fn symbolsReply(arena: Allocator, body: []const u8) Error!Answer {
+    const Reply = struct { result: ?[]const Listed = null, @"error": ?Failure = null };
+    const reply = try parse(Reply, arena, body);
+    if (reply.@"error") |failure| return .{ .failed = failure.message };
+    var symbols: std.ArrayList(Symbol) = .empty;
+    try flatten(arena, &symbols, reply.result orelse &.{}, "");
+    return .{ .symbols = symbols.items };
+}
+
+/// One `DocumentSymbol` (`selectionRange`, `children`) or
+/// `SymbolInformation` (`location`, `containerName`).
+const Listed = struct {
+    name: []const u8,
+    kind: i64,
+    selectionRange: ?Range = null,
+    children: ?[]const Listed = null,
+    location: ?struct { uri: []const u8, range: Range } = null,
+    containerName: ?[]const u8 = null,
+};
+
+/// Appends `listed` and their descendants, each name after `container`'s.
+fn flatten(
+    arena: Allocator,
+    symbols: *std.ArrayList(Symbol),
+    listed: []const Listed,
+    container: []const u8,
+) Error!void {
+    for (listed) |item| {
+        if (item.selectionRange) |range| {
+            const name = try joined(arena, container, item.name);
+            const at = range.start;
+            try symbols.append(arena, .{ .name = name, .kind = item.kind, .at = at, .file = null });
+            try flatten(arena, symbols, item.children orelse &.{}, name);
+        } else if (item.location) |location| {
+            const name = try joined(arena, item.containerName orelse "", item.name);
+            const file = try pathFromUri(arena, location.uri) orelse "";
+            const at = location.range.start;
+            try symbols.append(arena, .{ .name = name, .kind = item.kind, .at = at, .file = file });
+        } else return error.MalformedMessage;
+    }
+}
+
+fn joined(arena: Allocator, container: []const u8, name: []const u8) Allocator.Error![]const u8 {
+    if (container.len == 0) return name;
+    return std.mem.concat(arena, u8, &.{ container, ".", name });
+}
+
+/// A lowercase word for a `SymbolKind`; empty for one the protocol doesn't
+/// name, which servers may send.
+pub fn kindName(kind: i64) []const u8 {
+    const names = [_][]const u8{
+        "file",           "module",      "namespace", "package",     "class",
+        "method",         "property",    "field",     "constructor", "enum",
+        "interface",      "function",    "variable",  "constant",    "string",
+        "number",         "boolean",     "array",     "object",      "key",
+        "null",           "enum member", "struct",    "event",       "operator",
+        "type parameter",
+    };
+    if (kind < 1 or kind > names.len) return "";
+    return names[@intCast(kind - 1)];
 }
 
 /// How a server's token types draw: the kind of each, by its index in the
@@ -892,7 +991,7 @@ test "each message Nib sends has the expected shape" {
     const cases = [_]struct { body: []const u8, write: Write }{
         .{
             .body =
-            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":42,"rootUri":"file:///p","capabilities":{"general":{"positionEncodings":["utf-8","utf-16"]},"textDocument":{"semanticTokens":{"requests":{"range":true,"full":false},"tokenTypes":["comment","keyword","modifier","string","escapeSequence","regexp","number","keywordLiteral","enumMember","errorTag","builtin","macro","function","method","namespace","type","class","enum","struct","interface","typeParameter","property","variable","parameter","operator","label","event","decorator"],"tokenModifiers":[],"formats":["relative"]}}}}}
+            \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":42,"rootUri":"file:///p","capabilities":{"general":{"positionEncodings":["utf-8","utf-16"]},"textDocument":{"documentSymbol":{"hierarchicalDocumentSymbolSupport":true},"semanticTokens":{"requests":{"range":true,"full":false},"tokenTypes":["comment","keyword","modifier","string","escapeSequence","regexp","number","keywordLiteral","enumMember","errorTag","builtin","macro","function","method","namespace","type","class","enum","struct","interface","typeParameter","property","variable","parameter","operator","label","event","decorator"],"tokenModifiers":[],"formats":["relative"]}}}}}
             ,
             .write = struct {
                 fn write(queue: *std.ArrayList(u8)) Allocator.Error!void {
@@ -983,6 +1082,16 @@ test "each message Nib sends has the expected shape" {
             .write = struct {
                 fn write(queue: *std.ArrayList(u8)) Allocator.Error!void {
                     try navigate(testing.allocator, queue, 8, .references, "/p/a.zig", at);
+                }
+            }.write,
+        },
+        .{
+            .body =
+            \\{"jsonrpc":"2.0","id":9,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///p/a.zig"}}}
+            ,
+            .write = struct {
+                fn write(queue: *std.ArrayList(u8)) Allocator.Error!void {
+                    try navigate(testing.allocator, queue, 9, .symbols, "/p/a.zig", at);
                 }
             }.write,
         },
@@ -1084,12 +1193,13 @@ test "initialize replies give the position encoding and the offered navigation" 
     const gpa = arena.allocator();
     // As ZLS 0.17.0 answers, abridged.
     const zls = try initializeReply(gpa,
-        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8","textDocumentSync":{"openClose":true,"change":2},"definitionProvider":true,"declarationProvider":true,"typeDefinitionProvider":true,"implementationProvider":false,"referencesProvider":true},"serverInfo":{"name":"zls"}}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8","textDocumentSync":{"openClose":true,"change":2},"definitionProvider":true,"declarationProvider":true,"typeDefinitionProvider":true,"implementationProvider":false,"referencesProvider":true,"documentSymbolProvider":true},"serverInfo":{"name":"zls"}}}
     );
     try testing.expectEqual(Encoding.utf8, zls.capabilities.encoding);
     try testing.expect(zls.capabilities.offers.contains(.definition));
     try testing.expect(!zls.capabilities.offers.contains(.implementation));
     try testing.expect(zls.capabilities.offers.contains(.references));
+    try testing.expect(zls.capabilities.offers.contains(.symbols));
     try testing.expect(zls.capabilities.incremental);
     // As slangd 1.8 answers, abridged: UTF-16 by name, definitions as options.
     const slangd = try initializeReply(gpa,
@@ -1175,6 +1285,89 @@ test "navigation replies decode Location, LocationLink, arrays and null in order
         "{\"id\":7,\"result\":7}",
         "{\"id\":7,\"result\":[",
     }) |body| try testing.expectError(error.MalformedMessage, navigationReply(gpa, body));
+}
+
+test "symbol replies flatten a tree to dotted names in document order, or keep a flat list" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    // As ZLS 0.17.0 answers, abridged; kind 99 is unknown to the protocol.
+    const tree = try symbolsReply(gpa,
+        \\{"id":2,"result":[
+        \\ {"name":"std","kind":14,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":26}},
+        \\  "selectionRange":{"start":{"line":1,"character":6},"end":{"line":1,"character":9}},"children":[]},
+        \\ {"name":"Catalog","kind":14,"range":{"start":{"line":3,"character":0},"end":{"line":9,"character":2}},
+        \\  "selectionRange":{"start":{"line":3,"character":10},"end":{"line":3,"character":17}},"children":[
+        \\  {"name":"init","kind":12,"detail":"fn","range":{"start":{"line":4,"character":4},"end":{"line":6,"character":5}},
+        \\   "selectionRange":{"start":{"line":4,"character":11},"end":{"line":4,"character":15}},"children":[
+        \\   {"name":"local","kind":99,"range":{"start":{"line":5,"character":8},"end":{"line":5,"character":20}},
+        \\    "selectionRange":{"start":{"line":5,"character":14},"end":{"line":5,"character":19}}}]}]},
+        \\ {"name":"main","kind":12,"range":{"start":{"line":11,"character":0},"end":{"line":11,"character":20}},
+        \\  "selectionRange":{"start":{"line":11,"character":7},"end":{"line":11,"character":11}}}]}
+    );
+    const expected = [_]struct { []const u8, i64, Position }{
+        .{ "std", 14, .{ .line = 1, .character = 6 } },
+        .{ "Catalog", 14, .{ .line = 3, .character = 10 } },
+        .{ "Catalog.init", 12, .{ .line = 4, .character = 11 } },
+        .{ "Catalog.init.local", 99, .{ .line = 5, .character = 14 } },
+        .{ "main", 12, .{ .line = 11, .character = 7 } },
+    };
+    try testing.expectEqual(expected.len, tree.symbols.len);
+    for (expected, tree.symbols) |want, symbol| {
+        try testing.expectEqualStrings(want[0], symbol.name);
+        try testing.expectEqual(want[1], symbol.kind);
+        try testing.expectEqual(want[2], symbol.at);
+        try testing.expectEqual(null, symbol.file);
+    }
+    // A flat list names each symbol's file and container.
+    const flat = try symbolsReply(gpa,
+        \\{"id":3,"result":[
+        \\ {"name":"b","kind":6,"containerName":"A","location":{"uri":"file:///p/a.zig",
+        \\  "range":{"start":{"line":2,"character":4},"end":{"line":2,"character":5}}}},
+        \\ {"name":"c","kind":13,"location":{"uri":"untitled:x",
+        \\  "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}}]}
+    );
+    try testing.expectEqual(@as(usize, 2), flat.symbols.len);
+    try testing.expectEqualStrings("A.b", flat.symbols[0].name);
+    try testing.expectEqualStrings("/p/a.zig", flat.symbols[0].file.?);
+    try testing.expectEqual(Position{ .line = 2, .character = 4 }, flat.symbols[0].at);
+    try testing.expectEqualStrings("c", flat.symbols[1].name);
+    try testing.expectEqualStrings("", flat.symbols[1].file.?);
+    const empty = [_][]const u8{
+        "{\"id\":5,\"result\":null}",
+        "{\"id\":5,\"result\":[]}",
+        "{\"id\":5}",
+    };
+    for (empty) |body| {
+        try testing.expectEqual(@as(usize, 0), (try symbolsReply(gpa, body)).symbols.len);
+    }
+    const failed = try symbolsReply(gpa,
+        \\{"id":6,"error":{"code":-32603,"message":"no"}}
+    );
+    try testing.expectEqualStrings("no", failed.failed);
+    for ([_][]const u8{
+        // No position.
+        "{\"id\":7,\"result\":[{\"name\":\"a\",\"kind\":12}]}",
+        // No name.
+        \\{"id":7,"result":[{"kind":12,"selectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]}
+        ,
+        // A kind that is no integer.
+        \\{"id":7,"result":[{"name":"a","kind":"fn","selectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}}]}
+        ,
+        "{\"id\":7,\"result\":{}}",
+    }) |body| try testing.expectError(error.MalformedMessage, symbolsReply(gpa, body));
+}
+
+test "symbol kinds are named as the protocol numbers them, and unknown ones not at all" {
+    try testing.expectEqualStrings("file", kindName(1));
+    try testing.expectEqualStrings("method", kindName(6));
+    try testing.expectEqualStrings("function", kindName(12));
+    try testing.expectEqualStrings("constant", kindName(14));
+    try testing.expectEqualStrings("enum member", kindName(22));
+    try testing.expectEqualStrings("type parameter", kindName(26));
+    for ([_]i64{ 0, 27, -1, std.math.maxInt(i64) }) |kind| {
+        try testing.expectEqualStrings("", kindName(kind));
+    }
 }
 
 /// The text a server has after applying `change` to `before` by the

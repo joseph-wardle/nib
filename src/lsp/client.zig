@@ -92,6 +92,9 @@ pub const Client = struct {
     next_id: u32 = initialize_id + 1,
     /// The one navigation request awaiting an answer.
     pending: ?u32 = null,
+    /// What the pending request asked for, which decides how its answer is
+    /// decoded.
+    asked: protocol.Navigation = .definition,
     /// The last answer to a pending request
     answer: ?protocol.Answer = null,
     answer_memory: std.heap.ArenaAllocator.State = .init,
@@ -243,7 +246,10 @@ pub const Client = struct {
                         var memory = self.answer_memory.promote(gpa);
                         defer self.answer_memory = memory.state;
                         _ = memory.reset(.retain_capacity);
-                        self.answer = try protocol.navigationReply(memory.allocator(), body);
+                        self.answer = if (self.asked == .symbols)
+                            try protocol.symbolsReply(memory.allocator(), body)
+                        else
+                            try protocol.navigationReply(memory.allocator(), body);
                         self.pending = null;
                         result.answered = true;
                     } else if (self.token_request) |request| {
@@ -408,6 +414,7 @@ pub const Client = struct {
         try protocol.navigate(gpa, &self.queue, id, navigation, path, at);
         self.next_id += 1;
         self.pending = id;
+        self.asked = navigation;
         self.answer = null;
         self.flush(gpa, io);
     }
@@ -567,6 +574,20 @@ test "server requests are refused, notifications dropped, and only the pending a
         \\{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":4}}
         \\
     ));
+    // A symbols request that replaces a navigation request is decoded as
+    // symbols, and the next navigation answer as locations again.
+    try client.navigate(testing.allocator, testing.io, .definition, "/p/a.zig", second);
+    try client.navigate(testing.allocator, testing.io, .symbols, "/p/a.zig", second);
+    const symbols = try client.receive(testing.allocator, framed(
+        \\{"jsonrpc":"2.0","id":6,"result":[{"name":"main","kind":12,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":9}},"selectionRange":{"start":{"line":1,"character":7},"end":{"line":1,"character":11}}}]}
+    ));
+    try testing.expectEqual(Change{ .answered = true }, symbols);
+    try testing.expectEqualStrings("main", client.answer.?.symbols[0].name);
+    try client.navigate(testing.allocator, testing.io, .definition, "/p/a.zig", second);
+    _ = try client.receive(testing.allocator, framed(
+        \\{"jsonrpc":"2.0","id":7,"result":null}
+    ));
+    try testing.expectEqual(@as(usize, 0), client.answer.?.locations.len);
     try testing.expectError(error.MalformedMessage, client.receive(testing.allocator, framed("{")));
 }
 
@@ -911,6 +932,49 @@ test "zls initializes with UTF-8 and answers definitions and references" {
     for (references[1..], [_]u32{ 2, 3 }) |reference, line| {
         try testing.expectEqualStrings(a, reference.path.?);
         try testing.expectEqual(Position{ .line = line, .character = 6 }, reference.at);
+    }
+}
+
+test "zls answers a document's symbols as a tree, flattened to dotted names" {
+    var project: Project = undefined;
+    try project.init();
+    defer project.temp.cleanup();
+    var client: Client = .{ .server = &servers[0] };
+    defer client.deinit(testing.allocator, testing.io);
+    try startZls(&client, &project);
+    try testing.expect(client.capabilities.?.offers.contains(.symbols));
+    var storage: [4096]u8 = undefined;
+    const a = try project.path("a.zig", &storage);
+    var buffer = try Buffer.fromBytes(testing.allocator,
+        \\const b = @import("b.zig");
+        \\const Point = struct {
+        \\    x: u32,
+        \\    fn origin() Point {
+        \\        return .{ .x = 0 };
+        \\    }
+        \\};
+        \\pub fn main() void {}
+        \\
+    );
+    defer buffer.deinit(testing.allocator);
+    _ = try client.sync(testing.allocator, testing.io, 0, a, &buffer);
+    const unused: Position = .{ .line = 0, .character = 0 };
+    try client.navigate(testing.allocator, testing.io, .symbols, a, unused);
+    _ = try settle(&client, isAnswered);
+    const symbols = client.answer.?.symbols;
+    const expected = [_]struct { []const u8, []const u8, Position }{
+        .{ "b", "constant", .{ .line = 0, .character = 6 } },
+        .{ "Point", "constant", .{ .line = 1, .character = 6 } },
+        .{ "Point.x", "field", .{ .line = 2, .character = 4 } },
+        .{ "Point.origin", "function", .{ .line = 3, .character = 7 } },
+        .{ "main", "function", .{ .line = 7, .character = 7 } },
+    };
+    try testing.expectEqual(expected.len, symbols.len);
+    for (expected, symbols) |want, symbol| {
+        try testing.expectEqualStrings(want[0], symbol.name);
+        try testing.expectEqualStrings(want[1], protocol.kindName(symbol.kind));
+        try testing.expectEqual(want[2], symbol.at);
+        try testing.expectEqual(null, symbol.file);
     }
 }
 
