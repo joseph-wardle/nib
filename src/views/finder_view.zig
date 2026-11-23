@@ -42,14 +42,15 @@ pub fn draw(
 
     if (header_rows != 0) {
         var line: Line = .init(try frame.reserve(width));
-        // Locations is present once an answer has filled it.
-        const located = finder.locations.filled();
-        for ([_]Category{ .project, .all, .open, .locations }) |category| {
+        // Locations and Symbols are present once an answer has filled them.
+        for (std.enums.values(Category)) |category| {
+            if (finder.placesOf(category)) |places| if (!places.filled()) continue;
             const name = switch (category) {
                 .project => "Project",
                 .all => "All",
                 .open => "Open",
-                .locations => if (located) "Locations" else continue,
+                .locations => "Locations",
+                .symbols => "Symbols",
             };
             const focused = category == finder.category;
             line.put(if (focused) "[" else " ");
@@ -140,15 +141,27 @@ fn progress(finder: *const Finder, row: []u8) void {
     var line: Line = .init(row);
     var number: [64]u8 = undefined;
     const total = if (finder.catalogOf(finder.category)) |catalog| catalog.entries.len else 0;
-    const noun = if (finder.category == .locations) "rows" else "files";
+    const noun = switch (finder.category) {
+        .project, .all, .open => "files",
+        .locations => "rows",
+        .symbols => "symbols",
+    };
     const counts = .{ finder.matches.len, total, noun };
     line.put(std.fmt.bufPrint(&number, "{d}/{d} {s}", counts) catch unreachable);
-    // Locations has no list: it is never discovered.
+    // Locations and Symbols have no list: they are never discovered.
     const listed = finder.listOf(finder.category);
-    if (listed == null and finder.locations.omitted != 0) {
-        const omitted = .{finder.locations.omitted};
-        const spelled = std.fmt.bufPrint(&number, " | {d} outside local files", omitted);
-        line.put(spelled catch unreachable);
+    if (finder.placesOf(finder.category)) |places| {
+        // Symbols rows carry no path, so the header names their file.
+        if (finder.category == .symbols and places.rows.len != 0) {
+            line.put(" in ");
+            line.put(finder.display(places.rows[0].place.path));
+        }
+        if (places.omitted != 0) {
+            const symbols = finder.category == .symbols;
+            const elsewhere = if (symbols) "in other files" else "outside local files";
+            const omitted = .{ places.omitted, elsewhere };
+            line.put(std.fmt.bufPrint(&number, " | {d} {s}", omitted) catch unreachable);
+        }
     }
     if (listed) |list| if (list.discovering) line.put(" | scanning");
     if (finder.filtering) line.put(" | searching");
@@ -415,6 +428,7 @@ test "previews of UTF-8 text, from a snapshot or an open buffer, render like the
 
 const testing = std.testing;
 const Location = @import("../finder/finder.zig").Location;
+const Symbol = @import("../finder/finder.zig").Symbol;
 
 test "Locations counts rows and omitted locations, and a long row keeps the results on screen" {
     var finder: Finder = .{};
@@ -493,4 +507,23 @@ test "a result row combines its styles and returns to its own after a matched le
     frame.len = 0;
     try drawRow(&frame, ">   ", "abc", &.{2}, true, false, 5);
     try std.testing.expectEqualStrings("\x1b[0;7m>   a\x1b[m", frame.bytes[0..frame.len]);
+}
+
+test "Symbols counts symbols and names their file and those in other files" {
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    const symbols = [_]Symbol{
+        .{ .name = "main", .kind = "function", .line = 0, .column = 7, .start = 0 },
+        .{ .name = "std", .kind = "constant", .line = 1, .column = 6, .start = 0 },
+    };
+    try finder.outline(testing.allocator, testing.io, &background, "/p/a.zig", &symbols, 0, &.{});
+    var row: [80]u8 = undefined;
+    progress(&finder, &row);
+    try testing.expectEqualStrings("2/2 symbols in /p/a.zig", std.mem.trimEnd(u8, &row, " "));
+    try finder.outline(testing.allocator, testing.io, &background, "/p/a.zig", &symbols, 2, &.{});
+    progress(&finder, &row);
+    const omitted = "2/2 symbols in /p/a.zig | 2 in other files";
+    try testing.expectEqualStrings(omitted, std.mem.trimEnd(u8, &row, " "));
 }

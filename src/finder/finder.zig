@@ -17,6 +17,8 @@ pub const Category = enum {
     open,
     /// The last navigation answer with several locations, until the next.
     locations,
+    /// The last document's symbols, until the next.
+    symbols,
 };
 
 /// The caller's handle for an open document. The finder only stores it and
@@ -59,6 +61,22 @@ pub const Location = struct {
 
 /// Bytes of a location's line text that its row keeps.
 pub const max_text = 256;
+
+/// One row for Symbols, as the caller builds it.
+pub const Symbol = struct {
+    /// What the row shows and a search matches, such as `Finder.locate`.
+    /// Borrowed for the call.
+    name: []const u8,
+    /// A word shown after the place under the results, such as `method`;
+    /// may be empty. Borrowed for the call.
+    kind: []const u8,
+    /// Zero-based.
+    line: u32,
+    /// As `Place.column`.
+    column: u32,
+    /// As `Location.start`.
+    start: u64,
+};
 
 pub const Choice = union(enum) {
     /// Raw bytes relative to the root directory. Borrowed until the finder
@@ -116,45 +134,49 @@ pub const List = struct {
 
 pub const Document = struct { id: DocumentId, used: u64 };
 
-/// The rows of the last navigation answer with several locations, kept
-/// until the next one replaces them.
-pub const Locations = struct {
+/// The rows of the last answer that listed places, for Locations or
+/// Symbols, kept until the next one replaces them.
+pub const Places = struct {
     /// Null until an answer fills it.
     catalog: ?*match.Catalog = null,
     /// Per catalog entry origin. Owned.
     rows: []Located = &.{},
-    /// The bytes of every row's path, which `rows` borrow. Owned.
-    paths: []u8 = &.{},
-    /// The answer's locations left out for naming no local file.
+    /// The bytes of every row's path and Symbols' headings, which `rows`
+    /// borrow. Owned.
+    bytes: []u8 = &.{},
+    /// The answer's places left out: for Locations those naming no local
+    /// file, for Symbols those in another file.
     omitted: usize = 0,
 
-    /// What a row keeps of its `Location` once its label is built.
+    /// What a row keeps once its label is built.
     pub const Located = struct {
         place: Place,
-        /// Label bytes spelling `path:line:column`, before the line's text.
-        heading: usize,
+        /// What the line under the results shows: `path:line:column`, for
+        /// Symbols followed by the kind. Borrows the catalog's label for
+        /// Locations.
+        heading: []const u8,
         /// As `Location.start`.
         start: u64,
     };
 
     /// An answer has filled it, so Tab and the header include it.
-    pub fn filled(self: *const Locations) bool {
+    pub fn filled(self: *const Places) bool {
         return self.catalog != null;
     }
 
     /// Takes ownership of everything given.
     fn replace(
-        self: *Locations,
+        self: *Places,
         gpa: Allocator,
         catalog: ?*match.Catalog,
         rows: []Located,
-        paths: []u8,
+        bytes: []u8,
         omitted: usize,
     ) void {
         if (self.catalog) |old| old.release(gpa);
         gpa.free(self.rows);
-        gpa.free(self.paths);
-        self.* = .{ .catalog = catalog, .rows = rows, .paths = paths, .omitted = omitted };
+        gpa.free(self.bytes);
+        self.* = .{ .catalog = catalog, .rows = rows, .bytes = bytes, .omitted = omitted };
     }
 };
 
@@ -191,7 +213,8 @@ pub const Finder = struct {
     category: Category = .project,
     query: std.ArrayList(u8) = .empty,
     lists: std.EnumArray(Listing, List) = .initFill(.{}),
-    locations: Locations = .{},
+    locations: Places = .{},
+    symbols: Places = .{},
     /// Results in `shown`, best first. Owned.
     matches: []match.Match = &.{},
     /// The catalog `matches` index into. Holds a reference.
@@ -223,6 +246,7 @@ pub const Finder = struct {
         if (self.root) |*root| root.deinit(gpa, io);
         for (&self.lists.values) |*list| list.deinit(gpa);
         self.locations.replace(gpa, null, &.{}, &.{}, 0);
+        self.symbols.replace(gpa, null, &.{}, &.{}, 0);
         if (self.shown) |catalog| catalog.release(gpa);
         gpa.free(self.matches);
         self.query.deinit(gpa);
@@ -249,20 +273,22 @@ pub const Finder = struct {
         return self.root == null and self.root_failure == null;
     }
 
-    /// The category after the focused one in Tab order. Locations joins the
-    /// cycle once an answer has filled it.
+    /// The category after the focused one in Tab order. Locations and
+    /// Symbols join the cycle once an answer has filled them.
     pub fn next(self: *const Finder) Category {
+        const after_locations: Category = if (self.symbols.filled()) .symbols else .project;
         return switch (self.category) {
             .project => .all,
             .all => .open,
-            .open => if (self.locations.filled()) .locations else .project,
-            .locations => .project,
+            .open => if (self.locations.filled()) .locations else after_locations,
+            .locations => after_locations,
+            .symbols => .project,
         };
     }
 
     /// Shows `category`, listing Open again from `open` (borrowed for the
-    /// call). Project and All are discovered again; Locations keeps its
-    /// rows. The query is kept, and the selected path where it is still
+    /// call). Project and All are discovered again; Locations and Symbols
+    /// keep their rows. The query is kept, and the selected path where it is still
     /// listed. The preview is read again.
     pub fn focus(
         self: *Finder,
@@ -292,7 +318,7 @@ pub const Finder = struct {
                 try self.show(gpa, io, background);
             },
             .open => {},
-            .locations => try self.show(gpa, io, background),
+            .locations, .symbols => try self.show(gpa, io, background),
         }
     }
 
@@ -314,59 +340,88 @@ pub const Finder = struct {
         try self.listOpen(gpa, background, open);
         var length: usize = 0;
         for (locations) |location| length += location.place.path.len;
-        const paths = try gpa.alloc(u8, length);
-        errdefer gpa.free(paths);
-        const rows = try gpa.alloc(Locations.Located, locations.len);
+        const bytes = try gpa.alloc(u8, length);
+        errdefer gpa.free(bytes);
+        const rows = try gpa.alloc(Places.Located, locations.len);
         errdefer gpa.free(rows);
-        var bytes: std.ArrayList(u8) = .empty;
-        defer bytes.deinit(gpa);
-        const ends = try gpa.alloc(usize, locations.len);
-        var ends_owned = true;
-        defer if (ends_owned) gpa.free(ends);
+        // Each heading's length in its label, which escaping may lengthen.
+        const headings = try gpa.alloc(usize, locations.len);
+        defer gpa.free(headings);
+        var labels: Labels = try .init(gpa, locations.len);
+        defer labels.deinit(gpa);
         var copied: usize = 0;
-        for (locations, rows, ends) |location, *kept, *end| {
+        for (locations, rows, headings) |location, *kept, *heading| {
             const place = location.place;
-            const path = paths[copied..][0..place.path.len];
+            const path = bytes[copied..][0..place.path.len];
             @memcpy(path, place.path);
             copied += path.len;
-            const first = bytes.items.len;
+            const first = labels.bytes.items.len;
             // Shown one-based; a server's position may be the largest u32.
             const line = @as(u64, place.line) + 1;
             const column = @as(u64, place.column) + 1;
-            try bytes.print(gpa, "{s}:{d}:{d}", .{ self.display(path), line, column });
-            const heading = match.labelLength(bytes.items[first..]);
-            try bytes.appendSlice(gpa, "  ");
-            try bytes.appendSlice(gpa, rowText(location.text));
-            end.* = bytes.items.len;
-            try bytes.append(gpa, 0);
+            try labels.bytes.print(gpa, "{s}:{d}:{d}", .{ self.display(path), line, column });
+            heading.* = match.labelLength(labels.bytes.items[first..]);
+            try labels.bytes.appendSlice(gpa, "  ");
+            try labels.bytes.appendSlice(gpa, rowText(location.text));
+            try labels.end(gpa);
             kept.* = .{
                 .place = .{ .path = path, .line = place.line, .column = place.column },
-                .heading = heading,
+                .heading = &.{},
                 .start = location.start,
             };
         }
-        const owned = try bytes.toOwnedSlice(gpa);
-        ends_owned = false;
-        const created = match.Catalog.create(gpa, .{ .bytes = owned, .ends = ends }, null);
-        const catalog = created catch |err| {
-            return switch (err) {
-                error.Canceled => unreachable,
-                error.OutOfMemory => |e| e,
-            };
-        };
+        const catalog = try labels.catalog(gpa);
         errdefer catalog.release(gpa);
-        const matches = try filterInline(gpa, catalog, .locations, "", &.{});
-        // Nothing below fails.
-        background.cancel(gpa, .filter);
-        self.filtering = false;
-        self.filter_failure = null;
-        self.query.clearRetainingCapacity();
-        self.locations.replace(gpa, catalog, rows, paths, omitted);
-        self.category = .locations;
-        self.visible = true;
-        self.restart = true;
-        self.present(gpa, catalog.retain(), matches);
-        self.look(gpa, io, background, true);
+        for (catalog.entries) |entry| {
+            rows[entry.origin].heading = entry.label[0..headings[entry.origin]];
+        }
+        try self.fill(gpa, io, background, .locations, catalog, rows, bytes, omitted);
+    }
+
+    /// Replaces Symbols with `symbols`, all in the file at absolute `path`,
+    /// in their order, and focuses it as `locate` focuses Locations.
+    /// `omitted` counts the answer's symbols left out for lying in another
+    /// file. Running out of memory keeps the earlier rows, category and
+    /// query, though Open may already be listed again. Everything is
+    /// borrowed for the call.
+    pub fn outline(
+        self: *Finder,
+        gpa: Allocator,
+        io: Io,
+        background: *jobs.Jobs,
+        path: []const u8,
+        symbols: []const Symbol,
+        omitted: usize,
+        open: []const OpenFile,
+    ) Allocator.Error!void {
+        try self.listOpen(gpa, background, open);
+        const shown = self.display(path);
+        var length = path.len;
+        for (symbols) |symbol| length += std.fmt.count(heading_format, headingOf(shown, symbol));
+        const bytes = try gpa.alloc(u8, length);
+        errdefer gpa.free(bytes);
+        const kept_path = bytes[0..path.len];
+        @memcpy(kept_path, path);
+        const rows = try gpa.alloc(Places.Located, symbols.len);
+        errdefer gpa.free(rows);
+        var labels: Labels = try .init(gpa, symbols.len);
+        defer labels.deinit(gpa);
+        var used = path.len;
+        for (symbols, rows) |symbol, *kept| {
+            const args = headingOf(shown, symbol);
+            const heading = std.fmt.bufPrint(bytes[used..], heading_format, args) catch unreachable;
+            used += heading.len;
+            try labels.bytes.appendSlice(gpa, rowText(symbol.name));
+            try labels.end(gpa);
+            kept.* = .{
+                .place = .{ .path = kept_path, .line = symbol.line, .column = symbol.column },
+                .heading = heading,
+                .start = symbol.start,
+            };
+        }
+        const catalog = try labels.catalog(gpa);
+        errdefer catalog.release(gpa);
+        try self.fill(gpa, io, background, .symbols, catalog, rows, bytes, omitted);
     }
 
     /// Focus returns to the editor. Any preview read is abandoned; the query,
@@ -432,32 +487,42 @@ pub const Finder = struct {
                 const index = all.find(entry.label) orelse break :ignore .unknown;
                 break :ignore all.ignored[index];
             },
-            .project, .all, .locations => catalog.ignored[result.index],
+            .project, .all, .locations, .symbols => catalog.ignored[result.index],
         };
         return .{ .label = entry.label, .ignore = ignore, .document = document };
     }
 
     /// The selection as the full-width line under the results shows it: its
-    /// label, or for a location only `path:line:column`.
+    /// label, or for a place its row's heading.
     pub fn selectedPath(self: *const Finder) []const u8 {
         const entry = self.selection() orelse return "";
-        if (self.category != .locations) return entry.label;
-        return entry.label[0..self.locations.rows[entry.origin].heading];
+        const places = self.placesOf(self.category) orelse return entry.label;
+        return places.rows[entry.origin].heading;
     }
 
-    /// The list behind `category`; null for Locations, which lists no files.
+    /// The rows behind Locations or Symbols; null for the file categories.
+    pub fn placesOf(self: *const Finder, category: Category) ?*const Places {
+        return switch (category) {
+            .project, .all, .open => null,
+            .locations => &self.locations,
+            .symbols => &self.symbols,
+        };
+    }
+
+    /// The list behind `category`; null for Locations and Symbols, which list
+    /// no files.
     pub fn listOf(self: *const Finder, category: Category) ?*const List {
         return self.lists.getPtrConst(switch (category) {
             .project => .project,
             .all => .all,
             .open => .open,
-            .locations => return null,
+            .locations, .symbols => return null,
         });
     }
 
     /// The catalog `category` shows, once it has one.
     pub fn catalogOf(self: *const Finder, category: Category) ?*match.Catalog {
-        const list = self.listOf(category) orelse return self.locations.catalog;
+        const list = self.listOf(category) orelse return self.placesOf(category).?.catalog;
         return list.catalog;
     }
 
@@ -481,7 +546,7 @@ pub const Finder = struct {
         return switch (self.category) {
             .project, .all => .{ .path = entry.path },
             .open => .{ .document = chosen.document.?.id },
-            .locations => .{ .location = chosen.place.? },
+            .locations, .symbols => .{ .location = chosen.place.? },
         };
     }
 
@@ -579,13 +644,13 @@ pub const Finder = struct {
     };
 
     fn target(self: *const Finder, entry: match.Entry) Target {
-        if (self.category != .locations) return .{
+        const places = self.placesOf(self.category) orelse return .{
             .path = entry.path,
             .document = self.opened(entry.label),
             .place = null,
             .start = 0,
         };
-        const listed = self.locations.rows[entry.origin];
+        const listed = places.rows[entry.origin];
         const path = listed.place.path;
         return .{
             .path = path,
@@ -746,12 +811,41 @@ pub const Finder = struct {
         self.present(gpa, catalog.retain(), matches);
     }
 
+    /// Replaces the rows of `category`, Locations or Symbols, and focuses it
+    /// with an empty query and the first row selected. Takes ownership of
+    /// everything given, unless it fails, which changes nothing.
+    fn fill(
+        self: *Finder,
+        gpa: Allocator,
+        io: Io,
+        background: *jobs.Jobs,
+        category: Category,
+        catalog: *match.Catalog,
+        rows: []Places.Located,
+        bytes: []u8,
+        omitted: usize,
+    ) Allocator.Error!void {
+        const matches = try filterInline(gpa, catalog, category, "", &.{});
+        // Nothing below fails.
+        background.cancel(gpa, .filter);
+        self.filtering = false;
+        self.filter_failure = null;
+        self.query.clearRetainingCapacity();
+        const places = if (category == .locations) &self.locations else &self.symbols;
+        places.replace(gpa, catalog, rows, bytes, omitted);
+        self.category = category;
+        self.visible = true;
+        self.restart = true;
+        self.present(gpa, catalog.retain(), matches);
+        self.look(gpa, io, background, true);
+    }
+
     fn discover(self: *Finder, gpa: Allocator, io: Io, background: *jobs.Jobs) void {
         const root = self.root orelse return;
         const request: jobs.Request = switch (self.category) {
             .project => .{ .project = .{ .root = root.dir, .git = root.git } },
             .all => .{ .all = .{ .root = root.dir, .git = root.git } },
-            .open, .locations => unreachable,
+            .open, .locations, .symbols => unreachable,
         };
         // The categories share a lane, so this supersedes the other one.
         background.submit(gpa, io, .discovery, request);
@@ -842,13 +936,65 @@ fn filterInline(
     switch (category) {
         .project, .all => {},
         .open => std.mem.sort(match.Match, matches, context, Order.later),
-        .locations => std.mem.sortUnstable(match.Match, matches, context, Order.given),
+        .locations, .symbols => std.mem.sortUnstable(match.Match, matches, context, Order.given),
     }
     return matches;
 }
 
-/// A location's line as its row shows it: without leading whitespace, cut
-/// to `max_text` bytes on a character boundary.
+/// Row labels being built for a catalog, in row order.
+const Labels = struct {
+    /// Each label is followed by a 0 byte.
+    bytes: std.ArrayList(u8) = .empty,
+    /// The offset of each written label's 0 byte.
+    ends: []usize,
+    written: usize = 0,
+
+    fn init(gpa: Allocator, rows: usize) Allocator.Error!Labels {
+        return .{ .ends = try gpa.alloc(usize, rows) };
+    }
+
+    fn deinit(self: *Labels, gpa: Allocator) void {
+        self.bytes.deinit(gpa);
+        gpa.free(self.ends);
+    }
+
+    /// Ends the label appended to `bytes` since the last one.
+    fn end(self: *Labels, gpa: Allocator) Allocator.Error!void {
+        self.ends[self.written] = self.bytes.items.len;
+        self.written += 1;
+        try self.bytes.append(gpa, 0);
+    }
+
+    /// A catalog of every row's label, once each has ended. The labels go to
+    /// the catalog, even on failure; the caller releases it.
+    fn catalog(self: *Labels, gpa: Allocator) Allocator.Error!*match.Catalog {
+        std.debug.assert(self.written == self.ends.len);
+        const owned = try self.bytes.toOwnedSlice(gpa);
+        const ends = self.ends;
+        self.ends = &.{};
+        const created = match.Catalog.create(gpa, .{ .bytes = owned, .ends = ends }, null);
+        return created catch |err| switch (err) {
+            error.Canceled => unreachable,
+            error.OutOfMemory => |e| e,
+        };
+    }
+};
+
+/// A Symbols row's heading: `path:line:column`, one-based, then its kind.
+const heading_format = "{s}:{d}:{d}{s}{s}";
+
+const HeadingArgs = struct { []const u8, u64, u64, []const u8, []const u8 };
+
+fn headingOf(path: []const u8, symbol: Symbol) HeadingArgs {
+    // A server's position may be the largest u32.
+    const line = @as(u64, symbol.line) + 1;
+    const column = @as(u64, symbol.column) + 1;
+    const gap = if (symbol.kind.len == 0) "" else "  ";
+    return .{ path, line, column, gap, symbol.kind };
+}
+
+/// Text as a row shows it: without leading whitespace, cut to `max_text`
+/// bytes on a character boundary.
 fn rowText(line: []const u8) []const u8 {
     const text = std.mem.trimStart(u8, line, " \t");
     if (text.len <= max_text) return text;
@@ -1665,4 +1811,117 @@ test "two locations in one file each preview their own line, past 64 KiB, with n
     finder.move(testing.allocator, testing.io, &background, -1);
     try settle(&finder, &background);
     try testing.expect(std.mem.startsWith(u8, try previewText(&finder), "line 8997\n"));
+}
+
+fn symbolAt(name: []const u8, kind: []const u8, line: u32, column: u32) Symbol {
+    return .{ .name = name, .kind = kind, .line = line, .column = column, .start = 0 };
+}
+
+test "Symbols lists names in the given order beside Locations, each place under the results" {
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    const open = [_]OpenFile{openFile(7, "/p/a.zig", 1)};
+    const located = [_]Location{
+        listedAt("/p/a.zig", 0, 0, "a"),
+        listedAt("/p/a.zig", 1, 0, "b"),
+    };
+    try finder.locate(testing.allocator, testing.io, &background, &located, 0, &open);
+    try finder.search(testing.allocator, testing.io, &background, "zzz");
+    const symbols = [_]Symbol{
+        symbolAt("Finder", "constant", 9, 4),
+        symbolAt("Finder.locate", "method", 305, 11),
+        symbolAt("max_text", "", 60, 10),
+    };
+    try finder.outline(testing.allocator, testing.io, &background, "/p/a.zig", &symbols, 1, &open);
+    try testing.expectEqual(Category.symbols, finder.category);
+    try testing.expectEqualStrings("", finder.query.items);
+    try testing.expectEqual(@as(usize, 1), finder.symbols.omitted);
+    try expectRows(&finder, &.{ "Finder", "Finder.locate", "max_text" });
+    try testing.expectEqualStrings("/p/a.zig:10:5  constant", finder.selectedPath());
+    const at_line: Preview = .{ .document = .{ .id = id(7), .line = 9 } };
+    try testing.expectEqual(at_line, finder.preview());
+    finder.move(testing.allocator, testing.io, &background, 2);
+    // No kind, no gap.
+    try testing.expectEqualStrings("/p/a.zig:61:11", finder.selectedPath());
+    const chosen = finder.choice().?.location;
+    try testing.expectEqualStrings("/p/a.zig", chosen.path);
+    try testing.expectEqual(@as(u32, 60), chosen.line);
+    try testing.expectEqual(@as(u32, 10), chosen.column);
+    // A search matches names only: every row's kind or place holds "me".
+    try finder.search(testing.allocator, testing.io, &background, "me");
+    try settle(&finder, &background);
+    try expectRows(&finder, &.{"max_text"});
+    try finder.search(testing.allocator, testing.io, &background, "");
+    try expectRows(&finder, &.{ "Finder", "Finder.locate", "max_text" });
+    // Locations is kept, and Tab passes it on the way to Symbols.
+    try testing.expectEqual(Category.project, finder.next());
+    try finder.focus(testing.allocator, testing.io, &background, .open, &open);
+    try testing.expectEqual(Category.locations, finder.next());
+    try finder.focus(testing.allocator, testing.io, &background, .locations, &open);
+    try testing.expectEqual(Category.symbols, finder.next());
+    try expectRows(&finder, &.{ "/p/a.zig:1:1  a", "/p/a.zig:2:1  b" });
+    try testing.expectEqualStrings("/p/a.zig:1:1", finder.selectedPath());
+    try finder.focus(testing.allocator, testing.io, &background, .symbols, &open);
+    try expectRows(&finder, &.{ "Finder", "Finder.locate", "max_text" });
+    // The next outline replaces the rows; Locations stays as it was.
+    const next = symbols[1..2];
+    try finder.outline(testing.allocator, testing.io, &background, "/p/b.zig", next, 0, &open);
+    try expectRows(&finder, &.{"Finder.locate"});
+    try testing.expectEqualStrings("/p/b.zig:306:12  method", finder.selectedPath());
+    try testing.expectEqual(@as(usize, 2), finder.locations.catalog.?.entries.len);
+}
+
+test "Symbols without Locations follows Open in Tab order" {
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    const symbols = [_]Symbol{symbolAt("main", "function", 0, 7)};
+    try finder.outline(testing.allocator, testing.io, &background, "/p/a.zig", &symbols, 0, &.{});
+    try testing.expectEqual(Category.project, finder.next());
+    try finder.focus(testing.allocator, testing.io, &background, .open, &.{});
+    try testing.expectEqual(Category.symbols, finder.next());
+}
+
+test "allocation failure while filling Symbols keeps the previous rows, focus and query" {
+    var storage: [25][8]u8 = undefined;
+    var files: [25]OpenFile = undefined;
+    openFiles(&storage, &files);
+    var finder: Finder = .{};
+    defer finder.deinit(testing.allocator, testing.io);
+    var background: jobs.Jobs = try .init();
+    defer background.deinit(testing.allocator, testing.io);
+    const before = [_]Symbol{symbolAt("old", "", 0, 0)};
+    try finder.outline(testing.allocator, testing.io, &background, "/p/f01", &before, 0, &files);
+    try finder.focus(testing.allocator, testing.io, &background, .open, &files);
+    try finder.search(testing.allocator, testing.io, &background, "f0");
+    var names: [25][8]u8 = undefined;
+    var after: [25]Symbol = undefined;
+    for (&after, &names, 0..) |*symbol, *name, index| {
+        const spelled = std.fmt.bufPrint(name, "new{d:0>2}", .{index}) catch unreachable;
+        symbol.* = symbolAt(spelled, "function", @intCast(index), 2);
+    }
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        const config: std.testing.FailingAllocator.Config = .{ .fail_index = index };
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, config);
+        const gpa = failing.allocator();
+        const filled = finder.outline(gpa, testing.io, &background, "/p/f02", &after, 3, &files);
+        if (filled) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+        try testing.expectEqual(Category.open, finder.category);
+        try testing.expectEqualStrings("f0", finder.query.items);
+        try testing.expectEqual(@as(usize, 12), finder.matches.len);
+        const kept = &finder.symbols;
+        try testing.expectEqual(@as(usize, 1), kept.catalog.?.entries.len);
+        try testing.expectEqualStrings("/p/f01:1:1", kept.rows[0].heading);
+        try testing.expectEqual(@as(usize, 0), kept.omitted);
+    }
+    try testing.expect(index > 3);
+    try testing.expectEqual(Category.symbols, finder.category);
+    try testing.expectEqual(@as(usize, 25), finder.matches.len);
+    try testing.expectEqualStrings("new00", selectedLabel(&finder));
+    try testing.expectEqualStrings("/p/f02:1:3  function", finder.selectedPath());
+    try testing.expectEqual(@as(usize, 3), finder.symbols.omitted);
 }
