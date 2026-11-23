@@ -5,7 +5,7 @@ Nib is my personal terminal code editor for Linux, written in Zig.
 Goals:
 
 - Vim-style modal editing for the commands that matter, with deliberate defaults instead of plugins or a scripting language.
-- Quick project navigation: finding files now, and later symbols, definitions and usages through language servers.
+- Quick project navigation: finding files, plus definitions, usages and a file's symbols through language servers; later, symbols and text across the project.
 - Immediate response, and no work while idle.
 
 ## Status
